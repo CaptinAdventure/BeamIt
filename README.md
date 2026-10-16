@@ -18,7 +18,7 @@ The project is intentionally close to the problem space of RDP and Sunshine, but
 ## Current status
 
 This repository has full-monitor DXGI capture, monitor or single-window WGC capture, and automatic codec-preserving selection between D3D12 Video Encode and native NVENC DirectX 11 encoding, prioritizing 4:4:4 sampling.
-The app is a disposable CLI recorder and one-client plaintext TCP window streamer for testing the capture-to-encoder path. WGC and DXGI have each produced five-second H.264 and H.265 files on the development machine that decode with FFmpeg. The custom client, authenticated session protocol and application window-family tracking are not implemented.
+The host serves the authenticated **WSS protocol** in [`PROTOCOL.md`](PROTOCOL.md) (`--serve`): one JSON signaling WebSocket plus one binary WebSocket per video stream, over TLS with a shared password. The CLI also keeps a disposable recorder and the one-client plaintext TCP test streamer. The browser test client, the native clients, input and application window-family tracking are not implemented.
 
 ### Current near-term goal
 
@@ -186,6 +186,37 @@ This replaces the bandwidth-heavy all-IDR test path so static areas and terminal
 
 The shared input texture permits simultaneous-access interop for D3D11, and conversion commands are flushed before signaling work to D3D12. Video resource transitions stay on the encode queue; buffers cross to the graphics readback queue in `COMMON` state. This avoids using video-only resource states on a graphics command list.
 
+## Secure WebSocket host (`--serve`)
+
+```powershell
+# Store a long random password in a file only you can read (never on the command line):
+Set-Content -NoNewline -Path $env:USERPROFILE\beamit.pw -Value '<long random password>'
+.\BeamIt.exe --serve --port 17389 --password-file $env:USERPROFILE\beamit.pw
+# Optional: --bind 192.168.1.10, --codec h265, --fps 60, --bitrate 24000, --encoder d3d12|nvenc|auto,
+#           --capture dxgi (desktop streams), --tls-cert host.pem --tls-key host-key.pem
+```
+
+The wire protocol is specified in [`PROTOCOL.md`](PROTOCOL.md); clients are written against that document. Summary:
+
+- `https://host:port/` serves a placeholder test page (the web client is a later pass); `wss://host:port/control` is the JSON signaling socket; each stream gets its own `wss://host:port/streams/{id}?token=…` binary socket, announced with the codec parameters in `stream_offer`.
+- The client chooses the source (`window` HWND, `application` PID or `desktop`) and optionally codec/FPS/bitrate; the command-line values are defaults. Window/application streams use WGC; desktop streams use `--capture`. The host captures the first frame and configures the encoder before replying, so `stream_offer` contains the exact WebCodecs codec string (for example `avc1.F40028` for H.264 High 4:4:4), size, chroma format and bit depth. A resize sends `stream_config` with a new generation before the next key frame.
+- Each binary message is a 32-byte big-endian header (version, type, flags, generation, sequence, capture time) followed by one Annex B access unit. At most two frames are queued per stream socket; on overflow the queue is flushed, frames are skipped until a requested IDR, and the next frame carries the discontinuity flag. The host never sends a P-picture whose references were dropped.
+
+**Security.** TLS comes from Windows Schannel via [boost-wintls](https://github.com/laudrup/boost-wintls) (header-only, pinned SHA-256). Without `--tls-cert`/`--tls-key`, BeamIt creates (and reuses) a self-signed RSA-2048 certificate `CN=BeamIt host` in `CurrentUser\My`, valid for two years and regenerated when near expiry; its SHA-256 fingerprint is logged at startup. Browsers must accept it once by opening `https://host:port/`; native clients should pin the fingerprint, because password authentication is not bound to the TLS channel and an unpinned, accepted certificate allows an active relay. `--tls-key` must be an unencrypted RSA PKCS#8 PEM (`BEGIN PRIVATE KEY`).
+
+The password is read from `--password-file` (trailing CR/LF removed), turned into a key with PBKDF2-HMAC-SHA256 (600,000 iterations, random per-run salt, Windows CNG), then wiped; it is never logged or sent. Client and host prove knowledge of the key with HMAC-SHA256 over both random nonces (mutual authentication). A failed proof closes the socket after one second. Only one authenticated control session exists; a newer one supersedes it (close code 4001). Stream tokens are random, single-use and expire after 10 seconds. WebSocket upgrades with a foreign `Origin` are rejected.
+
+Tested from a stdlib Python WSS client on the development machine: authentication (correct and wrong password), `list_windows`, Teams application and desktop streams (NVENC H.264 4:4:4; the payload decodes with ffprobe as High 4:4:4 Predictive), forced key frames, `stop_stream`, token reuse and expiry, foreign origin and session supersede. Protocol helpers (base64url, PBKDF2/HMAC vectors, authentication proofs, frame header, SPS/codec-string parsing) are covered by the `[protocol]` Catch2 tests.
+
+### Transport decisions and rejected alternatives
+
+- **WebSockets over TLS** (requested): easy to configure, browser-compatible and passes proxies/firewalls as HTTPS. TCP head-of-line blocking remains, so latency is bounded by the two-frame send queue and IDR recovery rather than by datagram loss handling. WebRTC/QUIC transports were not chosen for this pass.
+- **Schannel (boost-wintls) instead of OpenSSL:** OpenSSL from source needs Perl (unavailable on the build machine), and a prebuilt binary would add an unpinned toolchain dependency. Schannel is the OS TLS stack and gets OS security updates. Limitations: wintls attaches private keys through legacy CryptoAPI (not CNG/NCrypt), so the self-signed key uses the Microsoft Enhanced RSA and AES provider, and only RSA PKCS#8 PEM keys import.
+- **Password authentication inside TLS** rather than a PAKE (for example SRP/OPAQUE) or TLS-PSK: browsers cannot use TLS-PSK, and the shared-password policy is satisfied by a PBKDF2 key plus mutual HMAC proofs. Channel binding is not available in browsers, hence the fingerprint pinning recommendation.
+- **Previous plaintext TCP stream:** kept only as the explicit `--insecure-test-stream` test.
+
+`StreamPipeline::stop()` joins its capture/encode thread on the network thread, which can briefly block other sockets while an encoder initializes; acceptable for this version. The server holds a process-wide COM MTA reference (`CoIncrementMTAUsage`): otherwise the MTA is torn down after the last stream thread exits and C++/WinRT's cached WGC activation factory points into an unloaded DLL (observed as an access violation on the next window stream).
+
 ## Temporary five-second recorder
 
 Build `BeamIt` using CLion's configured CMake profile, then pass these program arguments through its run configuration, or run the resulting executable:
@@ -307,7 +338,7 @@ This project uses CMake and C++26.
 Use the IDE's configured CMake version for configure/build steps; do not assume the command-line `cmake` installation matches the project requirements.
 For implementation details, inspect `CMakeLists.txt`.
 
-Boost **1.90.0**, including Beast and its transitive dependencies, is downloaded by CPM/CMake from the official CMake release archive with a pinned SHA-256. Only the Beast dependency graph is enabled; upstream tests, examples and fuzzers are disabled. `BeamIt` and `BeamItTests` link `Boost::beast`. The first configuration requires network access; subsequent configurations reuse the populated source. Run the `[beast]` test filter through CLion's `BeamItTests` configuration for an in-memory HTTP/WebSocket upgrade parsing check. This adds the dependency only: the existing raw TCP test transport is unchanged, and HTTP/WebSocket/TLS transport has not been selected or implemented.
+Boost **1.90.0**, including Beast and its transitive dependencies, is downloaded by CPM/CMake from the official CMake release archive with a pinned SHA-256. Only the Beast dependency graph is enabled; upstream tests, examples and fuzzers are disabled. `BeamIt` and `BeamItTests` link `Boost::beast`. The first configuration requires network access; subsequent configurations reuse the populated source. Run the `[beast]` test filter through CLion's `BeamItTests` configuration for an in-memory HTTP/WebSocket upgrade parsing check. Boost.JSON is also enabled for signaling messages, and boost-wintls **1.0.0** is downloaded by CPM (`DOWNLOAD_ONLY`, pinned SHA-256) and wrapped in the local `beamit_wintls` interface target, which links `crypt32`, `secur32` and `bcrypt` and adds MSVC `/bigobj` (the coroutine server exceeds the default object section limit). `_WIN32_WINNT` is set to Windows 10+ (`0x0A00`).
 
 ### NVIDIA interface headers for backend exploration
 
@@ -337,7 +368,15 @@ This is capability enumeration, not a live encode test: profile/capability/input
 - `include/beamit/media/NvencVideoEncoder.hpp` and `src/media/NvencVideoEncoder.cpp` — DirectX 11 NVENC H.264 4:4:4 encoder
 - `include/beamit/media/AutoVideoEncoder.hpp` and `src/media/AutoVideoEncoder.cpp` — default codec-preserving encoder selection
 - `include/beamit/media/VideoFrame.hpp` — shared captured-frame and encoded-packet types
-- `src/main.cpp` — disposable CLI recorder and plaintext TCP window streamer
+- `PROTOCOL.md` — WSS signaling/stream protocol v1 specification
+- `src/main.cpp` — CLI: `--serve` host, recorder and plaintext TCP test streamer
+- `src/host/HostServer.hpp/.cpp` — HTTPS/WSS server, signaling sessions and stream sockets (Beast + wintls, Asio coroutines)
+- `src/host/StreamPipeline.hpp/.cpp` — per-stream capture/encode thread
+- `src/host/TlsIdentity.hpp/.cpp` — PEM certificate loading and persistent self-signed certificate
+- `src/net/Crypto.hpp/.cpp` — CNG random, base64url, PBKDF2, HMAC and authentication proofs
+- `src/net/Protocol.hpp` — protocol constants and binary frame header
+- `src/media/BitstreamInfo.hpp/.cpp` — SPS parsing for codec strings, chroma format and bit depth
+- `tests/ProtocolTests.cpp` — protocol and bitstream unit tests
 - `src/ApplicationWindows.hpp` and `src/ApplicationWindows.cpp` — window listing and PID selection heuristic
 - `src/TcpVideoSink.hpp` — disposable one-client Winsock transport
 - `src/media/CodecHeaders.hpp` and `src/media/CodecHeaders.cpp` — encoder-specific Annex B parameter-set generation

@@ -18,6 +18,7 @@ using Sha256 = std::array<std::byte, 32>;
 [[nodiscard]] std::optional<std::vector<std::byte>> base64url_decode(std::string_view text);
 [[nodiscard]] Sha256 pbkdf2_sha256(std::string_view password, std::span<const std::byte> salt,
                                    std::uint32_t iterations);
+[[nodiscard]] Sha256 sha256(std::span<const std::byte> message);
 [[nodiscard]] Sha256 hmac_sha256(std::span<const std::byte> key, std::span<const std::byte> message);
 [[nodiscard]] bool constant_time_equal(std::span<const std::byte> left, std::span<const std::byte> right) noexcept;
 

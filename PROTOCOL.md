@@ -168,8 +168,11 @@ video frames (§7), so clients can estimate host-to-display latency.
 ] }
 ```
 
-Lists visible, capturable top-level windows. `primary` marks the largest
-window of its process (the window chosen for `{"kind":"application"}`).
+Lists visible, capturable top-level windows. `primary` marks windows that
+are candidates to be an application's main window (unowned, not tool
+windows). For `{"kind":"application"}` the host picks the largest primary
+candidate of that process, so several windows of one process may be
+`primary: true`.
 `hwnd` is an opaque string; clients must echo it back unchanged.
 
 ### 5.3 `start_stream`

@@ -8,6 +8,22 @@ include(CTest)
 include(cmake/CPM.cmake)
 include(cmake/NvidiaNvenc.cmake)
 
+# Embed the test web client as byte arrays: MSVC limits a single string literal to about 16 KB (C2026).
+function(beamit_embed_bytes path out_var)
+    file(READ "${path}" hex HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," hex "${hex}")
+    string(REGEX REPLACE "((0x..,){32})" "\\1\n    " hex "${hex}")
+    set(${out_var} "${hex}" PARENT_SCOPE)
+endfunction()
+beamit_embed_bytes("${CMAKE_CURRENT_SOURCE_DIR}/HTML/index.html" BEAMIT_HTML_INDEX)
+beamit_embed_bytes("${CMAKE_CURRENT_SOURCE_DIR}/HTML/beamit.js" BEAMIT_HTML_LIBRARY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/HTML/index.html"
+    "${CMAKE_CURRENT_SOURCE_DIR}/HTML/beamit.js"
+)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+configure_file(src/host/HtmlAssets.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/HtmlAssets.hpp" @ONLY)
+
 CPMAddPackage(
     NAME spdlog
     GIT_TAG v1.15.3
@@ -49,6 +65,8 @@ CPMAddPackage(
     DOWNLOAD_ONLY YES
 )
 add_library(beamit_wintls INTERFACE)
+# Beast/Asio coroutine translation units exceed the default COFF section limit.
+target_compile_options(beamit_wintls INTERFACE $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
 target_include_directories(beamit_wintls SYSTEM INTERFACE "${wintls_SOURCE_DIR}/include")
 target_link_libraries(beamit_wintls INTERFACE Boost::beast crypt32 secur32 bcrypt)
 
@@ -71,7 +89,7 @@ add_executable(BeamIt
     src/media/ProbeEncoders.cpp
     ${BEAMIT_HOST_SOURCES}
 )
-target_include_directories(BeamIt PRIVATE include src)
+target_include_directories(BeamIt PRIVATE include src "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(BeamIt PRIVATE spdlog CLI11::CLI11 Boost::beast Boost::json beamit_wintls
     d3d11 d3d12 dxgi windowsapp ws2_32 user32)
 target_compile_definitions(BeamIt PUBLIC NOMINMAX _WIN32_WINNT=0x0A00)
@@ -106,7 +124,7 @@ if(BUILD_TESTING)
         src/media/AutoVideoEncoder.cpp
         src/media/CodecHeaders.cpp
     )
-    target_include_directories(BeamItTests PRIVATE include src)
+    target_include_directories(BeamItTests PRIVATE include src "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_compile_definitions(BeamItTests PRIVATE BEAMIT_USE_CATCH2=1 NOMINMAX _WIN32_WINNT=0x0A00)
     target_link_libraries(BeamItTests PRIVATE Catch2::Catch2WithMain spdlog Boost::beast Boost::json beamit_wintls
         d3d11 d3d12 dxgi windowsapp ws2_32 user32)

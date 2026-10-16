@@ -87,6 +87,15 @@ Sha256 pbkdf2_sha256(std::string_view password, std::span<const std::byte> salt,
     return key;
 }
 
+Sha256 sha256(std::span<const std::byte> message) {
+    Sha256 digest{};
+    check(BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
+                     reinterpret_cast<PUCHAR>(const_cast<std::byte*>(message.data())), size(message.size()),
+                     reinterpret_cast<PUCHAR>(digest.data()), size(digest.size())),
+          "SHA-256");
+    return digest;
+}
+
 Sha256 hmac_sha256(std::span<const std::byte> key, std::span<const std::byte> message) {
     Sha256 digest{};
     check(BCryptHash(BCRYPT_HMAC_SHA256_ALG_HANDLE,

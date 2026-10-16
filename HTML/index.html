@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>BeamIt Protocol Test Client</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font: 15px/1.45 system-ui, sans-serif;
+        background: #111827;
+        color: #e5e7eb;
+      }
+      * { box-sizing: border-box; }
+      body { max-width: 1180px; margin: 0 auto; padding: 24px; }
+      h1, h2 { line-height: 1.2; }
+      h1 { margin: 0 0 6px; }
+      h2 { margin-top: 0; font-size: 1.05rem; }
+      p { color: #aebbd0; }
+      .layout { display: grid; grid-template-columns: minmax(280px, 350px) 1fr; gap: 20px; align-items: start; }
+      section { border: 1px solid #374151; border-radius: 10px; padding: 18px; background: #1f2937; }
+      label { display: block; margin: 12px 0 5px; color: #cbd5e1; }
+      input, select, button { font: inherit; }
+      input, select { width: 100%; padding: 9px 10px; border: 1px solid #4b5563; border-radius: 6px; background: #111827; color: inherit; }
+      button { border: 0; border-radius: 6px; background: #2563eb; color: white; padding: 9px 13px; cursor: pointer; }
+      button.secondary { background: #4b5563; }
+      button.danger { background: #b91c1c; }
+      button:disabled { opacity: .5; cursor: not-allowed; }
+      .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+      .status { color: #93c5fd; overflow-wrap: anywhere; }
+      .error { color: #fca5a5; }
+      .video { min-height: 360px; display: grid; place-items: center; overflow: hidden; border-radius: 6px; background: #030712; }
+      canvas { display: block; max-width: 100%; max-height: min(70vh, 760px); object-fit: contain; }
+      .metrics { display: flex; flex-wrap: wrap; gap: 14px; color: #cbd5e1; font-variant-numeric: tabular-nums; margin-top: 10px; }
+      details { margin-top: 16px; }
+      pre { max-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; border-radius: 6px; background: #111827; color: #cbd5e1; }
+      @media (max-width: 760px) {
+        body { padding: 14px; }
+        .layout { grid-template-columns: 1fr; }
+        .video { min-height: 220px; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>BeamIt Protocol Test Client</h1>
+      <p>Browser test harness for the v1 WSS signaling and video protocol. Use HTTPS and trust the host certificate before connecting.</p>
+    </header>
+
+    <main class="layout">
+      <section aria-labelledby="connection-heading">
+        <h2 id="connection-heading">Connection</h2>
+        <form id="connect-form">
+          <label for="server-url">Host HTTPS URL</label>
+          <input id="server-url" name="url" type="url" required spellcheck="false">
+          <label for="password">Shared password</label>
+          <input id="password" name="password" type="password" required autocomplete="current-password">
+          <div class="actions">
+            <button id="connect-button" type="submit">Connect</button>
+            <button id="disconnect-button" class="secondary" type="button" disabled>Disconnect</button>
+          </div>
+        </form>
+        <p id="connection-status" class="status" role="status">Disconnected</p>
+
+        <div class="actions">
+          <button id="refresh-windows-button" class="secondary" type="button" disabled>Refresh windows</button>
+          <button id="ping-button" class="secondary" type="button" disabled>Ping</button>
+        </div>
+
+        <h2 style="margin-top: 22px">Start stream</h2>
+        <form id="stream-form">
+          <label for="source-kind">Capture source</label>
+          <select id="source-kind" name="kind">
+            <option value="window">Window (WGC)</option>
+            <option value="application">Application primary window</option>
+            <option value="desktop">Primary desktop</option>
+          </select>
+          <label id="window-label" for="window-select">Window</label>
+          <select id="window-select" name="hwnd"></select>
+          <label id="pid-label" for="pid">Application PID</label>
+          <input id="pid" name="pid" type="number" min="0" step="1" inputmode="numeric">
+          <label for="codec">Codec</label>
+          <select id="codec" name="codec">
+            <option value="h264">H.264</option>
+            <option value="h265">H.265</option>
+          </select>
+          <label for="frame-rate">Frame rate (1–240)</label>
+          <input id="frame-rate" name="frame_rate" type="number" min="1" max="240" step="1" value="60">
+          <label for="bitrate">Bitrate (kbps)</label>
+          <input id="bitrate" name="bitrate_kbps" type="number" min="1" max="1000000" step="1" value="20000">
+          <div class="actions">
+            <button id="start-button" type="submit" disabled>Start stream</button>
+            <button id="stop-button" class="danger" type="button" disabled>Stop stream</button>
+          </div>
+        </form>
+        <p id="stream-status" class="status" role="status">No active stream</p>
+      </section>
+
+      <section aria-labelledby="video-heading">
+        <h2 id="video-heading">Live video</h2>
+        <div class="video">
+          <canvas id="video-canvas" aria-label="Decoded remote video"></canvas>
+        </div>
+        <div class="metrics">
+          <span id="resolution">—</span>
+          <span id="codec-info">—</span>
+          <span id="frame-info">Waiting for video</span>
+          <span id="latency-info"></span>
+        </div>
+        <details>
+          <summary>Protocol log</summary>
+          <pre id="log" aria-live="polite"></pre>
+        </details>
+      </section>
+    </main>
+
+    <script type="module">
+      import { BeamItClient, BeamItError, createWebCodecsDecoder } from "./beamit.js";
+
+      const $ = (id) => document.getElementById(id);
+      const form = $("stream-form");
+      const sourceKind = $("source-kind");
+      const clientOptions = { url: location.origin };
+      let client = null;
+      let stream = null;
+      let decoderHandle = null;
+      let lastSequence = null;
+      let frameCount = 0;
+      let lastStatsAt = 0;
+
+      $("server-url").value = clientOptions.url;
+
+      function log(message, error = false) {
+        const time = new Date().toLocaleTimeString();
+        const line = `[${time}] ${message}`;
+        const output = $("log");
+        output.textContent = `${line}\n${output.textContent}`.slice(0, 12000);
+        $("connection-status").classList.toggle("error", error);
+      }
+
+      function setConnected(connected) {
+        $("connect-button").disabled = connected;
+        $("disconnect-button").disabled = !connected;
+        $("refresh-windows-button").disabled = !connected;
+        $("ping-button").disabled = !connected;
+        $("start-button").disabled = !connected || stream !== null;
+        $("connection-status").textContent = connected ? "Authenticated" : "Disconnected";
+        updateSourceFields();
+      }
+
+      function updateSourceFields() {
+        const kind = sourceKind.value;
+        $("window-label").hidden = kind !== "window";
+        $("window-select").hidden = kind !== "window";
+        $("pid-label").hidden = kind !== "application";
+        $("pid").hidden = kind !== "application";
+      }
+
+      function setStreamStatus(text, error = false) {
+        $("stream-status").textContent = text;
+        $("stream-status").classList.toggle("error", error);
+      }
+
+      async function refreshWindows() {
+        if (!client?.connected) return;
+        const previous = $("window-select").value;
+        const windows = await client.listWindows();
+        const select = $("window-select");
+        select.replaceChildren();
+        for (const window of windows) {
+          const option = document.createElement("option");
+          option.value = window.hwnd;
+          option.textContent = `${window.title || "(untitled)"} — PID ${window.pid}${window.primary ? " (primary)" : ""}`;
+          select.append(option);
+        }
+        if (windows.some((window) => window.hwnd === previous)) select.value = previous;
+        log(`Listed ${windows.length} capturable window(s).`);
+      }
+
+      function drawFrame(videoFrame) {
+        const canvas = $("video-canvas");
+        if (canvas.width !== videoFrame.displayWidth || canvas.height !== videoFrame.displayHeight) {
+          canvas.width = videoFrame.displayWidth;
+          canvas.height = videoFrame.displayHeight;
+        }
+        const context = canvas.getContext("2d", { alpha: false, desynchronized: true });
+        context.drawImage(videoFrame, 0, 0, canvas.width, canvas.height);
+        videoFrame.close();
+      }
+
+      function resetVideo() {
+        decoderHandle?.close();
+        decoderHandle = null;
+        const canvas = $("video-canvas");
+        const context = canvas.getContext("2d");
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        canvas.width = 0;
+        canvas.height = 0;
+        $("resolution").textContent = "—";
+        $("codec-info").textContent = "—";
+        $("frame-info").textContent = "Waiting for video";
+        $("latency-info").textContent = "";
+        lastSequence = null;
+        frameCount = 0;
+        lastStatsAt = 0;
+      }
+
+      function detachStream() {
+        resetVideo();
+        stream = null;
+        $("stop-button").disabled = true;
+        $("start-button").disabled = !client?.connected;
+      }
+
+      async function startStream(event) {
+        event.preventDefault();
+        if (!client?.connected || stream) return;
+        const kind = sourceKind.value;
+        let source;
+        if (kind === "window") {
+          if (!$("window-select").value) throw new Error("Refresh windows and select a window first.");
+          source = { kind, hwnd: $("window-select").value };
+        } else if (kind === "application") {
+          const pid = Number($("pid").value);
+          if (!Number.isSafeInteger(pid) || pid < 0) throw new Error("Enter a valid application PID.");
+          source = { kind, pid };
+        } else {
+          source = { kind: "desktop" };
+        }
+        const video = {
+          codec: $("codec").value,
+          frame_rate: Number($("frame-rate").value),
+          bitrate_kbps: Number($("bitrate").value),
+        };
+        setStreamStatus("Starting capture and encoder…");
+        $("start-button").disabled = true;
+        const started = performance.now();
+        stream = await client.startStream({ source, video });
+        stream.on("frame", (frame) => {
+          if (lastSequence !== null && frame.sequence !== lastSequence + 1n) {
+            log(`Frame sequence gap: ${lastSequence} → ${frame.sequence}${frame.discontinuity ? " (discontinuity)" : ""}.`);
+          }
+          lastSequence = frame.sequence;
+          frameCount += 1;
+          const now = performance.now();
+          if (now - lastStatsAt >= 1000) {
+            $("frame-info").textContent = `${frameCount} frames/s · sequence ${frame.sequence}`;
+            $("latency-info").textContent = `Host capture timestamp ${frame.captureTimeUs} µs`;
+            frameCount = 0;
+            lastStatsAt = now;
+          }
+        });
+        stream.on("config", (config) => {
+          $("resolution").textContent = `${config.width}×${config.height}`;
+          $("codec-info").textContent = `${config.codec.toUpperCase()} · ${config.chroma_format ?? "sampling unknown"} · ${config.codec_string}`;
+          log(`Stream reconfigured to ${config.width}×${config.height}, ${config.codec_string}, generation ${config.generation}.`);
+        });
+        stream.on("stopped", (message) => {
+          log(`Stream stopped: ${message.reason ?? "unknown"}${message.message ? ` — ${message.message}` : ""}`);
+          detachStream();
+        });
+        stream.on("close", ({ code, reason }) => {
+          log(`Video socket closed (${code})${reason ? `: ${reason}` : ""}.`);
+          if (stream?.id === streamId) detachStream();
+        });
+        stream.on("error", (error) => log(error.message, true));
+        const streamId = stream.id;
+        const config = stream.video;
+        $("resolution").textContent = `${config.width}×${config.height}`;
+        $("codec-info").textContent = `${config.codec.toUpperCase()} · ${config.chroma_format ?? "sampling unknown"} · ${config.codec_string}`;
+        try {
+          decoderHandle = await createWebCodecsDecoder(stream, {
+            output: drawFrame,
+            onError: (error) => log(`Decoder: ${error.message}`, true),
+          });
+        } catch (error) {
+          try {
+            await stream.stop();
+          } catch (stopError) {
+            log(`Could not stop stream after decoder setup failed: ${stopError.message}`, true);
+            stream.close();
+            detachStream();
+          }
+          throw error;
+        }
+        $("stop-button").disabled = false;
+        $("start-button").disabled = true;
+        setStreamStatus(`Streaming ${source.kind} · ${config.width}×${config.height} · ${config.codec_string}`);
+        log(`Stream ${stream.id} opened in ${(performance.now() - started).toFixed(0)} ms.`);
+      }
+
+      $("connect-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        $("connect-button").disabled = true;
+        $("connection-status").textContent = "Connecting and authenticating…";
+        try {
+          client = new BeamItClient({ url: $("server-url").value });
+          client.on("close", ({ code, reason }) => {
+            log(`Control socket closed (${code})${reason ? `: ${reason}` : ""}.`);
+            detachStream();
+            setConnected(false);
+          });
+          client.on("protocolError", (error) => log(error.message, true));
+          client.on("socketError", (info) => log(`${info.socket} socket reported an error.`, true));
+          await client.connect($("password").value);
+          $("password").value = "";
+          setConnected(true);
+          log("Authenticated with the BeamIt host.");
+          await refreshWindows();
+        } catch (error) {
+          $("password").value = "";
+          setConnected(false);
+          $("connection-status").textContent = error.message;
+          log(error.message, true);
+          client?.disconnect();
+          client = null;
+        }
+      });
+
+      $("disconnect-button").addEventListener("click", () => {
+        client?.disconnect();
+        client = null;
+        detachStream();
+        setConnected(false);
+        log("Disconnected.");
+      });
+
+      $("refresh-windows-button").addEventListener("click", async () => {
+        try {
+          await refreshWindows();
+        } catch (error) {
+          log(error.message, true);
+        }
+      });
+
+      $("ping-button").addEventListener("click", async () => {
+        try {
+          const started = performance.now();
+          const response = await client.ping();
+          log(`Ping round trip ${(performance.now() - started).toFixed(1)} ms · host monotonic time ${response.host_time_us} µs.`);
+        } catch (error) {
+          log(error.message, true);
+        }
+      });
+
+      $("stream-form").addEventListener("submit", async (event) => {
+        try {
+          await startStream(event);
+        } catch (error) {
+          setStreamStatus(error.message, true);
+          $("start-button").disabled = !client?.connected;
+          log(error.message, true);
+        }
+      });
+
+      $("stop-button").addEventListener("click", async () => {
+        if (!stream) return;
+        $("stop-button").disabled = true;
+        try {
+          await stream.stop();
+        } catch (error) {
+          setStreamStatus(error.message, true);
+          $("stop-button").disabled = false;
+          log(error.message, true);
+        }
+      });
+
+      sourceKind.addEventListener("change", updateSourceFields);
+      updateSourceFields();
+    </script>
+  </body>
+</html>

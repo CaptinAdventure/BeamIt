@@ -7,6 +7,8 @@
 #include "host/HostServer.hpp"
 
 #include "ApplicationWindows.hpp"
+#include "FrameTimer.hpp"
+#include "HtmlAssets.hpp"
 #include "Utf8.hpp"
 #include "host/StreamPipeline.hpp"
 #include "media/BitstreamInfo.hpp"
@@ -14,6 +16,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <charconv>
@@ -21,6 +24,7 @@
 #include <deque>
 #include <map>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <variant>
 
@@ -40,17 +44,6 @@ using asio::awaitable;
 using asio::use_awaitable;
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
-
-constexpr std::string_view placeholder_page = R"(<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>BeamIt</title></head>
-<body>
-<h1>BeamIt host</h1>
-<p>The TLS certificate is accepted. The test web client is not implemented yet;
-clients connect to <code>/control</code> as described in PROTOCOL.md (protocol version 1).</p>
-</body>
-</html>
-)";
 
 std::string bytes_text(std::span<const std::byte> bytes) { return beamit::net::base64url_encode(bytes); }
 
@@ -716,6 +709,48 @@ void configure_websocket(WebSocket& ws, std::size_t max_message) {
     ws.auto_fragment(false);
 }
 
+// CSP source for an inline block: 'sha256-<standard padded base64>' of the exact text.
+std::string csp_hash(std::string_view text) {
+    auto encoded = beamit::net::base64url_encode(beamit::net::sha256(std::as_bytes(std::span(text))));
+    std::ranges::replace(encoded, '-', '+');
+    std::ranges::replace(encoded, '_', '/');
+    encoded.append((4 - encoded.size() % 4) % 4, '=');
+    return "'sha256-" + encoded + "'";
+}
+
+// Allows exactly the embedded page's inline <script>/<style> blocks and style="" attributes, nothing else inline.
+std::string make_content_security_policy(std::string_view page) {
+    std::string scripts;
+    std::string styles;
+    std::string style_attributes;
+    const auto collect = [&](std::string_view open, std::string_view close, std::string& out) {
+        for (std::size_t at = page.find(open); at != std::string_view::npos; at = page.find(open, at + 1)) {
+            const auto tag_end = page.find('>', at);
+            const auto end = page.find(close, tag_end);
+            if (tag_end == std::string_view::npos || end == std::string_view::npos) break;
+            if (page.substr(at, tag_end - at).find(" src=") != std::string_view::npos) continue;
+            out += ' ' + csp_hash(page.substr(tag_end + 1, end - tag_end - 1));
+        }
+    };
+    collect("<script", "</script>", scripts);
+    collect("<style", "</style>", styles);
+    for (std::size_t at = page.find(" style=\""); at != std::string_view::npos; at = page.find(" style=\"", at + 1)) {
+        const auto begin = at + 8;
+        const auto end = page.find('"', begin);
+        if (end == std::string_view::npos) break;
+        style_attributes += ' ' + csp_hash(page.substr(begin, end - begin));
+    }
+    std::string policy = "default-src 'none'; script-src 'self'" + scripts + "; style-src 'self'" + styles;
+    if (!style_attributes.empty()) policy += " 'unsafe-hashes'" + style_attributes;
+    policy += "; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    return policy;
+}
+
+const std::string& content_security_policy() {
+    static const std::string policy = make_content_security_policy(html_assets::index);
+    return policy;
+}
+
 http::response<http::string_body> make_response(http::status status, unsigned version, bool keep_alive,
                                                 std::string_view content_type, std::string body) {
     http::response<http::string_body> response{status, version};
@@ -724,8 +759,7 @@ http::response<http::string_body> make_response(http::status status, unsigned ve
     response.set(http::field::cache_control, "no-store");
     response.set("X-Content-Type-Options", "nosniff");
     response.set("Referrer-Policy", "no-referrer");
-    response.set("Content-Security-Policy",
-                 "default-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'");
+    response.set("Content-Security-Policy", content_security_policy());
     response.keep_alive(keep_alive);
     response.body() = std::move(body);
     response.prepare_payload();
@@ -819,7 +853,10 @@ awaitable<void> serve_connection(Server& server, tcp::socket socket) {
                                          "text/plain; charset=utf-8", "Method Not Allowed\n");
             } else if (request.target() == "/") {
                 response = make_response(http::status::ok, request.version(), request.keep_alive(),
-                                         "text/html; charset=utf-8", std::string(placeholder_page));
+                                         "text/html; charset=utf-8", std::string(html_assets::index));
+            } else if (request.target() == "/beamit.js") {
+                response = make_response(http::status::ok, request.version(), request.keep_alive(),
+                                         "text/javascript; charset=utf-8", std::string(html_assets::library));
             } else {
                 response = make_response(http::status::not_found, request.version(), request.keep_alive(),
                                          "text/plain; charset=utf-8", "Not Found\n");
@@ -854,6 +891,10 @@ awaitable<void> accept_loop(Server& server, tcp::acceptor& acceptor) {
 } // namespace
 
 void run_host_server(HostServerOptions options) {
+    // Pipeline threads join the MTA and exit with each stream. Without a process-wide MTA reference, COM tears the
+    // MTA down after the last stream and unloads WinRT DLLs that C++/WinRT's factory cache still points into.
+    CO_MTA_USAGE_COOKIE mta_cookie{};
+    check_hresult(CoIncrementMTAUsage(&mta_cookie), "Keeping the COM multithreaded apartment alive");
     Server server(std::move(options));
     server.tls.use_certificate(server.options.identity.certificate.get());
     const tcp::endpoint endpoint{asio::ip::make_address(server.options.bind_address), server.options.port};
@@ -865,7 +906,7 @@ void run_host_server(HostServerOptions options) {
     acceptor.listen();
     spdlog::info("TLS: {}; SHA-256 fingerprint {}", server.options.identity.description,
                  server.options.identity.sha256_fingerprint);
-    spdlog::info("Serving https://{}:{}/ (signaling wss://…/control); press Ctrl+C to stop",
+    spdlog::info("Serving https://{}:{}/ (signaling wss://<host>:<port>/control); press Ctrl+C to stop",
                  server.options.bind_address, server.options.port);
 
     asio::signal_set signals(server.io, SIGINT, SIGTERM);
