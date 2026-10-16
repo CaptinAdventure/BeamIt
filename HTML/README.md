@@ -15,6 +15,20 @@ sockets, tracks encoder generations, parses binary video frames, and forwards
 input according to protocol section 5.9. Audio and the reserved window
 lifecycle events are not implemented.
 
+## Window attention
+
+The test page handles protocol section 5.10 `attention` events. A banner lists
+each window currently requesting attention for the active stream, and the
+browser tab title shows the count. Secondary windows are tracked by their
+own opaque HWND, even when they differ from the captured window. Initial
+events received while the stream socket is opening are retained.
+
+The host's `clear` removes only the matching window; stopping the stream or
+disconnecting clears the display and restores the tab title. Local focus
+does not dismiss attention: the host clears it when the window is activated
+or destroyed. No notifications, sounds, or automatic host focus are requested.
+Browsers do not expose native Dock/taskbar flashing through this page.
+
 ## Browser input testing
 
 Start a stream, then click the video to focus it and forward mouse and

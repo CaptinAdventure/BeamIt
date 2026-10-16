@@ -196,6 +196,15 @@ Set-Content -NoNewline -Path $env:USERPROFILE\beamit.pw -Value '<long random pas
 #           --capture dxgi (desktop streams), --tls-cert host.pem --tls-key host-key.pem
 ```
 
+Or use the launcher script, which prepares everything per instance and starts `--serve`:
+
+```powershell
+.\scripts\Start-BeamItServer.ps1                       # instance "default", port 17389, all interfaces
+.\scripts\Start-BeamItServer.ps1 -Instance teams -Port 17390 -Bind 192.168.1.10 --codec h265 --bitrate 24000
+```
+
+It keeps files in `%LOCALAPPDATA%\BeamIt\<Instance>` (or `-DataDirectory`). If missing, it creates `password.txt` (32 random bytes, base64url) and a self-signed RSA-2048 `cert.pem`/`key.pem` (PKCS#8) with the host name, `localhost` and local IPs as subject alternative names, valid for two years and regenerated within 30 days of expiry. The directory, password and key are restricted to the current user. The password is not printed; copy it from the file. The script prints the certificate SHA-256 fingerprint for client pinning, then runs the newest `cmake-build-*\BeamIt.exe` (or `-Executable`). Remaining arguments are passed to BeamIt. Using per-instance PEM files instead of the built-in `CurrentUser\My` certificate gives each instance its own pinnable identity. Works with Windows PowerShell 5.1 and PowerShell 7; ACLs are set by SID through .NET, avoiding `Set-Acl` name lookups that fail on machines with a broken domain trust.
+
 The wire protocol is specified in [`PROTOCOL.md`](PROTOCOL.md); clients are written against that document. Summary:
 
 - `https://host:port/` serves the `HTML/` test client (embedded into the executable at build time as byte arrays, because MSVC limits string literals to about 16 KB; the Content-Security-Policy allows only the page's own inline script/styles by SHA-256 hash); `wss://host:port/control` is the JSON signaling socket; each stream gets its own `wss://host:port/streams/{id}?token=…` binary socket, announced with the codec parameters in `stream_offer`.
@@ -410,6 +419,7 @@ This is capability enumeration, not a live encode test: profile/capability/input
 - `tests/ProtocolTests.cpp` — protocol and bitstream unit tests
 - `tests/InputTests.cpp` — input mapping and validation unit tests
 - `tests/AttentionTests.cpp` — taskbar attention tracker unit tests
+- `scripts/Start-BeamItServer.ps1` — creates per-instance password/certificate files and starts the WSS host
 - `src/ApplicationWindows.hpp` and `src/ApplicationWindows.cpp` — window listing and PID selection heuristic
 - `src/TcpVideoSink.hpp` — disposable one-client Winsock transport
 - `src/media/CodecHeaders.hpp` and `src/media/CodecHeaders.cpp` — encoder-specific Annex B parameter-set generation

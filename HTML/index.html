@@ -32,6 +32,8 @@
       .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
       .status { color: #93c5fd; overflow-wrap: anywhere; }
       .error { color: #fca5a5; }
+      .attention { border: 1px solid #fbbf24; border-radius: 6px; padding: 12px; margin-bottom: 14px; color: #fde68a; background: #422006; }
+      .attention ul { margin: 6px 0 0; padding-left: 22px; }
       .video { min-height: 360px; display: grid; place-items: center; overflow: hidden; border-radius: 6px; background: #030712; }
       canvas { display: block; max-width: 100%; max-height: min(70vh, 760px); object-fit: contain; }
       .metrics { display: flex; flex-wrap: wrap; gap: 14px; color: #cbd5e1; font-variant-numeric: tabular-nums; margin-top: 10px; }
@@ -120,6 +122,10 @@
 
       <section aria-labelledby="video-heading">
         <h2 id="video-heading">Live video</h2>
+        <div id="attention" class="attention" role="status" aria-live="polite" hidden>
+          <strong>Windows requesting attention</strong>
+          <ul id="attention-windows"></ul>
+        </div>
         <div class="video">
           <canvas id="video-canvas" tabindex="0" aria-label="Remote video; click to control, Escape to release"></canvas>
         </div>
@@ -150,6 +156,8 @@
       let lastSequence = null;
       let frameCount = 0;
       let lastStatsAt = 0;
+      const normalTitle = document.title;
+      const attentionWindows = new Map();
 
       $("server-url").value = clientOptions.url;
 
@@ -159,6 +167,45 @@
         const output = $("log");
         output.textContent = `${line}\n${output.textContent}`.slice(0, 12000);
         $("connection-status").classList.toggle("error", error);
+      }
+
+      function renderAttention() {
+        const windows = attentionWindows.get(stream?.id);
+        const list = $("attention-windows");
+        list.replaceChildren();
+        for (const window of windows?.values() ?? []) {
+          const item = document.createElement("li");
+          item.textContent = `${window.title || "(untitled)"} — PID ${window.pid} · ${window.hwnd}`;
+          list.append(item);
+        }
+        const count = windows?.size ?? 0;
+        $("attention").hidden = count === 0;
+        document.title = count ? `[Attention: ${count}] ${normalTitle}` : normalTitle;
+      }
+
+      function handleAttention(message) {
+        if (message.type !== "attention") return;
+        if (typeof message.stream_id !== "string" ||
+            !["set", "clear"].includes(message.state) ||
+            !message.window || typeof message.window.hwnd !== "string" ||
+            !Number.isInteger(message.window.pid) ||
+            (message.window.title !== undefined && typeof message.window.title !== "string")) {
+          log("Invalid attention event received.", true);
+          return;
+        }
+        let windows = attentionWindows.get(message.stream_id);
+        if (message.state === "set") {
+          if (!windows) {
+            windows = new Map();
+            attentionWindows.set(message.stream_id, windows);
+          }
+          windows.set(message.window.hwnd, message.window);
+        } else {
+          windows?.delete(message.window.hwnd);
+          if (windows?.size === 0) attentionWindows.delete(message.stream_id);
+        }
+        log(`Attention ${message.state}: ${message.window.title || message.window.hwnd} · stream ${message.stream_id}.`);
+        renderAttention();
       }
 
       function setConnected(connected) {
@@ -235,6 +282,8 @@
         $("host-input-state").textContent = "No input state queried";
         resetVideo();
         stream = null;
+        attentionWindows.clear();
+        renderAttention();
         $("stop-button").disabled = true;
         $("start-button").disabled = !client?.connected;
       }
@@ -275,6 +324,7 @@
         $("start-button").disabled = true;
         const started = performance.now();
         stream = await client.startStream({ source, video });
+        renderAttention();
         stream.on("frame", (frame) => {
           if (lastSequence !== null && frame.sequence !== lastSequence + 1n) {
             log(`Frame sequence gap: ${lastSequence} → ${frame.sequence}${frame.discontinuity ? " (discontinuity)" : ""}.`);
@@ -337,6 +387,7 @@
         $("connection-status").textContent = "Connecting and authenticating…";
         try {
           client = new BeamItClient({ url: $("server-url").value });
+          client.on("message", handleAttention);
           client.on("close", ({ code, reason }) => {
             log(`Control socket closed (${code})${reason ? `: ${reason}` : ""}.`);
             detachStream();
@@ -391,6 +442,10 @@
         } catch (error) {
           setStreamStatus(error.message, true);
           $("start-button").disabled = !client?.connected;
+          if (!stream) {
+            attentionWindows.clear();
+            renderAttention();
+          }
           log(error.message, true);
         }
       });
