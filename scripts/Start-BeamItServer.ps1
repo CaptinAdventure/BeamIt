@@ -13,7 +13,7 @@
 .EXAMPLE
     .\scripts\Start-BeamItServer.ps1
 .EXAMPLE
-    .\scripts\Start-BeamItServer.ps1 -Instance teams -Port 17390 -Bind 192.168.1.10 --codec h265 --bitrate 24000
+    .\scripts\Start-BeamItServer.ps1 -Instance teams -Port 17390 -Bind 192.168.1.10
 #>
 [CmdletBinding()]
 param(
@@ -26,7 +26,7 @@ param(
     [string] $Executable,
     # Instance directory; defaults to %LOCALAPPDATA%\BeamIt\<Instance>.
     [string] $DataDirectory,
-    # Extra BeamIt arguments, e.g. --codec h265 --fps 60 --bitrate 24000.
+    # Extra BeamIt arguments, passed through unchanged.
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $BeamItArguments = @()
 )
@@ -158,7 +158,7 @@ $sha256.Dispose()
 Write-Host "Certificate SHA-256 fingerprint: $fingerprint (valid until $($certificate.NotAfter))"
 $certificate.Dispose()
 
-$arguments = @('--serve', '--port', $Port, '--bind', $Bind,
+$arguments = @('--port', $Port, '--bind', $Bind,
                '--password-file', $passwordFile, '--tls-cert', $certFile, '--tls-key', $keyFile) + $BeamItArguments
 Write-Host "Starting $Executable $($arguments -join ' ')"
 Write-Host "Open https://$([System.Net.Dns]::GetHostName()):$Port/ and accept the certificate once."

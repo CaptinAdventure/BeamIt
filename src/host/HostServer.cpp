@@ -537,6 +537,18 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
         capture::CaptureTarget target{};
         DWORD stream_pid{};
         json::object source_out{{"kind", kind}};
+        // Windows need WGC; whole-desktop streams default to DXGI Desktop Duplication.
+        auto backend = kind == "desktop" ? CaptureBackend::Dxgi : CaptureBackend::Wgc;
+        if (const auto* capture_field = source.if_contains("capture")) {
+            if (capture_field->is_string() && capture_field->as_string() == "wgc") {
+                backend = CaptureBackend::Wgc;
+            } else if (capture_field->is_string() && capture_field->as_string() == "dxgi" && kind == "desktop") {
+                backend = CaptureBackend::Dxgi;
+            } else {
+                throw ProtocolError{"invalid_request",
+                                    "source.capture must be \"dxgi\" or \"wgc\" (window sources: \"wgc\" only)"};
+            }
+        }
         if (kind == "window" || kind == "application") {
             HWND window{};
             if (kind == "window") {
@@ -607,7 +619,7 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
         std::unique_ptr<capture::Capturer> capturer;
         std::unique_ptr<media::Encoder> encoder;
         try {
-            capturer = defaults.make_capturer(target.kind);
+            capturer = defaults.make_capturer(backend);
         } catch (const std::exception& error) {
             throw ProtocolError{"capture_failed", error.what()};
         }
@@ -621,6 +633,7 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
         entry->id = bytes_text(beamit::net::random_bytes(16));
         entry->token = bytes_text(beamit::net::random_bytes(32));
         entry->request_id = id;
+        source_out["capture"] = backend == CaptureBackend::Dxgi ? "dxgi" : "wgc";
         entry->source = std::move(source_out);
         entry->pipeline = std::make_unique<StreamPipeline>(std::move(capturer), std::move(encoder), target, options);
         entry->input = std::make_unique<input::StreamInput>(target.window);

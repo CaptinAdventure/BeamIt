@@ -129,19 +129,29 @@ function validateMouseMode(mode) {
 
 function validateSource(source) {
   if (!source || typeof source !== "object") throw new TypeError("source is required");
+  const capture = {};
+  if (source.capture !== undefined) {
+    if (!["dxgi", "wgc"].includes(source.capture)) {
+      throw new TypeError('source.capture must be "dxgi" or "wgc"');
+    }
+    if (source.capture === "dxgi" && source.kind !== "desktop") {
+      throw new TypeError("DXGI capture is supported only for desktop sources");
+    }
+    capture.capture = source.capture;
+  }
   switch (source.kind) {
     case "window":
       if (typeof source.hwnd !== "string" || source.hwnd.length === 0) {
         throw new TypeError('window source requires an opaque string "hwnd"');
       }
-      return { kind: "window", hwnd: source.hwnd };
+      return { kind: "window", hwnd: source.hwnd, ...capture };
     case "application":
       if (!Number.isSafeInteger(source.pid) || source.pid < 0) {
         throw new TypeError('application source requires an integer "pid"');
       }
-      return { kind: "application", pid: source.pid };
+      return { kind: "application", pid: source.pid, ...capture };
     case "desktop":
-      return { kind: "desktop" };
+      return { kind: "desktop", ...capture };
     default:
       throw new TypeError('source.kind must be "window", "application", or "desktop"');
   }

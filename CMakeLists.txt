@@ -88,7 +88,6 @@ add_executable(BeamIt
     src/media/D3D12VideoEncoder.cpp
     src/media/AutoVideoEncoder.cpp
     src/media/CodecHeaders.cpp
-    src/media/ProbeEncoders.cpp
     ${BEAMIT_HOST_SOURCES}
 )
 target_include_directories(BeamIt PRIVATE include src "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -96,9 +95,9 @@ target_link_libraries(BeamIt PRIVATE spdlog CLI11::CLI11 Boost::beast Boost::jso
     d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi)
 target_compile_definitions(BeamIt PUBLIC NOMINMAX _WIN32_WINNT=0x0A00)
 if(TARGET NVIDIA::NVENCHeaders)
-    target_sources(BeamIt PRIVATE src/media/ProbeNvenc.cpp src/media/NvencVideoEncoder.cpp)
+    target_sources(BeamIt PRIVATE src/media/NvencVideoEncoder.cpp)
     target_link_libraries(BeamIt PRIVATE NVIDIA::NVENCHeaders)
-    target_compile_definitions(BeamIt PRIVATE BEAMIT_HAS_NVENC_PROBE=1)
+    target_compile_definitions(BeamIt PRIVATE BEAMIT_HAS_NVENC=1)
 endif()
 
 if(BUILD_TESTING)
@@ -135,7 +134,7 @@ if(BUILD_TESTING)
     if(TARGET NVIDIA::NVENCHeaders)
         target_sources(BeamItTests PRIVATE tests/NvencVideoEncoderTests.cpp src/media/NvencVideoEncoder.cpp)
         target_link_libraries(BeamItTests PRIVATE NVIDIA::NVENCHeaders)
-        target_compile_definitions(BeamItTests PRIVATE BEAMIT_HAS_NVENC_PROBE=1)
+        target_compile_definitions(BeamItTests PRIVATE BEAMIT_HAS_NVENC=1)
     endif()
     add_test(NAME BeamItTests COMMAND BeamItTests)
 endif()

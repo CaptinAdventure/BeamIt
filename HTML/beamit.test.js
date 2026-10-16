@@ -203,6 +203,46 @@ test("input state and mouse mode requests handle replies and host errors", async
   assert.equal(stream.mouseMode, "relative");
 });
 
+test("capture selection is preserved and invalid source/backend combinations are rejected before sending", async (t) => {
+  const { client, socket, stream } = await inputSession(t);
+  stream.close();
+  const cases = [
+    { kind: "desktop" },
+    { kind: "desktop", capture: "dxgi" },
+    { kind: "desktop", capture: "wgc" },
+    { kind: "window", hwnd: "0xABC", capture: "wgc" },
+    { kind: "application", pid: 4242, capture: "wgc" },
+  ];
+  for (const [index, source] of cases.entries()) {
+    const starting = client.startStream({ source });
+    const request = socket.sent.at(-1);
+    assert.deepEqual(request.source, source);
+    assert.equal(Object.hasOwn(request, "video"), false);
+    const id = `capture-${index}`;
+    socket.receive({
+      type: "stream_offer", id: request.id, stream_id: id,
+      source: { ...source, capture: source.capture ?? "dxgi" },
+      url: `wss://test:8443/streams/${id}?token=${base64UrlEncode(new Uint8Array(32))}`,
+      token_expires_in_ms: 10000, input: { mouse_mode: "absolute" },
+      video: { generation: 1, codec: "h264", codec_string: "avc1.4D001F", width: 1920, height: 1080 },
+    });
+    await tick();
+    FakeSocket.instances.at(-1).open();
+    const opened = await starting;
+    assert.equal(opened.offer.source.capture, source.capture ?? "dxgi");
+    opened.close();
+  }
+  const count = socket.sent.length;
+  for (const source of [
+    { kind: "window", hwnd: "0xABC", capture: "dxgi" },
+    { kind: "application", pid: 4242, capture: "dxgi" },
+    { kind: "desktop", capture: "unknown" },
+  ]) {
+    await assert.rejects(client.startStream({ source }), TypeError);
+  }
+  assert.equal(socket.sent.length, count);
+});
+
 function browserFixture() {
   const window = new FakeTarget();
   const document = new FakeTarget();

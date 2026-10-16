@@ -29,6 +29,21 @@ does not dismiss attention: the host clears it when the window is activated
 or destroyed. No notifications, sounds, or automatic host focus are requested.
 Browsers do not expose native Dock/taskbar flashing through this page.
 
+## Capture and video settings
+
+The page offers DXGI Desktop Duplication (the default) or WGC for desktop
+streams. Window and application streams always use WGC; DXGI is rejected
+locally for those sources. The streaming status reports the capture API
+returned by the host in `stream_offer.source.capture`.
+
+Library callers may pass `source.capture: "dxgi" | "wgc"` to `startStream`.
+When omitted, the host defaults to DXGI for desktops and WGC for windows and
+applications. Omitted video fields default to H.264, 60 FPS and 48000 kbps;
+the page starts with those same values. Encoder backend and chroma sampling
+are selected automatically by the host, not by the client. If WebCodecs
+rejects H.264's negotiated profile, stop the stream and try H.265; neither
+codec is guaranteed to be supported by every browser/GPU.
+
 ## Browser input testing
 
 Start a stream, then click the video to focus it and forward mouse and

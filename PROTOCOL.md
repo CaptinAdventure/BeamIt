@@ -195,10 +195,15 @@ candidate of that process, so several windows of one process may be
 
 * `"window"` with `hwnd` — one top-level window (Windows.Graphics.Capture);
 * `"application"` with integer `pid` — that process's primary window;
-* `"desktop"` — the primary monitor (host's configured capture backend).
+* `"desktop"` — the primary monitor.
 
-`video` and each of its fields are optional; host command-line defaults are
-used for omitted fields. `codec` is `"h264"` or `"h265"`; `frame_rate` is
+`source.capture` optionally selects the capture API: `"dxgi"` (DXGI Desktop
+Duplication, the default for `"desktop"`) or `"wgc"` (Windows.Graphics.Capture).
+Window and application sources always use `"wgc"`; `"dxgi"` for them is an
+`invalid_request`. `stream_offer.source.capture` reports the API used.
+
+`video` and each of its fields are optional; omitted fields default to
+`"h264"`, 60 FPS and 48000 kbps. `codec` is `"h264"` or `"h265"`; `frame_rate` is
 1–240; `bitrate_kbps` is 1–1000000. The host keeps the codec and picks the
 best available chroma sampling (§8).
 
@@ -216,7 +221,7 @@ produces an `error` (`not_found`, `capture_failed`, `encoder_failed`,
   "stream_id": "Q2hOc3kV2bTqjG6dAVu0Sg",
   "url": "wss://host:port/streams/Q2hOc3kV2bTqjG6dAVu0Sg?token=…",
   "token_expires_in_ms": 10000,
-  "source": { "kind": "window", "hwnd": "0x1A2B3C", "pid": 4242, "title": "Microsoft Teams" },
+  "source": { "kind": "window", "hwnd": "0x1A2B3C", "pid": 4242, "title": "Microsoft Teams", "capture": "wgc" },
   "video": { …video parameters, §5.5… }
 }
 ```
@@ -577,14 +582,12 @@ jitter buffer) and may drop late frames only at key-frame boundaries.
 
 ## 8. Encoder selection (informative)
 
-The host operator chooses the encoder backend and capture backend on the
-command line. With the default automatic encoder, H.264 prefers native NVENC
+The host always selects the encoder backend automatically. H.264 prefers native NVENC
 4:4:4 (High 4:4:4 Predictive) and falls back to D3D12 4:2:0; H.265 tries
 D3D12 4:4:4, then 4:2:2, then 4:2:0. The resulting sampling is reported in
 `chroma_format` and `codec_string`. Browser hardware decoders often lack
 4:4:4 support: a client should call `VideoDecoder.isConfigSupported()` and,
-if unsupported, restart the stream with `"codec": "h265"`/a different host
-configuration.
+if unsupported, restart the stream with `"codec": "h265"`.
 
 ## 9. Close codes
 

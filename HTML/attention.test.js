@@ -31,8 +31,22 @@ test("page tracks initial, secondary-window, and per-stream attention until host
     globalThis.page = {
       handleAttention, detachStream,
       selectStream(id) { stream = { id }; renderAttention(); },
+      selectSource(kind) { sourceKind.value = kind; updateSourceFields(); },
+      selectCapture(capture) { desktopCapture = capture; updateSourceFields(); },
     };`, context);
   const { page } = context;
+  page.selectSource("desktop");
+  assert.equal(element("capture-api").value, "dxgi");
+  assert.equal(element("capture-api").disabled, false);
+  page.selectCapture("wgc");
+  page.selectSource("window");
+  assert.equal(element("capture-api").value, "wgc");
+  assert.equal(element("capture-api").disabled, true);
+  page.selectSource("application");
+  assert.equal(element("capture-api").value, "wgc");
+  assert.equal(element("capture-api").disabled, true);
+  page.selectSource("desktop");
+  assert.equal(element("capture-api").value, "wgc");
   const event = (state, hwnd, streamId = "one", title = "Teams") => ({
     type: "attention", stream_id: streamId, state, window: { hwnd, pid: 4242, ...(title === undefined ? {} : { title }) },
   });

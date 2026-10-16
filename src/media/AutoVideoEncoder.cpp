@@ -1,6 +1,6 @@
 #include "beamit/media/AutoVideoEncoder.hpp"
 #include "beamit/media/D3D12VideoEncoder.hpp"
-#ifdef BEAMIT_HAS_NVENC_PROBE
+#ifdef BEAMIT_HAS_NVENC
 #include "beamit/media/NvencVideoEncoder.hpp"
 #endif
 
@@ -59,7 +59,7 @@ EncoderSubmitResult AutoVideoEncoder::try_submit(const CapturedFrame& frame) {
         }
         if (options_.codec == VideoCodec::H264) {
             spdlog::info("Automatic H.264: D3D12 has no 4:4:4 profile; trying NVENC 4:4:4 first");
-#ifdef BEAMIT_HAS_NVENC_PROBE
+#ifdef BEAMIT_HAS_NVENC
             auto nvenc = std::make_unique<NvencVideoEncoder>();
             if (!nvenc->configure(options_) || !nvenc->start()) {
                 error_ = nvenc->last_error();

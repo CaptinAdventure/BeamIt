@@ -84,6 +84,11 @@
           <select id="window-select" name="hwnd"></select>
           <label id="pid-label" for="pid">Application PID</label>
           <input id="pid" name="pid" type="number" min="0" step="1" inputmode="numeric">
+          <label for="capture-api">Capture API</label>
+          <select id="capture-api" name="capture" disabled>
+            <option value="dxgi">DXGI Desktop Duplication (desktop default)</option>
+            <option value="wgc" selected>Windows.Graphics.Capture (WGC)</option>
+          </select>
           <label for="codec">Codec</label>
           <select id="codec" name="codec">
             <option value="h264">H.264</option>
@@ -92,7 +97,7 @@
           <label for="frame-rate">Frame rate (1–240)</label>
           <input id="frame-rate" name="frame_rate" type="number" min="1" max="240" step="1" value="60">
           <label for="bitrate">Bitrate (kbps)</label>
-          <input id="bitrate" name="bitrate_kbps" type="number" min="1" max="1000000" step="1" value="20000">
+          <input id="bitrate" name="bitrate_kbps" type="number" min="1" max="1000000" step="1" value="48000">
           <div class="actions">
             <button id="start-button" type="submit" disabled>Start stream</button>
             <button id="stop-button" class="danger" type="button" disabled>Stop stream</button>
@@ -156,6 +161,7 @@
       let lastSequence = null;
       let frameCount = 0;
       let lastStatsAt = 0;
+      let desktopCapture = "dxgi";
       const normalTitle = document.title;
       const attentionWindows = new Map();
 
@@ -224,6 +230,8 @@
         $("window-select").hidden = kind !== "window";
         $("pid-label").hidden = kind !== "application";
         $("pid").hidden = kind !== "application";
+        $("capture-api").disabled = kind !== "desktop";
+        $("capture-api").value = kind === "desktop" ? desktopCapture : "wgc";
       }
 
       function setStreamStatus(text, error = false) {
@@ -315,6 +323,7 @@
         } else {
           source = { kind: "desktop" };
         }
+        source.capture = $("capture-api").value;
         const video = {
           codec: $("codec").value,
           frame_rate: Number($("frame-rate").value),
@@ -363,6 +372,9 @@
             onError: (error) => log(`Decoder: ${error.message}`, true),
           });
         } catch (error) {
+          if (error.code === "unsupported_video_config") {
+            log("Decoder configuration unsupported. Try restarting with H.265; the host selects the encoder and sampling automatically.", true);
+          }
           try {
             await stream.stop();
           } catch (stopError) {
@@ -377,7 +389,7 @@
         $("mouse-mode").value = stream.mouseMode;
         inputBinding = attachInput(stream);
         setInputEnabled(true);
-        setStreamStatus(`Streaming ${source.kind} · ${config.width}×${config.height} · ${config.codec_string}`);
+        setStreamStatus(`Streaming ${stream.offer.source.kind} · ${stream.offer.source.capture.toUpperCase()} · ${config.width}×${config.height} · ${config.codec_string}`);
         log(`Stream ${stream.id} opened in ${(performance.now() - started).toFixed(0)} ms.`);
       }
 
@@ -508,6 +520,9 @@
       });
 
       sourceKind.addEventListener("change", updateSourceFields);
+      $("capture-api").addEventListener("change", () => {
+        desktopCapture = $("capture-api").value;
+      });
       updateSourceFields();
     </script>
   </body>
