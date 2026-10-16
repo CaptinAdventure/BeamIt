@@ -1,0 +1,345 @@
+# BeamIt
+
+BeamIt is a **low-latency Windows application-remoting host** for mirroring a selected application's windows on another computer as native client-side windows. Full-desktop capture remains available for testing and desktop scenarios.
+
+The project is intentionally close to the problem space of RDP and Sunshine, but with a narrower scope:
+
+- **Host OS:** Windows 11 and newer only
+- **Client OS:** macOS first, Windows afterward
+- **Language:** C++26
+- **APIs:** prefer recent Windows APIs; avoid legacy approaches unless there is a strong reason
+- **Input support:** keyboard and mouse only
+- **Audio:** optional
+- **Gamepad support:** not in scope
+- **Local GUI:** not required
+- **Remote client:** custom seamless-remoting client; no Moonlight compatibility requirement
+- **Network:** strictly LAN-only; Internet connectivity will never be a requirement
+
+## Current status
+
+This repository has full-monitor DXGI capture, monitor or single-window WGC capture, and automatic codec-preserving selection between D3D12 Video Encode and native NVENC DirectX 11 encoding, prioritizing 4:4:4 sampling.
+The app is a disposable CLI recorder and one-client plaintext TCP window streamer for testing the capture-to-encoder path. WGC and DXGI have each produced five-second H.264 and H.265 files on the development machine that decode with FFmpeg. The custom client, authenticated session protocol and application window-family tracking are not implemented.
+
+### Current near-term goal
+
+The immediate goal is to mirror **Microsoft Teams** to a custom macOS client, with its main and external/secondary windows presented as native local windows. A Windows client follows. Taskbar attention on Windows and Dock attention on macOS are in scope; native notification forwarding is not required for this milestone.
+
+Both capture backends expose frames to a generic encoder interface. Single-window video can be viewed with `nc` and `ffplay` using the temporary TCP test below. Next, define the macOS client and window/control protocol, then implement WGC application-window tracking beyond a single HWND. Broader GPU/driver coverage still needs testing. Audio and gamepad support remain out of scope for this milestone.
+
+## Project goal
+
+Build a host application that can:
+
+1. Capture the desktop or a chosen app/window with minimal latency
+2. Encode video efficiently on Windows 11+
+3. Send video, input, and optionally audio to a remote client
+4. Keep end-to-end delay as low as possible while remaining stable
+
+## Client and session direction
+
+BeamIt is a seamless application-remoting system, not a Moonlight-compatible streaming host. A conventional Moonlight or browser video surface does not provide the required native window lifecycle and attention integration, so those are no longer the client target.
+
+Start with the macOS client, retaining Windows client support as a design requirement. The client must associate stable remote window identifiers with local windows and synchronize creation/closure, visibility, ownership, geometry, titles/icons, focus and attention, alongside video and keyboard/mouse input. Application selection must include secondary windows and related processes, not just one HWND. Exact window grouping, popup behavior and rendering/stream layout remain design decisions.
+
+AppKit windows with VideoToolbox decoding and Metal presentation are a candidate macOS-native approach, not yet a selected implementation. Compare that with a cross-platform client framework before committing; macOS-first does not by itself choose a language or UI toolkit.
+
+### LAN access and multiple hosts
+
+The system is strictly LAN-only. Do not add cloud services, Internet endpoints, NAT traversal or port forwarding requirements. Multiple independent BeamIt server instances may run on the same Windows machine; each needs independently configurable listen endpoints, application selection and credentials. Never assume a single fixed machine-wide port or session.
+
+Each instance accepts a shared password from a configuration file or command-line parameter. Possession of that instance's password is the combined authentication/authorization policy: no separate user accounts or roles are required. Clients without it must neither decode the stream nor issue accepted input/control commands. Password sharing grants all holders the same instance-level access; there is no individual identity or revocation.
+
+AES-256 is the requested encryption primitive, but an arbitrary password is not a 256-bit key. Before networking implementation, select a standard password-based key derivation and authenticated session protocol. Use authenticated encryption (for example AES-256-GCM), fresh session/directional keys, unique nonces, replay protection, and verified key possession before granting control. Protect window metadata and input/control traffic as well as video. Encryption without integrity or merely failing video decode is not sufficient authentication. Do not invent a cryptographic protocol.
+
+Prefer configuration files with restrictive permissions; command-line secrets can appear in process inspection and shell history. Never log passwords or derived keys. LAN-only deployment does not remove the need for authentication and integrity. The exact KDF, handshake, transport and configuration/CLI syntax are not implemented or selected yet.
+
+## Recommended high-level architecture
+
+The implementation is being organized around the following pieces:
+
+- **Capture pipeline**: desktop/window/app capture on Windows 11+ that emits a common GPU-backed frame type
+- **Encoder**: a generic interface accepting frames from either capture backend; automatic sampling-first selection, or explicit D3D12 H.264/H.265 or NVENC DirectX 11 H.264 4:4:4
+- **Transport**: authenticated, encrypted LAN video and window/control channel(s)
+- **Client integration**: native windows, remote-window mapping and taskbar/Dock attention
+- **Input injection**: keyboard and mouse handling
+- **Audio**: optional capture and streaming path
+- **Session management**: connect, disconnect, resync, bitrate/frame pacing
+- **Configuration**: resolution, bitrate, FPS, capture target, audio toggle
+
+## Capture API direction
+
+BeamIt should be able to support both of the relevant Windows capture APIs:
+
+- **Windows.Graphics.Capture** as the primary backend for window-oriented capture
+- **DXGI Desktop Duplication** as the alternate backend for desktop/monitor capture and fallback scenarios
+
+For the current Teams milestone, **Windows.Graphics.Capture is the better first choice** because the immediate requirement is correct handling of external and secondary windows.
+DXGI Desktop Duplication is implemented as a full-monitor capture backend and remains valuable for full-desktop streaming and fallback scenarios.
+
+The application exposes a common pure-virtual `Capturer` abstraction. The temporary recorder selects one backend at startup with `--capture`; it never switches APIs during a recording. This test harness does not settle production backend selection.
+
+Suggested shape of the capture layer:
+
+- `Capturer` as the shared interface for lifecycle and frame acquisition
+- `WgcCapturer` for `Windows.Graphics.Capture`
+- `DxgiCapturer` for `DXGI Desktop Duplication`
+
+That keeps the rest of the streaming pipeline agnostic to the backend while preserving the ability to choose the most appropriate API for the scenario.
+
+The DXGI implementation uses Desktop Duplication to capture one monitor at a time. A null monitor target selects the primary display; an explicit `HMONITOR` selects another display. It passes the acquired D3D11 surface directly to the encoder without a capture texture allocation or GPU copy. A shared lifetime lease keeps the duplication frame acquired while consumers use it; callers must retain the complete `CapturedFrame`, not just its texture. The encoder retains the frame through GPU completion. `last_error()` distinguishes a no-frame timeout (`S_OK`) from failures. Cursor composition and multi-monitor composition are not implemented yet.
+
+The duplication frame stays acquired until consumers release their leases, then is released immediately before the next nonblocking acquisition (or shutdown). Acquisition returns no new frame while a consumer still holds the previous lease. Keeping `ReleaseFrame` adjacent to `AcquireNextFrame` avoids unnecessary desktop-update copies during encoding/pacing. The test harness releases borrowed frames after encoded output is drained; when DXGI has no update, `Encoder::try_repeat_frame()` encodes the retained GPU image (converted YUV with D3D12, owned BGRA with NVENC) as a new picture with advancing reference/order state. It never replays compressed packets or accesses a released duplication surface. WGC still uses owned texture copies. Capture-to-display latency still needs comparison on the receiving computer.
+
+The WGC implementation captures one monitor or one HWND per capturer instance, with the same null-monitor primary-display default. It uses `CreateForMonitor` or `CreateForWindow`, a free-threaded frame pool, and an owned D3D11 texture for each acquired frame. Cursor capture follows `CaptureOptions::capture_cursor`. Resizing recreates the frame pool and reconfigures the test encoder. Dimensions are rounded down to even pixels for NV12 encoding, dropping at most one pixel at the right/bottom edge. Application-family tracking and multi-monitor composition are not implemented.
+
+## Frame-to-encoder boundary
+
+Both `WgcCapturer` and `DxgiCapturer` expose frames through the same `CapturedFrame` type. It carries a reference-counted D3D11 texture and capture timestamp.
+
+The pure-virtual `Encoder` interface accepts those frames and exposes encoded packets separately, allowing asynchronous hardware encoders to apply backpressure and return output when ready. `D3D12VideoEncoder` selects H.264 or H.265 explicitly, validates the requested codec/profile/input format/resolution/rate-control mode with the adapter's D3D12 Video Encode capability queries, and does not silently switch codecs.
+
+The D3D12 encoder chooses the same adapter as the incoming capture texture. It uses a shared D3D12 input texture in the selected YUV format, opened on the capture D3D11 device, and a D3D11 video-processor GPU conversion from the captured BGRA frame. Shared fences coordinate D3D11 conversion and D3D12 encode/copy work. Submission is bounded to one in-flight frame; callers receive `WouldBlock` until the previous packet is drained. Encoded bytes are copied back to CPU memory only at the packet handoff.
+
+### Automatic encoder selection (default)
+
+`--encoder auto` is the default. `AutoVideoEncoder` prioritizes 4:4:4 while preserving `--codec`:
+
+| Requested codec | Initialization priority |
+| --- | --- |
+| H.264 (default) | NVENC High444 / 8-bit 4:4:4, then D3D12 Main / 8-bit 4:2:0 |
+| HEVC (`--codec h265`) | D3D12 8-bit 4:4:4, 10-bit 4:4:4, 10-bit 4:2:2, then 8-bit 4:2:0 |
+
+D3D12's H.264 API exposes no 4:4:4 profile, so that impossible candidate is skipped with a log. NVENC HEVC is not implemented and is not tried for an HEVC request. No codec change is permitted: the selected codec's available 4:4:4 backends are considered before lowering sampling on D3D12.
+
+Selection happens when the first frame supplies the capture device and is repeated on reconfiguration/resize. NVENC availability/profile/configuration rejection (including missing SDK integration or an incompatible/missing driver API) is logged before trying D3D12. Allocation, device, GPU submission and encoding failures abort; they do not trigger backend switching. Once a backend accepts a picture, it stays selected until reconfiguration. Both encoders remain on the capture adapter. Explicit `--encoder d3d12` or `--encoder nvenc` bypasses automatic backend selection.
+
+On the development T1000, default H.264 selects NVENC and produces `yuv444p`; HEVC tries D3D12's higher-sampling candidates and currently falls back to `yuv420p`. The selected sampling is logged. Clients must support the selected profile; automatic host selection does not negotiate client hardware-decoding support. The hidden `[.auto-hardware]` Catch2 test checks the NVENC-to-D3D12 fallback on a non-NVIDIA adapter; on the development Intel adapter, NVENC is correctly rejected and D3D12 is attempted, but D3D12 also rejects encoding with the current driver.
+
+### Native NVENC DirectX 11 encoder
+
+Select `--encoder nvenc --codec h264` to force `NvencVideoEncoder` through the same `Encoder` interface. NVENC currently requires **8-bit SDR H.264 High 4:4:4 Predictive** and fails explicitly if that profile, 4:4:4 encoding, RGB input, or asynchronous encoding is unavailable. Explicit NVENC selection does not fall back to 4:2:0, HEVC, D3D12, or another adapter.
+
+The NVENC session uses `NV_ENC_DEVICE_TYPE_DIRECTX` on the capture texture's D3D11 device. Each fresh frame is copied on the GPU to one reusable encoder-owned BGRA texture, registered as NVENC's word-ordered ARGB format (BGRA bytes). NVENC performs RGB-to-YUV conversion for 4:4:4 encoding; no CPU pixel readback, CUDA toolkit, manual planar packing, or packed AYUV intermediate is required. The copy is deliberately encoder-side: it preserves the last image for DXGI idle-frame repeats without accessing a released duplication surface. Capture remains copy-free for DXGI. Capture must already be on an NVENC-capable NVIDIA device; cross-GPU transfer is not implemented.
+
+The P1 ultra-low-latency preset favors throughput over compression efficiency. Encoding uses CBR with a one-frame VBV, a 60-picture I/P GOP, one reference frame, no B-frames, no lookahead, no temporal AQ, and no multipass. Async Windows completion events bound submission to one outstanding picture; output is Annex B with AUD and repeated SPS/PPS on IDRs. The complete captured-frame lease is retained through completion, with a D3D11 copy fence also protecting shutdown/error cleanup. Reconfiguration rebuilds the session for resized windows; the next picture is an IDR.
+
+Record or stream with either capture backend:
+
+```powershell
+.\BeamIt.exe --encoder nvenc --capture dxgi --desktop --fps 60 --bitrate 48000 --output desktop-444.h264
+.\BeamIt.exe --encoder nvenc --capture wgc --app 1234 --fps 60 --bitrate 48000 --insecure-test-stream --port 5000
+```
+
+For a low-buffer test receiver:
+
+```sh
+nc HOST_IP 5000 | ffplay -f h264 -framerate 60 -nofind_stream_info \
+  -fflags nobuffer -flags low_delay -threads 1 -sync ext -framedrop -noinfbuf -i pipe:0
+```
+
+Both WGC and DXGI 1080p60 recordings on the T1000 decoded as `High 4:4:4 Predictive`, `yuv444p`, with 5 I-frames and 295 P-frames per five-second recording and no B-frames. This does not prove one-frame end-to-end latency or hardware decoding on macOS: High444 support must be checked on the intended client, and software decoding can increase latency. HDR and HEVC NVENC encoding are not implemented.
+
+The SDK integration described below must be enabled. Driver-independent lifecycle/configuration tests run with the normal test suite; run the hidden `[.nvenc-hardware]` Catch2 tag through CLion's `BeamItTests` configuration for D3D11 submission/repeat, backpressure, lease release, in-flight shutdown and session-recreation checks on an NVIDIA GPU.
+
+### Automatic chroma sampling
+
+List encoding capabilities on **all** DXGI hardware adapters without capturing or opening a listener:
+
+```powershell
+.\BeamIt.exe --probe-encoders --fps 60 --bitrate 24000
+```
+
+The probe logs adapter index/name, PCI vendor/device IDs and LUID, then checks H.264 Main/NV12 and the HEVC sampling candidates plus Main10/P010. It distinguishes codec, profile and input-format rejection and checks the current 1920x1080 CBR I/P configuration (GOP 60, one reference, no B-frames) at the supplied FPS/bitrate. Software adapters are listed but skipped. An HRESULT of zero with an unsupported message means the query succeeded and returned `IsSupported = FALSE`, not that encoding is supported.
+
+This is a capability probe, not an encoder selection command or proof of working conversion, resource interoperability, live encode or cross-adapter transfer. The running encoder still follows the capture adapter; indices/LUIDs can change across restarts. Main10/P010 is probed for future high-bit-depth work, not enabled as a runtime HDR mode.
+
+On the development system, the 1080p60/24,000 kbps probe reported:
+
+| Adapter | D3D12 query results |
+| --- | --- |
+| NVIDIA Quadro T1000 (`10DE:1FB9`) | H.264 Main/NV12, HEVC Main/NV12 and HEVC Main10/P010 I/P supported; queried HEVC 4:4:4/4:2:2 profiles unsupported |
+| Intel UHD Graphics (`8086:9BC4`) | H.264 and HEVC encoder codec support reported false through D3D12 |
+| Microsoft Basic Render Driver | Software adapter, skipped |
+
+These results describe this driver/API combination, not every API capability of the silicon. Prefer D3D12 when it exposes the desired sampling; use NVENC for the demonstrated NVIDIA H.264 4:4:4 gap before lowering sampling. A driver update may change results. Do not assume that swapping D3D12 adapter pointers enables cross-GPU capture: the existing D3D11/D3D12 bridge is same-adapter.
+
+HEVC (`--codec h265`) tries these formats in order, retaining the first supported capture-to-encoder path:
+
+| Priority | Sampling | Input format | HEVC profile |
+| --- | --- | --- | --- |
+| 1 | 4:4:4, 8-bit | AYUV | Main 4:4:4 |
+| 2 | 4:4:4, 10-bit | Y410 | Main10 4:4:4 |
+| 3 | 4:2:2, 10-bit | Y210 | Main10 4:2:2 |
+| 4 | 4:2:0, 8-bit | NV12 | Main |
+
+Each candidate must pass codec/profile/input-format checks, level and I/P configuration checks, resource creation and D3D11 conversion/shared-resource interoperability. Capability failures are logged before trying the next candidate; device removal, out-of-memory and other operational failures abort rather than silently reducing quality. If none works, encoding fails explicitly. Selection occurs at initialization and is repeated after reconfiguration/resizing, not per frame. D3D12 H.264 exposes no 4:4:4/4:2:2 profiles, so explicit `--encoder d3d12 --codec h264` uses 4:2:0. Default automatic H.264 selection tries NVENC 4:4:4 first, without changing codecs.
+
+The log reports the actual selection, for example `Encoder sampling: 4:4:4 8-bit AYUV (HEVC)`, and includes the initialization stage/HRESULT for rejected candidates. The development GPU/driver currently rejects AYUV/Y410/Y210 encoder input support and falls back to `4:2:0 8-bit NV12`; installing newer SDK headers alone does not add hardware/driver support. The headers must expose the HEVC range-extension profiles used here (the updated Windows SDK does).
+
+Generated HEVC VPS/SPS profile constraints, chroma format, bit depth and cropping match the selected format. Reconstruction transitions use the queried plane count rather than assuming NV12's two planes. Higher sampling preserves more chroma detail but is not lossless, and 10-bit candidates are still **SDR**, not HDR. Capture remains BGRA8; no PQ/scRGB/HDR metadata or tone mapping is implemented. Selection is based on host capability only: the receiver must support the selected HEVC range-extension profile, potentially using software decoding if its hardware cannot. No client capability negotiation exists in the disposable raw TCP transport.
+
+Packets contain an Annex B access unit delimiter and encoded slice, with codec parameter sets (H.264 SPS/PPS or HEVC VPS/SPS/PPS) on IDRs. Parameter sets match the negotiated level and HEVC coding-unit/transform settings, including resolution cropping, nominal frame-rate timing and zero picture reordering. HEVC configuration queries select supported 64x64 or 32x32 coding units and transform depths, honoring required asymmetric motion partition without switching codecs. The output packet also carries codec, capture timestamp and an accurate IDR key-frame flag. Hardware availability is adapter/driver-specific; unsupported configurations fail with an HRESULT. Production network framing and remote-window association are not implemented.
+
+Both codecs use **low-delay I/P encoding without B-frames**: an IDR starts each fixed 60-frame GOP, followed by 59 P-frames, each referencing only the immediately preceding reconstructed picture. At 60 FPS an IDR occurs every second; at 30 FPS, every two seconds. Two GPU reconstruction slots alternate between previous-reference read and current-output write, using a texture array when required by the driver. Capability checks request one DPB reference. Frame numbers/POCs reset at each IDR; initial configuration and resize start a fresh IDR with parameter sets. There is still only one submitted picture in flight, with decode order equal to presentation order and no encoder lookahead enabled.
+
+This replaces the bandwidth-heavy all-IDR test path so static areas and terminal glyphs can be predicted rather than recompressed independently every frame. Unlike B-frame GOPs, it does not require future pictures or presentation reordering. An IDR every 60 frames bounds random-access recovery without making GOP tuning another CLI setting yet. CBR bitrate selection is unchanged. On a 4:2:0 fallback, colored/subpixel text still loses chroma detail regardless of bitrate; higher sampling is not a lossless desktop codec or a one-frame end-to-end latency guarantee.
+
+The shared input texture permits simultaneous-access interop for D3D11, and conversion commands are flushed before signaling work to D3D12. Video resource transitions stay on the encode queue; buffers cross to the graphics readback queue in `COMMON` state. This avoids using video-only resource states on a graphics command list.
+
+## Temporary five-second recorder
+
+Build `BeamIt` using CLion's configured CMake profile, then pass these program arguments through its run configuration, or run the resulting executable:
+
+```powershell
+.\BeamIt.exe --capture wgc --codec h264 --output desktop.h264
+.\BeamIt.exe --capture dxgi --codec h265 --output desktop.h265
+```
+
+Both commands capture the primary monitor. `--output` is required in file mode. Defaults are `--capture wgc --codec h264 --fps 30 --bitrate 12000` (kbps). The output file is overwritten. Capture/encode/file errors return a nonzero exit code; any partial output must be treated as incomplete. Add `--app PID` or `--hwnd HWND` to record one WGC window instead of the desktop.
+
+In manual testing, 12,000 kbps was too low for the desired quality and 24,000 kbps was satisfactory; use `--bitrate 24000`. This is a quality observation, not a changed default or a universal bitrate requirement.
+
+The recorder writes `fps * 5` frames, paced at the requested rate, reusing the latest captured GPU texture when the desktop is idle. The file represents five seconds at that rate; wall time includes initialization/readback and can be longer on a slow encoder, which produces a warning. The loop waits up to five seconds for an initial capture frame or an encoded packet. No audio is recorded.
+
+Simple test format alternatives:
+
+| Format | Tradeoff |
+| --- | --- |
+| **Raw Annex B `.h264` / `.h265` (selected)** | No muxer dependency; easy to discard. Parameter sets are generated in the encoder; no container timestamps or audio. |
+| MPEG-TS `.ts` | Playback and timestamps, but adds transport-stream muxing. |
+| Matroska `.mkv` | Flexible timestamps and codec metadata, but adds a muxer dependency. |
+| Custom packet `.bin` | Minimal packet/timestamp dump, but requires a custom reader and is not directly playable. |
+
+Inspect and decode a recording locally with FFmpeg (not a build/runtime dependency):
+
+```powershell
+ffprobe -v error -count_frames -show_entries stream=codec_name,width,height,r_frame_rate,nb_read_frames desktop.h264
+ffmpeg -v error -xerror -i desktop.h264 -f null -
+ffplay -framerate 30 desktop.h264
+```
+
+Use the corresponding `.h265` path for HEVC. The default recording should contain 150 decodable frames at 30 FPS. In CLion, run `BeamItTests` for GPU-independent header parsing, dimensions/cropping, timing, and interface/configuration checks; live capture/encode tests require a Windows interactive desktop and a supported GPU.
+
+To inspect the I/P sequence, use `ffprobe -v error -select_streams v -show_entries frame=pict_type,key_frame -of csv=p=0 desktop.h264`. A five-second 60 FPS recording should contain five IDR/I pictures and 295 P-pictures, no B-pictures, and decode without errors using the command above. Compare text quality at native pixel scale with the same bitrate, FPS and scene as the previous all-IDR path.
+
+For sampling, record with `--codec h265` and inspect `ffprobe -v error -show_entries stream=profile,pix_fmt -of default=noprint_wrappers=1 desktop.h265`. Expect `yuv444p`, `yuv444p10le`, `yuv422p10le` or fallback `yuv420p`, matching the encoder's selection log. Higher-sampling headers are covered by GPU-independent parser tests; live 4:4:4/4:2:2 encoding still needs a supporting GPU/driver.
+
+## Temporary single-window TCP test
+
+**Explicitly approved testing exception:** this mode sends unencrypted, unauthenticated video. Anyone who can reach the selected endpoint can view the selected window. Use it only on a trusted LAN, never expose it to the Internet. It is not the production session protocol and does not implement the shared-password policy above.
+
+List visible titled top-level windows, then start one instance targeting a PID or an exact HWND from that list:
+
+```powershell
+.\BeamIt.exe --list-apps
+.\BeamIt.exe --app 1234 --insecure-test-stream --port 49173 --bitrate 24000
+# Alternatively, select a particular window:
+.\BeamIt.exe --hwnd 0x123ABC --insecure-test-stream --port 49174 --bitrate 24000
+# Or stream the whole primary monitor using DXGI:
+.\BeamIt.exe --desktop --capture dxgi --insecure-test-stream --port 49173 --fps 60 --bitrate 24000
+```
+
+`--app` takes a **process ID**, not an executable name. It prefers an unowned, non-tool window, then the largest window in that category. `PRIMARY?` in the listing indicates this heuristic category, not a guarantee of the application's main window. Use `--hwnd` to override the heuristic. Handles/PIDs are transient; relist after restarting an application. Multi-process applications may list windows under different PIDs.
+
+On the receiving computer:
+
+```sh
+nc SENDER_IP 49173 | ffplay -i pipe:0
+```
+
+H.264 is the default; `--codec h265` selects HEVC with the same receiver command. The default receiver command is a compatibility test, **not a low-latency configuration**: probing, decoder threading and playback queues can delay presentation significantly.
+
+For latency testing, set the host to `--fps 60` and use this H.264 receiver command (match `-framerate` to the host's `--fps`):
+
+```sh
+nc SENDER_IP 49173 | ffplay -f h264 -framerate 60 -nofind_stream_info -fflags nobuffer -flags low_delay -threads 1 -sync ext -framedrop -noinfbuf -i pipe:0
+```
+
+For HEVC, replace `-f h264` with `-f hevc`. Explicit format selection avoids autodetection; `-nofind_stream_info` skips startup stream analysis (the IDR parameter sets initialize the decoder). Single-thread decoding avoids frame-thread delay but needs enough CPU to sustain the stream. External-clock sync and frame dropping help playback catch up; they do not remove every internal player queue. WGC discards an older queued capture when a newer frame is available. The encoder has one frame in flight and uses I/P pictures without B-frame reordering. The test host uses a Windows high-resolution waitable timer for pacing and GPU polling instead of scheduler-tick-rounded sleeps, without changing the system-wide timer resolution.
+
+While streaming, the host logs achieved FPS, actual encoded Mbps, encode/readback time and socket-write time every five seconds. These measurements exclude capture queue age, OS/network buffering and receiver presentation; a completed `send` means bytes were accepted by Winsock, not displayed. Actual bitrate varies with content and IDR bursts, so use the measured output rate when assessing LAN capacity. A slow receiver/link can still accumulate old bytes in TCP. Do not drop arbitrary encoded P-pictures to catch up: later pictures depend on them. Drop before encoding or resume at an IDR; presentation-only dropping must preserve decoder reference updates.
+
+One frame is a target, not a demonstrated end-to-end bound: at 60 FPS the entire capture-to-display budget is 16.7 ms (33.3 ms at 30 FPS). Measure with a changing source clock or high-speed camera showing both displays. Achieving a reliable near-one-frame path needs the planned custom client with bounded latest-frame queues and explicit presentation scheduling; `nc | ffplay` does not provide that control. TCP was chosen solely for the requested `nc` test and requires no muxer or custom receiver; its backpressure/head-of-line behavior and raw video-only stream are not a production transport decision.
+
+`--port` requires `--insecure-test-stream`; streaming requires exactly one of `--desktop`, `--app` or `--hwnd` and cannot be combined with `--output`. `--desktop` captures the whole primary monitor with either WGC or DXGI; app/HWND selectors require WGC. Desktop mode exposes everything visible on that monitor. The default bind is `0.0.0.0` (all IPv4 interfaces). Use `--bind 192.168.1.10` to restrict the listener to a particular local address, or `--bind 127.0.0.1` for local testing. Different instances must use distinct endpoints. If Windows Firewall blocks access, allow the executable/port only on the intended private LAN; BeamIt does not alter firewall rules.
+
+The listener waits for one client, then captures continuously rather than for five seconds. Target closure ends capture; disconnection or a send stalled for five seconds returns an explicit error and ends the instance. There is no reconnect loop; restart the command for another connection. Ctrl+C terminates the test host.
+
+In app/HWND mode, only the selected window is captured, not its separate popouts/dialogs. Neither mode includes remote input, audio, native client windows, focus or attention forwarding. Keep the source window visible and nonminimized on an active Windows interactive desktop; the host has no GUI but is not yet a service/session-zero solution. Capture-protected windows may fail or produce no useful content. Initial missing frames time out after five seconds; minimizing later may freeze the last frame. Window resizes restart the encoder with new parameter sets; the receiving decoder must accept resolution changes.
+
+## Non-goals
+
+Unless requirements change, BeamIt should **not** focus on:
+
+- Windows 10 or older
+- Gamepad / controller support
+- Legacy capture APIs when modern alternatives exist
+- A local end-user GUI on the host machine
+- General-purpose remote desktop compatibility with every existing client
+- Moonlight/Sunshine protocol compatibility
+- Internet connectivity, cloud services and NAT traversal
+- Native notification bridging in the initial application-remoting milestone
+
+## Open questions
+
+These remain open before client/network implementation:
+
+- Which macOS UI/language and rendering integration should the first client use?
+- How should application windows, popups, geometry, DPI and focus map to local client windows?
+- Should video use one stream per window or a shared surface with window metadata?
+- Which standard password-based session protocol, KDF and authenticated transport meet the latency requirements?
+- How should each server instance configure its listen endpoints and target application?
+- Which codec and stream settings best fit macOS hardware decoding?
+- Is explicit failure acceptable on GPUs without D3D12 Video Encode, or is a fallback backend required?
+- When should optional audio be introduced after Teams window behavior is validated?
+
+## Development notes
+
+- Keep the host Windows 11+ only; build the client for macOS first and Windows afterward.
+- Prefer modern C++26 idioms.
+- Prefer the lowest-latency path that is still maintainable.
+- Avoid assuming protocol choices, codec choices, or capture APIs without documenting the tradeoff.
+- If there is uncertainty, ask before locking in a design.
+
+## Build
+
+This project uses CMake and C++26.
+Use the IDE's configured CMake version for configure/build steps; do not assume the command-line `cmake` installation matches the project requirements.
+For implementation details, inspect `CMakeLists.txt`.
+
+Boost **1.90.0**, including Beast and its transitive dependencies, is downloaded by CPM/CMake from the official CMake release archive with a pinned SHA-256. Only the Beast dependency graph is enabled; upstream tests, examples and fuzzers are disabled. `BeamIt` and `BeamItTests` link `Boost::beast`. The first configuration requires network access; subsequent configurations reuse the populated source. Run the `[beast]` test filter through CLion's `BeamItTests` configuration for an in-memory HTTP/WebSocket upgrade parsing check. This adds the dependency only: the existing raw TCP test transport is unchanged, and HTTP/WebSocket/TLS transport has not been selected or implemented.
+
+### NVIDIA interface headers for backend exploration
+
+CMake extracts NVIDIA's **Video Codec SDK 13.0.37** from the locally supplied `vendor/Video_Codec_SDK_13.0.37.zip` into `vendor/nvidia_nvend` during configuration, using `cmake/NvidiaNvenc.cmake`. The archive's SHA-256 is pinned (`828c5382a9999191eebd26fc5e3c62dc545aeccd95b6e307d9f7de5103889954`); extraction retains the upstream `Interface/` directory and license files. Both the ZIP and generated directory are ignored by Git. Obtain the SDK archive from NVIDIA and place it at that path before configuring. Use CLion's CMake profile to configure/build; set `-DBEAMIT_FETCH_NVENC_INTERFACE=OFF` to skip this optional SDK integration. No network download is performed for this SDK.
+
+Unlike the previous headers-only 13.1.15 package, this is the full SDK archive. BeamIt uses only its `Interface/` headers, not the C++ `NvEncoder` wrapper, samples or bundled libraries. Preserve the SDK's license files and header copyright/permission notices. No CUDA toolkit or native encoder runtime is installed.
+
+`NVIDIA::NVENCHeaders` is an interface-only CMake target used by the optional native encoder and capability probe:
+
+```powershell
+.\BeamIt.exe --probe-nvenc
+```
+
+This separate diagnostic loads `nvEncodeAPI64.dll` from System32, checks driver API compatibility, then opens a temporary D3D11 NVENC session on each NVIDIA hardware adapter. It reports advertised H.264 profile GUIDs (identifying High 4:4:4 Predictive), `NV_ENC_CAPS_SUPPORT_YUV444_ENCODE`, and H.264 input formats including planar YUV444. It cannot be combined with the D3D12 probe, application listing, or recording/streaming selectors. Disabling the SDK integration keeps the command available with an explicit build-disabled error.
+
+The previous 13.1 headers exceeded the development driver's maximum API 13.0. With the genuine SDK 13.0.37 headers, the probe reports **headers 13.0, driver maximum 13.0** and succeeds on the Quadro T1000: **H.264 High444 profile YES, YUV444 encode capability YES, planar YUV444 input YES**. This demonstrates native NVENC exposes a 4:4:4 path that the current D3D12 queries do not expose on this driver. The probe uses the SDK's real versioned structures, not rewritten version constants.
+
+This is capability enumeration, not a live encode test: profile/capability/input-format results do not guarantee a particular resolution, rate-control mode, or decoder's support. Planar NVENC YUV444 is not packed DXGI AYUV. There is no capture, color conversion, encoder initialization, frame submission, or backend/adapter switching in this probe. Actual encoding uses `--encoder auto` by default; `--encoder nvenc` forces the native backend.
+
+## Repository files
+
+- `include/beamit/capture/Capturer.hpp` — common capture interface and target types
+- `include/beamit/capture/DxgiCapturer.hpp` and `src/capture/DxgiCapturer.cpp` — DXGI monitor capture backend
+- `include/beamit/capture/WgcCapturer.hpp` and `src/capture/WgcCapturer.cpp` — WGC monitor/window capture backend
+- `include/beamit/media/Encoder.hpp` — common asynchronous encoder interface
+- `include/beamit/media/D3D12VideoEncoder.hpp` and `src/media/D3D12VideoEncoder.cpp` — H.264/H.265 D3D12 hardware encoder
+- `include/beamit/media/NvencVideoEncoder.hpp` and `src/media/NvencVideoEncoder.cpp` — DirectX 11 NVENC H.264 4:4:4 encoder
+- `include/beamit/media/AutoVideoEncoder.hpp` and `src/media/AutoVideoEncoder.cpp` — default codec-preserving encoder selection
+- `include/beamit/media/VideoFrame.hpp` — shared captured-frame and encoded-packet types
+- `src/main.cpp` — disposable CLI recorder and plaintext TCP window streamer
+- `src/ApplicationWindows.hpp` and `src/ApplicationWindows.cpp` — window listing and PID selection heuristic
+- `src/TcpVideoSink.hpp` — disposable one-client Winsock transport
+- `src/media/CodecHeaders.hpp` and `src/media/CodecHeaders.cpp` — encoder-specific Annex B parameter-set generation
+- `CMakeLists.txt` — CMake build configuration
+- `cmake/CPM.cmake` — dependency bootstrap for CPM
