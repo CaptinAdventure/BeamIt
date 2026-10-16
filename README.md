@@ -18,7 +18,7 @@ The project is intentionally close to the problem space of RDP and Sunshine, but
 ## Current status
 
 This repository has full-monitor DXGI capture, monitor or single-window WGC capture, and automatic codec-preserving selection between D3D12 Video Encode and native NVENC DirectX 11 encoding, prioritizing 4:4:4 sampling.
-The host serves the authenticated **WSS protocol** in [`PROTOCOL.md`](PROTOCOL.md) (`--serve`): one JSON signaling WebSocket plus one binary WebSocket per video stream, over TLS with a shared password. The CLI also keeps a disposable recorder and the one-client plaintext TCP test streamer. The browser test client, the native clients, input and application window-family tracking are not implemented.
+The host serves the authenticated **WSS protocol** in [`PROTOCOL.md`](PROTOCOL.md) (`--serve`): one JSON signaling WebSocket plus one binary WebSocket per video stream, over TLS with a shared password. The CLI also keeps a disposable recorder and the one-client plaintext TCP test streamer. Remote keyboard and mouse input is routed per stream over the signaling socket. The `HTML/` browser test client is served at `/`. Native clients and application window-family tracking are not implemented.
 
 ### Current near-term goal
 
@@ -102,7 +102,7 @@ The D3D12 encoder chooses the same adapter as the incoming capture texture. It u
 
 ### Automatic encoder selection (default)
 
-`--encoder auto` is the default. `AutoVideoEncoder` prioritizes 4:4:4 while preserving `--codec`:
+`--encoder auto` is the default and includes NVENC in its best-codec search: for the default H.264 codec, it tries NVENC High444 before falling back to D3D12 4:2:0. `AutoVideoEncoder` prioritizes 4:4:4 while preserving `--codec`:
 
 | Requested codec | Initialization priority |
 | --- | --- |
@@ -117,7 +117,7 @@ On the development T1000, default H.264 selects NVENC and produces `yuv444p`; HE
 
 ### Native NVENC DirectX 11 encoder
 
-Select `--encoder nvenc --codec h264` to force `NvencVideoEncoder` through the same `Encoder` interface. NVENC currently requires **8-bit SDR H.264 High 4:4:4 Predictive** and fails explicitly if that profile, 4:4:4 encoding, RGB input, or asynchronous encoding is unavailable. Explicit NVENC selection does not fall back to 4:2:0, HEVC, D3D12, or another adapter.
+Select `--encoder nvenc --codec h264` to force `NvencVideoEncoder` through the same `Encoder` interface; otherwise, the default automatic H.264 search tries NVENC first when available. NVENC currently requires **8-bit SDR H.264 High 4:4:4 Predictive** and fails explicitly if that profile, 4:4:4 encoding, RGB input, or asynchronous encoding is unavailable. Explicit NVENC selection does not fall back to 4:2:0, HEVC, D3D12, or another adapter.
 
 The NVENC session uses `NV_ENC_DEVICE_TYPE_DIRECTX` on the capture texture's D3D11 device. Each fresh frame is copied on the GPU to one reusable encoder-owned BGRA texture, registered as NVENC's word-ordered ARGB format (BGRA bytes). NVENC performs RGB-to-YUV conversion for 4:4:4 encoding; no CPU pixel readback, CUDA toolkit, manual planar packing, or packed AYUV intermediate is required. The copy is deliberately encoder-side: it preserves the last image for DXGI idle-frame repeats without accessing a released duplication surface. Capture remains copy-free for DXGI. Capture must already be on an NVENC-capable NVIDIA device; cross-GPU transfer is not implemented.
 
@@ -198,15 +198,44 @@ Set-Content -NoNewline -Path $env:USERPROFILE\beamit.pw -Value '<long random pas
 
 The wire protocol is specified in [`PROTOCOL.md`](PROTOCOL.md); clients are written against that document. Summary:
 
-- `https://host:port/` serves a placeholder test page (the web client is a later pass); `wss://host:port/control` is the JSON signaling socket; each stream gets its own `wss://host:port/streams/{id}?token=…` binary socket, announced with the codec parameters in `stream_offer`.
+- `https://host:port/` serves the `HTML/` test client (embedded into the executable at build time as byte arrays, because MSVC limits string literals to about 16 KB; the Content-Security-Policy allows only the page's own inline script/styles by SHA-256 hash); `wss://host:port/control` is the JSON signaling socket; each stream gets its own `wss://host:port/streams/{id}?token=…` binary socket, announced with the codec parameters in `stream_offer`.
 - The client chooses the source (`window` HWND, `application` PID or `desktop`) and optionally codec/FPS/bitrate; the command-line values are defaults. Window/application streams use WGC; desktop streams use `--capture`. The host captures the first frame and configures the encoder before replying, so `stream_offer` contains the exact WebCodecs codec string (for example `avc1.F40028` for H.264 High 4:4:4), size, chroma format and bit depth. A resize sends `stream_config` with a new generation before the next key frame.
 - Each binary message is a 32-byte big-endian header (version, type, flags, generation, sequence, capture time) followed by one Annex B access unit. At most two frames are queued per stream socket; on overflow the queue is flushed, frames are skipped until a requested IDR, and the next frame carries the discontinuity flag. The host never sends a P-picture whose references were dropped.
+- Keyboard and mouse input are JSON messages on the signaling socket, each naming its `stream_id` (§5.9 of the protocol); see *Remote input* below.
+- Taskbar attention requests (window flashing) are reported as `attention` `set`/`clear` events (§5.10); see *Taskbar attention* below.
 
 **Security.** TLS comes from Windows Schannel via [boost-wintls](https://github.com/laudrup/boost-wintls) (header-only, pinned SHA-256). Without `--tls-cert`/`--tls-key`, BeamIt creates (and reuses) a self-signed RSA-2048 certificate `CN=BeamIt host` in `CurrentUser\My`, valid for two years and regenerated when near expiry; its SHA-256 fingerprint is logged at startup. Browsers must accept it once by opening `https://host:port/`; native clients should pin the fingerprint, because password authentication is not bound to the TLS channel and an unpinned, accepted certificate allows an active relay. `--tls-key` must be an unencrypted RSA PKCS#8 PEM (`BEGIN PRIVATE KEY`).
 
 The password is read from `--password-file` (trailing CR/LF removed), turned into a key with PBKDF2-HMAC-SHA256 (600,000 iterations, random per-run salt, Windows CNG), then wiped; it is never logged or sent. Client and host prove knowledge of the key with HMAC-SHA256 over both random nonces (mutual authentication). A failed proof closes the socket after one second. Only one authenticated control session exists; a newer one supersedes it (close code 4001). Stream tokens are random, single-use and expire after 10 seconds. WebSocket upgrades with a foreign `Origin` are rejected.
 
 Tested from a stdlib Python WSS client on the development machine: authentication (correct and wrong password), `list_windows`, Teams application and desktop streams (NVENC H.264 4:4:4; the payload decodes with ffprobe as High 4:4:4 Predictive), forced key frames, `stop_stream`, token reuse and expiry, foreign origin and session supersede. Protocol helpers (base64url, PBKDF2/HMAC vectors, authentication proofs, frame header, SPS/codec-string parsing) are covered by the `[protocol]` Catch2 tests.
+
+### Remote input
+
+Input messages (`mouse_move`, `mouse_button`, `mouse_wheel`, `key`, `text`, `release_all`, `set_mouse_mode`, `get_input_state`) carry a `stream_id`; the host injects them with `SendInput` into the interactive desktop (`src/host/InputInjector.cpp`). Success is silent; errors use the normal `error` message.
+
+- **Mouse modes, per stream.** *Absolute* (default): `x`/`y` in video pixels from the stream's top-left, mapped proportionally onto the window's visible frame (`DWMWA_EXTENDED_FRAME_BOUNDS`, which matches what WGC records) or the primary monitor, clamped, and sent as `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`. *Relative*: `dx`/`dy` deltas. For desktop streams they are real relative motion (host pointer acceleration applies; raw-input apps see deltas). For window streams the host adds the scaled delta to the cursor and clamps it inside the window, so pointer-locked clients cannot wander onto other host windows.
+- **Keyboard.** `KeyboardEvent.code` names are translated to Set-1 scan codes (`KEYEVENTF_SCANCODE`, Chromium's Windows mapping), so layout is applied by the host like a physical keyboard. `text` injects Unicode (`KEYEVENTF_UNICODE`) for IME/paste; newlines and tabs become Enter/Tab keys.
+- **Focus.** Key presses, button presses and text bring a window stream's window to the foreground first unless a window of the same process already has it (so the app's dialogs keep working). `SetForegroundWindow` is tried first, then `AttachThreadInput`. Failures report `focus_failed` once until the next success.
+- **No stuck input.** Held keys/buttons are tracked per stream and released on `release_all`, `stop_stream`, stream failure and session end/supersede.
+- **State query.** `get_input_state` returns the host pointer position in the stream's video pixels (desktop: relative to the primary monitor, possibly outside the video on other monitors; window: relative to the window frame, or `-1,-1` when outside it or minimized) plus Shift/Ctrl/Alt/Win held state and Caps/Num/Scroll Lock toggles. The inverse mapping is exact for the even-cropped video of odd-sized windows. Verified live, including injected Shift and Caps Lock changes.
+- **DPI.** `--serve` makes the process per-monitor DPI aware (v2) so window rectangles, the cursor and the virtual desktop are all in physical pixels.
+
+Rejected alternatives: binary input on the stream socket (stream sockets are host→client only, and one signaling socket gives one total order across streams); `PostMessage`/`SendMessage` to the target window (bypasses focus/keyboard state and breaks many UI frameworks); virtual-key codes from the client (layout-dependent); mapping relative motion for window streams as raw deltas (the pointer escapes the streamed window).
+
+Limitations: UIPI silently drops input to elevated windows unless BeamIt runs elevated; the secure desktop (UAC, lock screen, Ctrl+Alt+Del) is unreachable (`input_failed`); the host must run in the interactive user session; popup menus outside the window rectangle cannot be reached until secondary windows are streamed; `AttachThreadInput` may block briefly if the foreground app is hung.
+
+### Taskbar attention
+
+When a host window flashes its taskbar button (`FlashWindowEx`, e.g. a Teams chat or call), the host sends `{"type":"attention","stream_id":…,"state":"set","window":{hwnd,pid,title}}` on the signaling socket, and `"clear"` when the window is activated or destroyed, so the client can bounce the Dock icon or flash its own taskbar button. Window streams receive events for every window of the streamed process (Teams flashes secondary windows); desktop streams receive all. Windows currently requesting attention are reported right after `stream_offer`.
+
+`src/host/AttentionMonitor.cpp` runs one thread with a hidden top-level tool window registered with `RegisterShellHookWindow`. The shell hook reports `HSHELL_FLASH` on the first flash and `HSHELL_WINDOWACTIVATED`/`HSHELL_RUDEAPPACTIVATED`/`HSHELL_WINDOWDESTROYED`; events are posted to the server's I/O context.
+
+Why "set until activated": probing on Windows 11 showed `HSHELL_REDRAW` does not track the flash cycle (with `FLASHW_TIMERNOFG` one redraw arrives after ~2.6 s, then nothing while the button keeps flashing), and `FLASHW_STOP` produces just one `HSHELL_REDRAW`, identical to a title or icon change. A redraw-plus-timeout heuristic therefore cleared live flashes early and was rejected. Consequently `FLASHW_STOP` and the end of a counted flash are not reported; the window stays `set` until activated or closed, like the highlighted taskbar button. Other rejected alternatives: polling taskbar UI Automation (shell-internal, version-specific, polling latency); `SetWinEventHook` (no flash event); hooking `FlashWindowEx` in target processes (injection). Badge overlays and toast notifications are not covered.
+
+Verified live with a WinForms window flashed with `FLASHW_TRAY|FLASHW_TIMERNOFG`, observed through window and desktop streams: `set` on the flash, unchanged by `FLASHW_STOP` and re-flash, `clear` on activation, `set` again on a new flash, and `clear` before `stream_stopped` when the window closed. Tracker logic is covered by the `[attention]` Catch2 tests.
+
+Tested on the development machine with a stdlib Python WSS client against a WinForms text box window: absolute clicks landed on the exact computed client pixel, edge clamping and relative movement/clamping matched the window frame, Shift+keys, digits, Unicode text (`héllo 👋`, newline) and `release_all` arrived, the wheel scrolled down for positive `dy`, and focus was restored from another foreground application. `not_ready`, `invalid_request` and `not_found` errors were checked. The key table, coordinate mapping, normalization and text validation are covered by the `[input]` Catch2 tests.
 
 ### Transport decisions and rejected alternatives
 
@@ -372,11 +401,15 @@ This is capability enumeration, not a live encode test: profile/capability/input
 - `src/main.cpp` — CLI: `--serve` host, recorder and plaintext TCP test streamer
 - `src/host/HostServer.hpp/.cpp` — HTTPS/WSS server, signaling sessions and stream sockets (Beast + wintls, Asio coroutines)
 - `src/host/StreamPipeline.hpp/.cpp` — per-stream capture/encode thread
+- `src/host/InputInjector.hpp/.cpp` — remote keyboard/mouse injection, key table, coordinate mapping and focus
+- `src/host/AttentionMonitor.hpp/.cpp` — shell-hook taskbar attention (flash) tracking
 - `src/host/TlsIdentity.hpp/.cpp` — PEM certificate loading and persistent self-signed certificate
 - `src/net/Crypto.hpp/.cpp` — CNG random, base64url, PBKDF2, HMAC and authentication proofs
 - `src/net/Protocol.hpp` — protocol constants and binary frame header
 - `src/media/BitstreamInfo.hpp/.cpp` — SPS parsing for codec strings, chroma format and bit depth
 - `tests/ProtocolTests.cpp` — protocol and bitstream unit tests
+- `tests/InputTests.cpp` — input mapping and validation unit tests
+- `tests/AttentionTests.cpp` — taskbar attention tracker unit tests
 - `src/ApplicationWindows.hpp` and `src/ApplicationWindows.cpp` — window listing and PID selection heuristic
 - `src/TcpVideoSink.hpp` — disposable one-client Winsock transport
 - `src/media/CodecHeaders.hpp` and `src/media/CodecHeaders.cpp` — encoder-specific Annex B parameter-set generation

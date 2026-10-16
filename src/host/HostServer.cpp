@@ -10,6 +10,8 @@
 #include "FrameTimer.hpp"
 #include "HtmlAssets.hpp"
 #include "Utf8.hpp"
+#include "host/AttentionMonitor.hpp"
+#include "host/InputInjector.hpp"
 #include "host/StreamPipeline.hpp"
 #include "media/BitstreamInfo.hpp"
 #include "net/Protocol.hpp"
@@ -20,6 +22,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <csignal>
 #include <deque>
 #include <map>
@@ -229,6 +232,12 @@ struct StreamEntry {
     std::unique_ptr<StreamPipeline> pipeline;
     std::shared_ptr<StreamSocket> socket;
     std::unique_ptr<asio::steady_timer> token_timer;
+    std::unique_ptr<input::StreamInput> input;
+    // Process of a window/application stream; attention events of any of its windows are reported. Zero for desktop
+    // streams, which report every window.
+    DWORD pid{};
+    bool focus_error_sent{};
+    bool input_error_sent{};
 };
 
 struct Server {
@@ -238,6 +247,8 @@ struct Server {
     wintls::context tls{wintls::method::system_default};
     HostServerOptions options;
     std::weak_ptr<ControlSession> active;
+    // Windows currently requesting attention (network thread only).
+    std::map<HWND, AttentionEvent> attention;
 };
 
 using Outgoing = std::variant<std::string, websocket::close_reason>;
@@ -314,6 +325,7 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
         streams.clear();
         for (auto& [id, entry] : entries) {
             if (entry->token_timer) entry->token_timer->cancel();
+            entry->input->release_all();
             entry->pipeline->stop();
             if (entry->socket) entry->socket->close({code, "signaling session ended"});
         }
@@ -323,6 +335,7 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
                     std::string_view message = {}, const std::optional<json::value>& id = std::nullopt) {
         if (streams.erase(entry->id) == 0) return;
         if (entry->token_timer) entry->token_timer->cancel();
+        entry->input->release_all();
         entry->pipeline->stop();
         if (entry->socket) entry->socket->close({websocket::close_code::normal, reason});
         json::object stopped{{"type", "stream_stopped"}, {"stream_id", entry->id}, {"reason", reason}};
@@ -413,6 +426,7 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
                 end_stream(find_stream(message), "requested", {}, id);
             } else if (type == "request_key_frame") {
                 find_stream(message)->pipeline->request_key_frame();
+            } else if (handle_input(type, message, id)) {
             } else if (type == "authenticate") {
                 throw ProtocolError{"invalid_request", "already authenticated"};
             } else {
@@ -521,6 +535,7 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
         const auto& source = source_field->as_object();
         const std::string_view kind = source.at("kind").as_string();
         capture::CaptureTarget target{};
+        DWORD stream_pid{};
         json::object source_out{{"kind", kind}};
         if (kind == "window" || kind == "application") {
             HWND window{};
@@ -552,6 +567,7 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
             target.window = window;
             source_out["hwnd"] = hwnd_text(window);
             source_out["pid"] = pid;
+            stream_pid = pid;
             source_out["title"] = window_title(window);
         } else if (kind == "desktop") {
             target.kind = capture::CaptureTargetKind::Desktop;
@@ -580,6 +596,14 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
                 optional_uint(video, "bitrate_kbps", options.target_bitrate_kbps, 1, 1'000'000);
         }
 
+        auto mouse_mode = input::MouseMode::Absolute;
+        if (const auto* input_field = message.if_contains("input")) {
+            if (!input_field->is_object()) throw ProtocolError{"invalid_request", "input must be an object"};
+            if (const auto* mode = input_field->as_object().if_contains("mouse_mode")) {
+                mouse_mode = parse_mode(*mode);
+            }
+        }
+
         std::unique_ptr<capture::Capturer> capturer;
         std::unique_ptr<media::Encoder> encoder;
         try {
@@ -599,6 +623,9 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
         entry->request_id = id;
         entry->source = std::move(source_out);
         entry->pipeline = std::make_unique<StreamPipeline>(std::move(capturer), std::move(encoder), target, options);
+        entry->input = std::make_unique<input::StreamInput>(target.window);
+        entry->input->mouse_mode = mouse_mode;
+        entry->pid = stream_pid;
         streams.emplace(entry->id, entry);
         spdlog::info("Starting stream {} for {}", entry->id, json::serialize(entry->source));
 
@@ -621,6 +648,7 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
             .start_failed = [on_network](std::string code, std::string text) {
                 on_network([code, text](ControlSession& self, const std::shared_ptr<StreamEntry>& stream) {
                     self.streams.erase(stream->id);
+                    stream->input->release_all();
                     stream->pipeline->stop();
                     self.send_error(stream->request_id, code, text);
                 });
@@ -663,9 +691,169 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
             {"token_expires_in_ms", std::chrono::milliseconds(protocol::token_lifetime).count()},
             {"source", entry->source},
             {"video", video_json(video)},
+            {"input", {{"mouse_mode", input::mouse_mode_name(entry->input->mouse_mode)}}},
         };
         if (entry->request_id) reply["id"] = *entry->request_id;
         send(std::move(reply));
+        for (const auto& [window, event] : server.attention) send_attention(*entry, event);
+    }
+
+    void on_attention(const AttentionEvent& event) {
+        for (const auto& [id, entry] : streams) {
+            if (entry->ready) send_attention(*entry, event);
+        }
+    }
+
+    void send_attention(const StreamEntry& entry, const AttentionEvent& event) {
+        if (entry.pid != 0 && entry.pid != event.pid) return;
+        json::object window{{"hwnd", hwnd_text(event.window)}, {"pid", event.pid}};
+        if (IsWindow(event.window)) window["title"] = window_title(event.window);
+        send({{"type", "attention"}, {"stream_id", entry.id}, {"state", event.requested ? "set" : "clear"},
+              {"window", std::move(window)}});
+    }
+
+    static input::MouseMode parse_mode(const json::value& value) {
+        const auto mode = value.is_string() ? input::parse_mouse_mode(value.as_string()) : std::nullopt;
+        if (!mode) throw ProtocolError{"invalid_request", "mouse_mode must be absolute or relative"};
+        return *mode;
+    }
+
+    static std::optional<double> number(const json::object& message, std::string_view name) {
+        const auto* field = message.if_contains(name);
+        if (!field) return std::nullopt;
+        double value{};
+        if (field->is_double()) {
+            value = field->as_double();
+        } else if (field->is_int64()) {
+            value = static_cast<double>(field->as_int64());
+        } else if (field->is_uint64()) {
+            value = static_cast<double>(field->as_uint64());
+        } else {
+            throw ProtocolError{"invalid_request", fmt::format("{} must be a number", name)};
+        }
+        if (!std::isfinite(value) || std::abs(value) > 1e6) {
+            throw ProtocolError{"invalid_request", fmt::format("{} is out of range", name)};
+        }
+        return value;
+    }
+
+    static int wheel_units(const json::object& message, std::string_view name) {
+        const auto* field = message.if_contains(name);
+        if (!field) return 0;
+        if (!field->is_int64() || std::abs(field->as_int64()) > protocol::max_wheel_units) {
+            throw ProtocolError{"invalid_request",
+                                fmt::format("{} must be an integer within +/-{}", name, protocol::max_wheel_units)};
+        }
+        return static_cast<int>(field->as_int64());
+    }
+
+    static bool required_bool(const json::object& message, std::string_view name) {
+        const auto* field = message.if_contains(name);
+        if (!field || !field->is_bool()) throw ProtocolError{"invalid_request", fmt::format("{} must be a boolean", name)};
+        return field->as_bool();
+    }
+
+    static std::string_view required_string(const json::object& message, std::string_view name) {
+        const auto* field = message.if_contains(name);
+        if (!field || !field->is_string()) throw ProtocolError{"invalid_request", fmt::format("{} must be a string", name)};
+        return field->as_string();
+    }
+
+    // Handles the §5.9 input messages; returns false for other types. Success is silent.
+    bool handle_input(std::string_view type, const json::object& message, const std::optional<json::value>& id) {
+        static constexpr std::array types{"set_mouse_mode", "mouse_move",  "mouse_button",   "mouse_wheel",
+                                          "key",            "text",        "release_all",    "get_input_state"};
+        if (std::ranges::find(types, type) == types.end()) return false;
+        const auto entry = find_stream(message);
+        auto& state = *entry->input;
+        if (type == "set_mouse_mode") {
+            state.mouse_mode = parse_mode(message.contains("mode") ? message.at("mode") : json::value{});
+            json::object reply{{"type", "mouse_mode"}, {"stream_id", entry->id},
+                               {"mode", input::mouse_mode_name(state.mouse_mode)}};
+            if (id) reply["id"] = *id;
+            send(std::move(reply));
+            return true;
+        }
+        if (type == "get_input_state") {
+            if (!entry->ready) throw ProtocolError{"not_ready", "the stream has not been offered yet"};
+            const auto position = state.cursor_position(entry->video.width, entry->video.height)
+                                      .value_or(input::ScreenPoint{-1, -1});
+            const auto modifiers = input::modifier_state();
+            json::object reply{
+                {"type", "input_state"},
+                {"stream_id", entry->id},
+                {"x", position.x},
+                {"y", position.y},
+                {"modifiers", {{"shift", modifiers.shift}, {"control", modifiers.control}, {"alt", modifiers.alt},
+                               {"meta", modifiers.meta}, {"caps_lock", modifiers.caps_lock},
+                               {"num_lock", modifiers.num_lock}, {"scroll_lock", modifiers.scroll_lock}}},
+                {"mouse_mode", input::mouse_mode_name(state.mouse_mode)},
+            };
+            if (id) reply["id"] = *id;
+            send(std::move(reply));
+            return true;
+        }
+        if (type == "release_all") {
+            state.release_all();
+            return true;
+        }
+        if (!entry->socket) throw ProtocolError{"not_ready", "open the stream socket before sending input"};
+
+        auto result = input::InputResult::Ok;
+        if (type == "mouse_move") {
+            const auto absolute = state.mouse_mode == input::MouseMode::Absolute;
+            const auto first = number(message, absolute ? "x" : "dx");
+            const auto second = number(message, absolute ? "y" : "dy");
+            if (!first || !second || message.contains(absolute ? "dx" : "x") || message.contains(absolute ? "dy" : "y")) {
+                throw ProtocolError{"invalid_request", absolute ? "absolute mouse_move needs x and y only"
+                                                                : "relative mouse_move needs dx and dy only"};
+            }
+            result = absolute ? state.move_absolute(*first, *second, entry->video.width, entry->video.height)
+                              : state.move_relative(*first, *second, entry->video.width, entry->video.height);
+        } else if (type == "mouse_button") {
+            const auto button = input::parse_mouse_button(required_string(message, "button"));
+            if (!button) throw ProtocolError{"invalid_request", "button must be left, right, middle, back or forward"};
+            result = state.button(*button, required_bool(message, "down"));
+        } else if (type == "mouse_wheel") {
+            result = state.wheel(wheel_units(message, "dx"), wheel_units(message, "dy"));
+        } else if (type == "key") {
+            const auto code = required_string(message, "code");
+            const auto key = input::key_for_code(code);
+            if (!key) throw ProtocolError{"invalid_request", fmt::format("unsupported key code '{}'", code)};
+            result = state.key(*key, required_bool(message, "down"));
+        } else {
+            const auto text = input::text_to_utf16(required_string(message, "text"));
+            if (!text) {
+                throw ProtocolError{"invalid_request",
+                                    "text must be valid UTF-8, at most 1024 UTF-16 units, without control characters"};
+            }
+            result = state.text(*text);
+        }
+        report_input_result(*entry, result, id);
+        return true;
+    }
+
+    // Reports focus/injection failures once until the next success so a stream of moves cannot flood the socket.
+    void report_input_result(StreamEntry& entry, input::InputResult result, const std::optional<json::value>& id) {
+        switch (result) {
+        case input::InputResult::Ok:
+            entry.focus_error_sent = false;
+            entry.input_error_sent = false;
+            return;
+        case input::InputResult::FocusFailed:
+            if (std::exchange(entry.focus_error_sent, true)) return;
+            send_error(id, "focus_failed", "the target window could not be brought to the foreground", entry.id);
+            return;
+        case input::InputResult::InjectFailed:
+        case input::InputResult::TargetGone:
+            if (std::exchange(entry.input_error_sent, true)) return;
+            send_error(id, "input_failed",
+                       result == input::InputResult::TargetGone
+                           ? "the target window no longer exists"
+                           : "Windows rejected the input (secure desktop or elevated target?)",
+                       entry.id);
+            return;
+        }
     }
 
     // Validates and consumes a stream token; returns the entry when the upgrade may proceed.
@@ -895,6 +1083,11 @@ void run_host_server(HostServerOptions options) {
     // MTA down after the last stream and unloads WinRT DLLs that C++/WinRT's factory cache still points into.
     CO_MTA_USAGE_COOKIE mta_cookie{};
     check_hresult(CoIncrementMTAUsage(&mta_cookie), "Keeping the COM multithreaded apartment alive");
+    // Input mapping uses physical pixels for window rectangles, the cursor and the virtual desktop.
+    if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+        spdlog::warn("Could not enable per-monitor DPI awareness (error {}); remote input may be offset on scaled "
+                     "displays", GetLastError());
+    }
     Server server(std::move(options));
     server.tls.use_certificate(server.options.identity.certificate.get());
     const tcp::endpoint endpoint{asio::ip::make_address(server.options.bind_address), server.options.port};
@@ -908,6 +1101,20 @@ void run_host_server(HostServerOptions options) {
                  server.options.identity.sha256_fingerprint);
     spdlog::info("Serving https://{}:{}/ (signaling wss://<host>:<port>/control); press Ctrl+C to stop",
                  server.options.bind_address, server.options.port);
+
+    // Taskbar flash notifications arrive on the monitor's thread; track and forward them on the network thread.
+    AttentionMonitor attention_monitor([&server](const AttentionEvent& event) {
+        asio::post(server.io, [&server, event] {
+            spdlog::debug("Attention {} for window {} (pid {})", event.requested ? "set" : "clear",
+                          hwnd_text(event.window), event.pid);
+            if (event.requested) {
+                server.attention[event.window] = event;
+            } else {
+                server.attention.erase(event.window);
+            }
+            if (auto session = server.active.lock()) session->on_attention(event);
+        });
+    });
 
     asio::signal_set signals(server.io, SIGINT, SIGTERM);
     signals.async_wait([&](beast::error_code error, int) {

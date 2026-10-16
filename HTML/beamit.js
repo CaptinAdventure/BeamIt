@@ -120,6 +120,13 @@ function protocolError(message, code = "invalid_message", properties = {}) {
   return new BeamItError(message, { code, ...properties });
 }
 
+function validateMouseMode(mode) {
+  if (mode !== "absolute" && mode !== "relative") {
+    throw new TypeError('mouse mode must be "absolute" or "relative"');
+  }
+  return mode;
+}
+
 function validateSource(source) {
   if (!source || typeof source !== "object") throw new TypeError("source is required");
   switch (source.kind) {
@@ -216,6 +223,163 @@ export function parseVideoFrame(data) {
     captureTimeUs: view.getBigUint64(24),
     payload: bytes.subarray(headerLength),
   };
+}
+
+export function bindBrowserInput(stream, element, { onError = (error) => console.error(error) } = {}) {
+  const document = element.ownerDocument;
+  const window = document.defaultView;
+  const removers = [];
+  const buttons = ["left", "middle", "right", "back", "forward"];
+  const heldButtons = new Set();
+  const heldKeys = new Set();
+  let wheelX = 0;
+  let wheelY = 0;
+  let disposed = false;
+  const focused = () => document.activeElement === element && stream.ready && !disposed;
+  const locked = () => document.pointerLockElement === element;
+  const run = (operation) => {
+    try {
+      operation();
+    } catch (error) {
+      onError(error);
+    }
+  };
+  const listen = (target, type, listener, options) => {
+    target.addEventListener(type, listener, options);
+    removers.push(() => target.removeEventListener(type, listener, options));
+  };
+  const release = () => {
+    heldButtons.clear();
+    heldKeys.clear();
+    wheelX = 0;
+    wheelY = 0;
+    if (stream.ready && !disposed) run(() => stream.releaseAll());
+  };
+  const move = (event) => {
+    if (stream.mouseMode === "relative") {
+      if (!locked()) return false;
+      stream.mouseMove({ dx: event.movementX, dy: event.movementY });
+    } else {
+      const rectangle = element.getBoundingClientRect();
+      if (rectangle.width <= 0 || rectangle.height <= 0) return false;
+      stream.mouseMove({
+        x: Math.max(0, Math.min(stream.video.width - 1, (event.clientX - rectangle.left) * stream.video.width / rectangle.width)),
+        y: Math.max(0, Math.min(stream.video.height - 1, (event.clientY - rectangle.top) * stream.video.height / rectangle.height)),
+      });
+    }
+    return true;
+  };
+
+  listen(element, "mousemove", (event) => {
+    if (focused()) run(() => move(event));
+  });
+  listen(element, "mousedown", (event) => {
+    if (!stream.ready || !buttons[event.button]) return;
+    event.preventDefault();
+    element.focus({ preventScroll: true });
+    if (stream.mouseMode === "relative" && !locked()) {
+      if (typeof element.requestPointerLock !== "function") {
+        onError(new BeamItError("Pointer lock is unavailable", { code: "pointer_lock_unavailable" }));
+      } else {
+        run(() => {
+          const result = element.requestPointerLock();
+          result?.catch(onError);
+        });
+      }
+      return;
+    }
+    run(() => {
+      if (!move(event)) return;
+      stream.mouseButton(buttons[event.button], true);
+      heldButtons.add(event.button);
+    });
+  });
+  listen(window, "mouseup", (event) => {
+    if (!heldButtons.delete(event.button)) return;
+    event.preventDefault();
+    run(() => {
+      if (focused()) move(event);
+      stream.mouseButton(buttons[event.button], false);
+    });
+  });
+  listen(element, "contextmenu", (event) => {
+    if (focused()) event.preventDefault();
+  });
+  listen(element, "auxclick", (event) => {
+    if (focused()) event.preventDefault();
+  });
+  listen(element, "wheel", (event) => {
+    if (!focused() || (stream.mouseMode === "relative" && !locked())) return;
+    event.preventDefault();
+    run(() => {
+      if (!move(event)) return;
+      // Preserve fractional pixel-wheel motion across events; line mode is one notch.
+      const scale = event.deltaMode === 1 ? 120 : event.deltaMode === 2 ? stream.video.height * 1.2 : 1.2;
+      wheelX += event.deltaX * scale;
+      wheelY += event.deltaY * scale;
+      const dx = Math.trunc(wheelX);
+      const dy = Math.trunc(wheelY);
+      wheelX -= dx;
+      wheelY -= dy;
+      let remainingX = dx;
+      let remainingY = dy;
+      while (remainingX !== 0 || remainingY !== 0) {
+        const x = Math.max(-12000, Math.min(12000, remainingX));
+        const y = Math.max(-12000, Math.min(12000, remainingY));
+        stream.mouseWheel({ dx: x, dy: y });
+        remainingX -= x;
+        remainingY -= y;
+      }
+    });
+  }, { passive: false });
+  listen(element, "keydown", (event) => {
+    if (!focused() || event.isComposing || event.keyCode === 229) return;
+    if (event.code === "Escape") {
+      event.preventDefault();
+      release();
+      if (locked()) document.exitPointerLock();
+      element.blur();
+      return;
+    }
+    event.preventDefault();
+    run(() => {
+      stream.key(event.code, true);
+      heldKeys.add(event.code);
+    });
+  });
+  listen(window, "keyup", (event) => {
+    if (!heldKeys.delete(event.code)) return;
+    event.preventDefault();
+    run(() => stream.key(event.code, false));
+  });
+  listen(element, "compositionstart", release);
+  listen(element, "compositionend", (event) => {
+    if (focused() && event.data) run(() => stream.text(event.data));
+  });
+  listen(element, "blur", release);
+  listen(window, "blur", release);
+  listen(document, "visibilitychange", () => {
+    if (document.hidden) release();
+  });
+  listen(document, "pointerlockchange", () => {
+    if (!locked()) {
+      release();
+      element.blur();
+    }
+  });
+  listen(document, "pointerlockerror", () => {
+    onError(new BeamItError("The browser denied pointer lock", { code: "pointer_lock_failed" }));
+  });
+
+  const dispose = () => {
+    if (disposed) return;
+    release();
+    disposed = true;
+    if (locked()) document.exitPointerLock();
+    for (const remove of removers) remove();
+  };
+  removers.push(stream.on("close", dispose));
+  return { release, dispose };
 }
 
 export async function createWebCodecsDecoder(stream, {
@@ -379,10 +543,15 @@ export class BeamItClient extends EventHub {
     return response.windows;
   }
 
-  async startStream({ source, video } = {}) {
+  async startStream({ source, video, input } = {}) {
     const request = { source: validateSource(source) };
     const videoOptions = validateVideo(video);
     if (videoOptions && Object.keys(videoOptions).length > 0) request.video = videoOptions;
+    if (input !== undefined) {
+      if (!input || typeof input !== "object" || Array.isArray(input)) throw new TypeError("input must be an object");
+      request.input = {};
+      if (input.mouse_mode !== undefined) request.input.mouse_mode = validateMouseMode(input.mouse_mode);
+    }
     const offer = await this.#request("start_stream", request, "stream_offer");
     if (typeof offer.stream_id !== "string" || typeof offer.url !== "string" ||
         !Number.isFinite(offer.token_expires_in_ms) || offer.token_expires_in_ms <= 0) {
@@ -410,6 +579,86 @@ export class BeamItClient extends EventHub {
   async requestKeyFrame(streamId) {
     this.#assertConnected();
     this.#send({ type: "request_key_frame", stream_id: streamId });
+  }
+
+  async setMouseMode(streamId, mode) {
+    const stream = this.#inputStream(streamId);
+    const response = await this.#request("set_mouse_mode", {
+      stream_id: streamId, mode: validateMouseMode(mode),
+    }, "mouse_mode");
+    if (response.stream_id !== streamId || response.mode !== mode) throw protocolError("Invalid mouse_mode response");
+    stream._updateMouseMode(response.mode);
+    return response;
+  }
+
+  async getInputState(streamId) {
+    const stream = this.#inputStream(streamId, false);
+    const response = await this.#request("get_input_state", { stream_id: streamId }, "input_state");
+    if (response.stream_id !== streamId || !Number.isInteger(response.x) || !Number.isInteger(response.y) ||
+        !["absolute", "relative"].includes(response.mouse_mode) || !response.modifiers ||
+        !["shift", "control", "alt", "meta", "caps_lock", "num_lock", "scroll_lock"]
+          .every((key) => typeof response.modifiers[key] === "boolean")) {
+      throw protocolError("Invalid input_state response");
+    }
+    stream._updateMouseMode(response.mouse_mode);
+    return response;
+  }
+
+  mouseMove(streamId, position) {
+    const stream = this.#inputStream(streamId);
+    const fields = stream.mouseMode === "relative" ? ["dx", "dy"] : ["x", "y"];
+    const other = stream.mouseMode === "relative" ? ["x", "y"] : ["dx", "dy"];
+    if (!position || !fields.every((field) => Number.isFinite(position[field])) ||
+        other.some((field) => position[field] !== undefined)) {
+      throw new TypeError(`mouse_move requires finite ${fields.join("/")} in ${stream.mouseMode} mode`);
+    }
+    this.#sendInput("mouse_move", streamId, Object.fromEntries(fields.map((field) => [field, position[field]])));
+  }
+
+  mouseButton(streamId, button, down) {
+    if (!["left", "right", "middle", "back", "forward"].includes(button) || typeof down !== "boolean") {
+      throw new TypeError("mouse_button requires a supported button and boolean down");
+    }
+    this.#sendInput("mouse_button", streamId, { button, down });
+  }
+
+  mouseWheel(streamId, { dx = 0, dy = 0 } = {}) {
+    if (![dx, dy].every((value) => Number.isInteger(value) && Math.abs(value) <= 12000)) {
+      throw new TypeError("mouse_wheel requires integer deltas within +/-12000");
+    }
+    this.#sendInput("mouse_wheel", streamId, { dx, dy });
+  }
+
+  key(streamId, code, down) {
+    if (typeof code !== "string" || code.length === 0 || typeof down !== "boolean") {
+      throw new TypeError("key requires a physical KeyboardEvent.code and boolean down");
+    }
+    this.#sendInput("key", streamId, { code, down });
+  }
+
+  text(streamId, text) {
+    if (typeof text !== "string" || text.length > 1024 || /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/u.test(text) ||
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(text)) {
+      throw new TypeError("text must contain at most 1024 UTF-16 units, valid Unicode, and no controls except tab/newline");
+    }
+    this.#sendInput("text", streamId, { text });
+  }
+
+  releaseAll(streamId) {
+    this.#sendInput("release_all", streamId, {});
+  }
+
+  #inputStream(streamId, requireOpen = true) {
+    this.#assertConnected();
+    const stream = this.#streams.get(streamId);
+    if (!stream) throw new BeamItError("Stream does not belong to this session", { code: "not_found", streamId });
+    if (requireOpen && !stream.ready) throw new BeamItError("Stream socket is not open", { code: "not_ready", streamId });
+    return stream;
+  }
+
+  #sendInput(type, streamId, fields) {
+    this.#inputStream(streamId);
+    this.#send({ type, stream_id: streamId, ...fields });
   }
 
   disconnect() {
@@ -661,6 +910,7 @@ export class BeamItStream extends EventHub {
   #waitingFrames = [];
   #unobservedFrames = [];
   #messageQueue = Promise.resolve();
+  #mouseMode;
 
   constructor(client, offer, WebSocketImpl, controlUrl) {
     super();
@@ -669,6 +919,8 @@ export class BeamItStream extends EventHub {
     this.#controlUrl = controlUrl;
     this.id = offer.stream_id;
     this.offer = offer;
+    if (!["absolute", "relative"].includes(offer.input?.mouse_mode)) throw protocolError("Invalid stream input parameters");
+    this.#mouseMode = offer.input.mouse_mode;
     this.video = validateVideoParameters(offer.video);
     this.#configs.set(this.video.generation, this.video);
   }
@@ -730,6 +982,28 @@ export class BeamItStream extends EventHub {
     return this.#client.stopStream(this.id);
   }
 
+  get ready() {
+    return this.#opened && !this.#closed && this.#socket?.readyState === 1;
+  }
+
+  get mouseMode() {
+    return this.#mouseMode;
+  }
+
+  _updateMouseMode(mode) {
+    this.#mouseMode = mode;
+    this.emit("mouse_mode", mode);
+  }
+
+  setMouseMode(mode) { return this.#client.setMouseMode(this.id, mode); }
+  getInputState() { return this.#client.getInputState(this.id); }
+  mouseMove(position) { this.#client.mouseMove(this.id, position); }
+  mouseButton(button, down) { this.#client.mouseButton(this.id, button, down); }
+  mouseWheel(deltas) { this.#client.mouseWheel(this.id, deltas); }
+  key(code, down) { this.#client.key(this.id, code, down); }
+  text(text) { this.#client.text(this.id, text); }
+  releaseAll() { this.#client.releaseAll(this.id); }
+
   requestKeyFrame() {
     return this.#client._sendRequestKeyFrame(this.id);
   }
@@ -757,8 +1031,8 @@ export class BeamItStream extends EventHub {
   }
 
   handleStopped(message) {
-    this.emit("stopped", message);
     this.close(1000, "stream stopped");
+    this.emit("stopped", message);
   }
 
   controlClosed(error) {

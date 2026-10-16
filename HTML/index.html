@@ -22,6 +22,8 @@
       section { border: 1px solid #374151; border-radius: 10px; padding: 18px; background: #1f2937; }
       label { display: block; margin: 12px 0 5px; color: #cbd5e1; }
       input, select, button { font: inherit; }
+      textarea { width: 100%; padding: 9px; font: inherit; background: #111827; color: inherit; border: 1px solid #4b5563; border-radius: 6px; }
+      canvas:focus { outline: 2px solid #60a5fa; outline-offset: -2px; }
       input, select { width: 100%; padding: 9px 10px; border: 1px solid #4b5563; border-radius: 6px; background: #111827; color: inherit; }
       button { border: 0; border-radius: 6px; background: #2563eb; color: white; padding: 9px 13px; cursor: pointer; }
       button.secondary { background: #4b5563; }
@@ -95,12 +97,31 @@
           </div>
         </form>
         <p id="stream-status" class="status" role="status">No active stream</p>
+        <h2>Remote input</h2>
+        <label for="mouse-mode">Mouse mode</label>
+        <select id="mouse-mode" disabled>
+          <option value="absolute">Absolute (video coordinates)</option>
+          <option value="relative">Relative (pointer lock)</option>
+        </select>
+        <p>Click the video to control the host. In relative mode, the first click locks the pointer.
+          Press Escape to release control. Input is released when focus is lost.
+          Physical keys use the host keyboard layout; browser/OS shortcuts may not be captured.</p>
+        <div class="actions">
+          <button id="release-input" class="secondary" type="button" disabled>Release all</button>
+          <button id="input-state" class="secondary" type="button" disabled>Get input state</button>
+        </div>
+        <pre id="host-input-state" aria-live="polite">No input state queried</pre>
+        <label for="input-text">Unicode text / paste as typing (max 1024 UTF-16 units)</label>
+        <textarea id="input-text" rows="3" maxlength="1024" placeholder="Enter or paste text here; it is sent only when you click Send text."></textarea>
+        <div class="actions">
+          <button id="send-text" type="button" disabled>Send text</button>
+        </div>
       </section>
 
       <section aria-labelledby="video-heading">
         <h2 id="video-heading">Live video</h2>
         <div class="video">
-          <canvas id="video-canvas" aria-label="Decoded remote video"></canvas>
+          <canvas id="video-canvas" tabindex="0" aria-label="Remote video; click to control, Escape to release"></canvas>
         </div>
         <div class="metrics">
           <span id="resolution">—</span>
@@ -116,7 +137,7 @@
     </main>
 
     <script type="module">
-      import { BeamItClient, BeamItError, createWebCodecsDecoder } from "./beamit.js";
+      import { BeamItClient, bindBrowserInput, createWebCodecsDecoder } from "./beamit.js";
 
       const $ = (id) => document.getElementById(id);
       const form = $("stream-form");
@@ -125,6 +146,7 @@
       let client = null;
       let stream = null;
       let decoderHandle = null;
+      let inputBinding = null;
       let lastSequence = null;
       let frameCount = 0;
       let lastStatsAt = 0;
@@ -207,10 +229,26 @@
       }
 
       function detachStream() {
+        inputBinding?.dispose();
+        inputBinding = null;
+        setInputEnabled(false);
+        $("host-input-state").textContent = "No input state queried";
         resetVideo();
         stream = null;
         $("stop-button").disabled = true;
         $("start-button").disabled = !client?.connected;
+      }
+
+      function setInputEnabled(enabled) {
+        for (const id of ["mouse-mode", "release-input", "input-state", "send-text"]) {
+          $(id).disabled = !enabled;
+        }
+      }
+
+      function attachInput(target) {
+        return bindBrowserInput(target, $("video-canvas"), {
+          onError: (error) => log(`Input: ${error.message}`, true),
+        });
       }
 
       async function startStream(event) {
@@ -286,6 +324,9 @@
         }
         $("stop-button").disabled = false;
         $("start-button").disabled = true;
+        $("mouse-mode").value = stream.mouseMode;
+        inputBinding = attachInput(stream);
+        setInputEnabled(true);
         setStreamStatus(`Streaming ${source.kind} · ${config.width}×${config.height} · ${config.codec_string}`);
         log(`Stream ${stream.id} opened in ${(performance.now() - started).toFixed(0)} ms.`);
       }
@@ -363,6 +404,51 @@
           setStreamStatus(error.message, true);
           $("stop-button").disabled = false;
           log(error.message, true);
+        }
+      });
+
+      $("mouse-mode").addEventListener("change", async () => {
+        const target = stream;
+        if (!target) return;
+        inputBinding?.dispose();
+        inputBinding = null;
+        setInputEnabled(false);
+        try {
+          await target.setMouseMode($("mouse-mode").value);
+          log(`Mouse mode: ${target.mouseMode}. Click the video to resume control.`);
+        } catch (error) {
+          log(`Input: ${error.message}`, true);
+        } finally {
+          if (stream === target && target.ready) {
+            $("mouse-mode").value = target.mouseMode;
+            inputBinding = attachInput(target);
+            setInputEnabled(true);
+          }
+        }
+      });
+
+      $("release-input").addEventListener("click", () => inputBinding?.release());
+      $("input-state").addEventListener("click", async () => {
+        const target = stream;
+        if (!target) return;
+        try {
+          const state = await target.getInputState();
+          if (stream !== target) return;
+          $("host-input-state").textContent = JSON.stringify({
+            x: state.x, y: state.y, modifiers: state.modifiers, mouse_mode: state.mouse_mode,
+          }, null, 2);
+          $("mouse-mode").value = state.mouse_mode;
+        } catch (error) {
+          log(`Input: ${error.message}`, true);
+        }
+      });
+      $("send-text").addEventListener("click", () => {
+        if (!stream) return;
+        try {
+          stream.text($("input-text").value);
+          log("Text submitted to the host (successful input has no acknowledgement).");
+        } catch (error) {
+          log(`Input: ${error.message}`, true);
         }
       });
 
