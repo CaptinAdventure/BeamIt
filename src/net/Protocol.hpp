@@ -20,6 +20,8 @@ inline constexpr std::size_t max_clipboard_bytes = 10ULL * 1024 * 1024;
 inline constexpr std::int64_t max_wheel_units = 120 * 100;
 inline constexpr std::chrono::seconds auth_timeout{10};
 inline constexpr std::chrono::seconds token_lifetime{10};
+// Period of `stream_stats` reports (PROTOCOL.md §5.15).
+inline constexpr std::chrono::seconds stats_interval{10};
 inline constexpr unsigned short close_superseded = 4001;
 
 inline constexpr std::uint8_t frame_version = 1;

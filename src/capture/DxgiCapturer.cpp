@@ -1,4 +1,5 @@
 #include "beamit/capture/DxgiCapturer.hpp"
+#include "capture/CaptureClock.hpp"
 
 #include <chrono>
 #include <iterator>
@@ -162,7 +163,8 @@ std::optional<media::CapturedFrame> DxgiCapturer::try_acquire_frame() {
     set_error(S_OK);
     return media::CapturedFrame{
         .texture = std::move(acquired_texture),
-        .captured_at = std::chrono::steady_clock::now(),
+        // Zero when only the pointer changed; that falls back to now.
+        .captured_at = qpc_to_steady(frame_info.LastPresentTime.QuadPart),
         .lifetime = std::move(lease),
     };
 }

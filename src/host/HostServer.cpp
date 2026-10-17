@@ -4,6 +4,7 @@
 #include "host/wss/HttpFrontend.hpp"
 
 #include "FrameTimer.hpp"
+#include "ThreadPriority.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -80,6 +81,11 @@ void run_host_server(HostServerOptions options) {
         server.io.stop();
     });
     asio::co_spawn(server.io, accept_loop(server, acceptor), asio::detached);
+    // The io_context thread performs every TLS/WebSocket write and input injection, so it is time critical too.
+    const TimerResolutionGuard timer_resolution;
+    if (!timer_resolution.active()) spdlog::warn("Could not raise the system timer resolution to 1 ms");
+    const MmcssTaskGuard mmcss(set_realtime_priority_with_handle());
+    if (!mmcss.registered()) spdlog::warn("MMCSS registration failed; using a time-critical thread priority");
     server.io.run();
 }
 

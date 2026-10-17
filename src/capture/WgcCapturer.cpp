@@ -1,4 +1,5 @@
 #include "beamit/capture/WgcCapturer.hpp"
+#include "capture/CaptureClock.hpp"
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -299,7 +300,7 @@ std::optional<media::CapturedFrame> WgcCapturer::try_acquire_frame() {
         impl_->last_error = S_OK;
         return media::CapturedFrame{
             .texture = std::move(owned_texture),
-            .captured_at = std::chrono::steady_clock::now(),
+            .captured_at = qpc_100ns_to_steady(frame.SystemRelativeTime().count()),
         };
     } catch (const winrt::hresult_error& error) {
         impl_->last_error = error.code();

@@ -178,6 +178,7 @@ void ControlSession::send_error(const RequestId& id, std::string_view code, std:
 void ControlSession::close(websocket::close_code code, std::string_view reason) {
     if (closing_) return;
     closing_ = true;
+    if (stats_timer_) stats_timer_->cancel();
     stop_all_streams(websocket::close_code::going_away);
     outbox_.emplace_back(websocket::close_reason{code, reason});
     pump();
@@ -251,6 +252,7 @@ awaitable<void> ControlSession::run(std::shared_ptr<ControlSession> self) {
         spdlog::debug("Control socket {} closed: {}", self->remote_, error.what());
     }
     auth_timer->cancel();
+    if (self->stats_timer_) self->stats_timer_->cancel();
     self->closing_ = true;
     self->stop_all_streams(websocket::close_code::going_away);
     if (self->server_.active.lock() == self) self->server_.active.reset();
@@ -359,6 +361,7 @@ void ControlSession::authenticate(const json::object& message) {
     send({{"type", "authenticated"}, {"server_proof", bytes_text(server_proof)},
           {"host_time_us", protocol::host_time_us(Clock::now())}});
     spdlog::info("Control client {} authenticated", remote_);
+    schedule_stats();
     for (const auto& window : server_.windows.windows()) {
         send_window_event({.kind = WindowEvent::Kind::Opened, .window = window});
     }

@@ -11,7 +11,8 @@ bool StreamSocket::deliver(std::shared_ptr<const EncodedFrame> frame) {
     bool discontinuity = false;
     bool recovered = true;
     if (!drop_until_key_ && queue_.size() >= max_queued) {
-        dropped_ += queue_.size();
+        stats_.frames_dropped += queue_.size();
+        ++stats_.recoveries;
         queue_.clear();
         drop_until_key_ = true;
         recovered = frame->packet.key_frame;
@@ -19,7 +20,7 @@ bool StreamSocket::deliver(std::shared_ptr<const EncodedFrame> frame) {
     }
     if (drop_until_key_) {
         if (!frame->packet.key_frame) {
-            ++dropped_;
+            ++stats_.frames_dropped;
             return recovered;
         }
         drop_until_key_ = false;
@@ -61,7 +62,15 @@ awaitable<void> StreamSocket::write_loop(std::shared_ptr<StreamSocket> self) {
             });
             const std::array<asio::const_buffer, 2> buffers{
                 asio::buffer(header), asio::buffer(packet.data.data(), packet.data.size())};
+            const auto write_start = Clock::now();
             co_await self->ws->async_write(buffers, use_awaitable);
+            const auto written = Clock::now();
+            auto& stats = self->stats_;
+            ++stats.frames_sent;
+            stats.bytes_sent += header.size() + packet.data.size();
+            stats.write.add(written - write_start);
+            stats.send.add(written - item.frame->encoded_at);
+            stats.host_latency.add(written - packet.captured_at);
         }
         if (self->pending_close_) {
             auto reason = *self->pending_close_;

@@ -32,6 +32,7 @@ client                                   host
   |=== WSS /streams/{id}?token=… ===========>|
   |<========== binary video frames ==========|
   |<-------------------- stream_config ------|  (only when the encoder is reconfigured)
+  |<--------------------- stream_stats ------|  (every 10 s: host time + per-stream metrics, §5.15)
   |--- mouse_move / mouse_button / key ----->|  (input, tagged with stream_id)
   |<------------------------ attention ------|  (taskbar flash set/clear, §5.10)
   |<-------- window_changed / window_closed -|  (§5.12)
@@ -172,7 +173,8 @@ and verify the certificate fingerprint.
 ```
 
 `host_time_us` uses the same monotonic host clock as `capture_time_us` in
-video frames (§7), so clients can estimate host-to-display latency.
+video frames (§7), so clients can estimate host-to-display latency (see
+§5.15 for the procedure).
 
 ### 5.2 `list_windows`
 
@@ -851,6 +853,90 @@ Reply, after the change took effect:
   (§5.8) ends the stream as usual. Encoder failures while applying the
   change also end the stream with `stream_stopped`.
 
+### 5.15 `stream_stats` (host → client)
+
+Sent every 10 seconds after authentication, whether or not streams exist,
+so the client can estimate end-to-end latency and decide whether to lower
+the frame rate (`set_stream_rate`, §5.14) or the bitrate. Counters and
+averages cover the time since the previous report; a stream's first report
+covers the time since its `start_stream`.
+
+```json
+{
+  "type": "stream_stats",
+  "host_time_us": 123456789,
+  "interval_ms": 10000.4,
+  "streams": [
+    {
+      "stream_id": "…",
+      "connected": true,
+      "generation": 1, "width": 1920, "height": 1080,
+      "frame_rate": 60, "bitrate_kbps": 20000,
+      "interval_ms": 10000.4,
+      "frames_captured": 567, "frames_encoded": 599, "key_frames": 10, "frames_sent": 599,
+      "frames_dropped_encoder": 15, "frames_dropped_network": 0, "network_recoveries": 0,
+      "queued_frames": 0,
+      "encoded_kbps": 12148, "sent_kbps": 12163,
+      "encoder_load": 0.79,
+      "capture_ms": { "avg": 0.57, "max": 9.86 },
+      "encode_ms": { "avg": 12.71, "max": 25.01 },
+      "send_ms": { "avg": 0.85, "max": 11.46 },
+      "write_ms": { "avg": 0.75, "max": 11.36 },
+      "host_latency_ms": { "avg": 14.1, "max": 30.9 }
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `host_time_us` | Host monotonic clock when the report was produced (same clock as `pong` and `capture_time_us`) |
+| `interval_ms` (top level) | Time since the previous report (or authentication) |
+| `streams` | Every stream that has been offered (`stream_offer` sent); `[]` if none |
+| `connected` | The stream socket is open; network counters stay 0 until then |
+| `generation` … `bitrate_kbps` | Current video parameters (§5.5): the targets in effect |
+| `interval_ms` (per stream) | Period covered by this stream's counters |
+| `frames_captured` | Encoded pictures with new source content |
+| `frames_encoded` | All encoded pictures, including re-encodes of an unchanged source (an idle source still produces `frame_rate` pictures) |
+| `key_frames` | IDR pictures (periodic, requested, after reconfiguration or network recovery) |
+| `frames_sent` | Pictures completely written to the stream socket |
+| `frames_dropped_encoder` | Frame-rate ticks skipped because capture + encoding of the previous picture took longer than one frame interval |
+| `frames_dropped_network` | Encoded pictures discarded because the socket/client did not keep up (§7.1) |
+| `network_recoveries` | Send-queue overflows; each skipped to the next key frame |
+| `queued_frames` | Pictures waiting in the send queue right now (at most 2) |
+| `encoded_kbps` | Actual encoder output rate (compare with the `bitrate_kbps` target) |
+| `sent_kbps` | Actual rate written to the socket, including frame headers |
+| `encoder_load` | Fraction of the interval the pipeline spent capturing, encoding and reconfiguring; values near 1 mean the frame rate cannot be sustained |
+| `capture_ms` | Source presentation → encoder submission, for pictures with new content (`null` if none) |
+| `encode_ms` | Encoder submission → encoded picture available |
+| `send_ms` | Encoded picture available → completely written to the socket (includes send-queue wait) |
+| `write_ms` | Duration of the socket write alone; grows with TCP back-pressure |
+| `host_latency_ms` | `capture_time_us` → completely written to the socket: the host's share of the latency |
+
+Duration objects hold `avg` and `max` in milliseconds and are `null` when
+there were no samples. Pipeline and socket counters are sampled a few
+microseconds apart, so `frames_sent` may differ from `frames_encoded` by one.
+
+*Informative — estimating latency and choosing an action:*
+
+* **Clock offset.** Send `ping` and note the local send/receive times
+  `t0`/`t1`; `offset ≈ host_time_us − (t0 + t1) / 2` (repeat and keep the
+  sample with the smallest `t1 − t0`). `host_time_us` of `stream_stats`
+  can be used to detect drift between pings, but it is one-way and includes
+  transfer time.
+* **End-to-end latency** of a picture = local display time − (
+  `capture_time_us` − offset). `host_latency_ms` is the host's share;
+  subtract it to obtain network + client receive/decode/present time.
+* **Lower the frame rate** when `frames_dropped_encoder` > 0,
+  `encoder_load` approaches 1, or `encode_ms.avg` approaches
+  `1000 / frame_rate` — the encoder cannot keep up and a lower bitrate will
+  not help much.
+* **Lower the bitrate** when `frames_dropped_network` or
+  `network_recoveries` > 0, `queued_frames` stays > 0, `write_ms`/`send_ms`
+  grow, or the client-side latency (excluding `host_latency_ms`) grows —
+  the network is the bottleneck.
+* **Raise** cautiously when all of these are low for several reports.
+
 ## 6. Stream sockets
 
 * URL: `wss://{host}/streams/{stream_id}?token={token}`; `token` is 32
@@ -875,7 +961,7 @@ integers are **big-endian** (network order, `DataView` default).
 | 8      | 4    | `generation`      | Video parameter generation (§5.5)                      |
 | 12     | 4    | `reserved`        | `0`                                                    |
 | 16     | 8    | `sequence`        | Per-stream counter of produced pictures, starting at 0 |
-| 24     | 8    | `capture_time_us` | Host monotonic capture time (same clock as `pong`)     |
+| 24     | 8    | `capture_time_us` | Host monotonic capture time (same clock as `pong`), see below |
 | 32     | …    | payload           | One Annex B access unit                                |
 
 * Clients must locate the payload with `header_length`, not a constant, and
@@ -884,6 +970,13 @@ integers are **big-endian** (network order, `DataView` default).
   delimiter. Key frames repeat SPS/PPS (and VPS for H.265).
 * `capture_time_us` is suitable as the WebCodecs `EncodedVideoChunk`
   `timestamp`; key frames map to `type: "key"`.
+* `capture_time_us` is the operating system's presentation time of the
+  captured content (DXGI `LastPresentTime`, WGC `SystemRelativeTime`; the
+  acquisition time when the OS supplies none, e.g. pointer-only updates).
+  When the source has not changed, the host re-encodes the last image and
+  stamps it with the time it was submitted to the encoder, since it still
+  shows the source as of that moment. Values are therefore non-decreasing
+  within a stream (except across a generation change).
 * **Discontinuity** (bit 1) is set on the first frame after the host
   dropped frames. Gaps in `sequence` show how many pictures were dropped.
 

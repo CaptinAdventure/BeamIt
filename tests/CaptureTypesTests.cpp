@@ -5,6 +5,8 @@
 #include "beamit/media/Encoder.hpp"
 #include "beamit/media/AutoVideoEncoder.hpp"
 #include "media/EncodeSequence.hpp"
+#include "capture/CaptureClock.hpp"
+#include "host/StreamPipeline.hpp"
 
 #ifdef BEAMIT_USE_CATCH2
 
@@ -16,6 +18,40 @@ using namespace beamit::capture;
 
 static_assert(std::is_abstract_v<beamit::media::Encoder>);
 static_assert(std::is_final_v<beamit::media::D3D12VideoEncoder>);
+
+TEST_CASE("QPC capture timestamps map onto steady_clock", "[capture]") {
+    using namespace std::chrono_literals;
+    LARGE_INTEGER counter{};
+    LARGE_INTEGER frequency{};
+    REQUIRE(QueryPerformanceCounter(&counter));
+    REQUIRE(QueryPerformanceFrequency(&frequency));
+    const auto before = std::chrono::steady_clock::now();
+    const auto age_50ms = frequency.QuadPart / 20;
+    const auto mapped = qpc_to_steady(counter.QuadPart - age_50ms);
+    REQUIRE(mapped < before - 45ms);
+    REQUIRE(mapped > before - 60ms);
+    const auto now_100ns = counter.QuadPart / frequency.QuadPart * 10'000'000 +
+                           counter.QuadPart % frequency.QuadPart * 10'000'000 / frequency.QuadPart;
+    const auto mapped_100ns = qpc_100ns_to_steady(now_100ns - 500'000);
+    REQUIRE(mapped_100ns < before - 45ms);
+    REQUIRE(mapped_100ns > before - 60ms);
+    // Missing, future and stale timestamps fall back to now.
+    for (const auto value : {std::int64_t{0}, counter.QuadPart + frequency.QuadPart, counter.QuadPart - 5 * frequency.QuadPart}) {
+        REQUIRE(qpc_to_steady(value) >= before);
+    }
+    REQUIRE(qpc_100ns_to_steady(0) >= before);
+}
+
+TEST_CASE("duration statistics keep count, total and maximum", "[stats]") {
+    using namespace std::chrono_literals;
+    beamit::host::DurationStats stats;
+    stats.add(2ms);
+    stats.add(6ms);
+    stats.add(-1ms);
+    REQUIRE(stats.count == 3);
+    REQUIRE(stats.total == 8ms);
+    REQUIRE(stats.max == 6ms);
+}
 
 TEST_CASE("capture target defaults to desktop", "[capture]") {
     const CaptureTarget target{};

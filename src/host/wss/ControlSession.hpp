@@ -67,8 +67,8 @@ struct StreamEntry {
 };
 
 // The JSON signaling socket (PROTOCOL.md §3-5). Everything runs on the network thread unless noted.
-// Implementation: ControlSession.cpp (lifecycle, authentication, streams), ControlInput.cpp (§5.9) and
-// ControlDesktop.cpp (windows, icons, clipboard, attention).
+// Implementation: ControlSession.cpp (lifecycle, authentication, streams), ControlInput.cpp (§5.9),
+// ControlDesktop.cpp (windows, icons, clipboard, attention) and ControlStats.cpp (§5.15).
 struct ControlSession : std::enable_shared_from_this<ControlSession> {
     ControlSession(Server& host, std::shared_ptr<WebSocket> socket, std::string url_authority, std::string peer);
 
@@ -132,6 +132,10 @@ private:
     void set_clipboard(const json::object& message, const RequestId& id);
     void send_attention(const StreamEntry& entry, const AttentionEvent& event);
 
+    // Statistics (ControlStats.cpp).
+    void schedule_stats();
+    void send_stream_stats();
+
     Server& server_;
     std::shared_ptr<WebSocket> ws_;
     std::string authority_;
@@ -143,6 +147,8 @@ private:
     bool closing_{};
     bool authenticated_{};
     bool auth_failed_{};
+    std::unique_ptr<asio::steady_timer> stats_timer_;
+    Clock::time_point stats_since_{};
 };
 
 } // namespace beamit::host::wss

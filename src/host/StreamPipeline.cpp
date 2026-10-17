@@ -1,6 +1,7 @@
 #include "host/StreamPipeline.hpp"
 
 #include "FrameTimer.hpp"
+#include "ThreadPriority.hpp"
 #include "Utf8.hpp"
 #include "media/BitstreamInfo.hpp"
 
@@ -12,7 +13,6 @@
 namespace beamit::host {
 namespace {
 
-using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 
 struct StartFailure : std::runtime_error {
@@ -70,6 +70,14 @@ std::uint64_t StreamPipeline::request_rate_change(std::optional<std::uint32_t> b
     return rate_change_.serial;
 }
 
+PipelineStats StreamPipeline::take_stats() {
+    const auto now = Clock::now();
+    std::lock_guard lock(stats_mutex_);
+    auto stats = std::exchange(stats_, PipelineStats{});
+    stats.elapsed = now - std::exchange(stats_since_, now);
+    return stats;
+}
+
 std::optional<StreamPipeline::RateChange> StreamPipeline::take_rate_change() {
     std::lock_guard lock(rate_mutex_);
     if (rate_change_.serial == 0) return std::nullopt;
@@ -82,6 +90,9 @@ void StreamPipeline::stop() noexcept {
 }
 
 void StreamPipeline::run() noexcept {
+    // Capture, pacing and encode submission all run here; ask the scheduler to treat the thread as time critical.
+    const MmcssTaskGuard mmcss(set_realtime_priority_with_handle());
+    if (!mmcss.registered()) spdlog::warn("MMCSS registration failed; using a time-critical thread priority");
     try {
         loop();
     } catch (const Stopped&) {
@@ -249,13 +260,21 @@ void StreamPipeline::loop() {
     while (true) {
         check_stop();
         timer.wait_until(next_frame);
-        next_frame = std::max(next_frame + std::chrono::nanoseconds(1'000'000'000 / options_.frame_rate),
-                              Clock::now());
+        const auto woke = Clock::now();
+        const auto frame_interval = std::chrono::nanoseconds(1'000'000'000 / options_.frame_rate);
+        // Whole frame intervals between the scheduled tick and now were skipped by the previous iteration.
+        const auto skipped = static_cast<std::uint64_t>(std::max<Clock::duration::rep>(
+            0, (woke - next_frame) / frame_interval));
+        next_frame = std::max(next_frame + frame_interval, woke);
         if (target_.kind == capture::CaptureTargetKind::Window && !IsWindow(target_.window)) {
             callbacks_.stopped("source_closed", "the captured window closed");
             return;
         }
-        if (auto frame = capturer_->try_acquire_frame()) latest = std::move(frame);
+        bool fresh = false;
+        if (auto frame = capturer_->try_acquire_frame()) {
+            latest = std::move(frame);
+            fresh = true;
+        }
         check_hresult(capturer_->last_error(), "Capture");
         // Keep only the newest surface until the client connects, so activation shows current content.
         if (!active_) continue;
@@ -270,12 +289,31 @@ void StreamPipeline::loop() {
             }
         }
         if (key_frame_requested_.exchange(false)) encoder_->request_key_frame();
+        const auto submit_time = Clock::now();
+        const auto capture_age = fresh && latest ? submit_time - latest->captured_at : Clock::duration{};
         const auto submitted = latest ? encoder_->try_submit(*latest) : encoder_->try_repeat_frame();
         if (submitted != EncoderSubmitResult::Accepted) {
             check_hresult(encoder_->last_error(), "Frame submission");
             throw std::runtime_error("encoder unexpectedly rejected a frame after output was drained");
         }
         auto packet = receive(false);
+        const auto encoded_at = Clock::now();
+        // Without new content the picture still shows the source as of submission, so latency estimates based on
+        // capture_time_us (PROTOCOL.md §7) stay meaningful while the source is idle.
+        if (!fresh) packet.captured_at = submit_time;
+        {
+            std::lock_guard lock(stats_mutex_);
+            stats_.frames_skipped += skipped;
+            ++stats_.frames_encoded;
+            if (fresh) {
+                ++stats_.frames_captured;
+                stats_.capture.add(capture_age);
+            }
+            if (packet.key_frame) ++stats_.key_frames;
+            stats_.encoded_bytes += packet.data.size();
+            stats_.encode.add(encoded_at - submit_time);
+            stats_.busy += encoded_at - woke;
+        }
         if (latest && latest->lifetime) latest.reset();
         if (announce) {
             describe(packet, false);
@@ -292,6 +330,7 @@ void StreamPipeline::loop() {
         frame->packet = std::move(packet);
         frame->generation = parameters.generation;
         frame->sequence = sequence++;
+        frame->encoded_at = encoded_at;
         callbacks_.frame(std::move(frame));
     }
 }

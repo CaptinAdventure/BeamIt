@@ -9,8 +9,20 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace beamit::host::wss {
+
+// Stream socket counters since the previous StreamSocket::take_stats (PROTOCOL.md §5.15).
+struct NetworkStats {
+    std::uint64_t frames_sent{};
+    std::uint64_t bytes_sent{};       // Including frame headers.
+    std::uint64_t frames_dropped{};   // Discarded because the client/network did not keep up.
+    std::uint64_t recoveries{};       // Overflows that skipped to the next key frame.
+    DurationStats send;               // Packet available -> fully written to the socket.
+    DurationStats write;              // Duration of the socket write itself (TCP back-pressure).
+    DurationStats host_latency;       // Source presentation -> fully written.
+};
 
 // One binary stream socket (PROTOCOL.md §6-7) with a tiny bounded queue; overflow skips to the next key frame.
 // Network thread only.
@@ -25,6 +37,9 @@ struct StreamSocket : std::enable_shared_from_this<StreamSocket> {
     void close(websocket::close_reason reason);
     // Reads until the client disconnects (clients must not send data), then calls `on_disconnected`.
     static awaitable<void> read_loop(std::shared_ptr<StreamSocket> self);
+    // Returns and resets the counters.
+    NetworkStats take_stats() { return std::exchange(stats_, NetworkStats{}); }
+    [[nodiscard]] std::size_t queued() const { return queue_.size(); }
 
     std::shared_ptr<WebSocket> ws;
     std::string stream_id;
@@ -44,7 +59,7 @@ private:
     bool writing_{};
     bool closing_{};
     bool drop_until_key_{};
-    std::uint64_t dropped_{};
+    NetworkStats stats_;
 };
 
 } // namespace beamit::host::wss

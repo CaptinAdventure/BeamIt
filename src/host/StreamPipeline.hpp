@@ -3,7 +3,9 @@
 #include "beamit/capture/Capturer.hpp"
 #include "beamit/media/Encoder.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -13,6 +15,8 @@
 #include <thread>
 
 namespace beamit::host {
+
+using Clock = std::chrono::steady_clock;
 
 struct VideoParameters {
     std::uint32_t generation{};
@@ -31,6 +35,35 @@ struct EncodedFrame {
     media::EncodedPacket packet;
     std::uint32_t generation{};
     std::uint64_t sequence{};
+    // When the encoder returned the packet.
+    Clock::time_point encoded_at{};
+};
+
+// Running average and maximum of a duration.
+struct DurationStats {
+    std::uint64_t count{};
+    Clock::duration total{};
+    Clock::duration max{};
+
+    void add(Clock::duration value) noexcept {
+        if (value < Clock::duration::zero()) value = Clock::duration::zero();
+        ++count;
+        total += value;
+        max = std::max(max, value);
+    }
+};
+
+// Pipeline counters since the previous StreamPipeline::take_stats (PROTOCOL.md §5.15).
+struct PipelineStats {
+    Clock::duration elapsed{};
+    std::uint64_t frames_captured{};  // Encoded pictures with new source content.
+    std::uint64_t frames_encoded{};   // Including repeats of an unchanged source.
+    std::uint64_t key_frames{};
+    std::uint64_t frames_skipped{};   // Frame-rate ticks missed because capture/encoding was too slow.
+    std::uint64_t encoded_bytes{};
+    DurationStats capture;            // Source presentation -> encoder submission (new content only).
+    DurationStats encode;             // Encoder submission -> packet available.
+    Clock::duration busy{};           // Time spent capturing, encoding and reconfiguring.
 };
 
 // How a rate change was applied (PROTOCOL.md §5.14 `stream_rate.applied`).
@@ -70,6 +103,8 @@ public:
     // values of pending ones. Returns the serial reported by `rate_changed`.
     std::uint64_t request_rate_change(std::optional<std::uint32_t> bitrate_kbps,
                                       std::optional<std::uint32_t> frame_rate);
+    // Thread-safe: returns and resets the counters.
+    PipelineStats take_stats();
     // Joins the thread; no callbacks run after this returns.
     void stop() noexcept;
 
@@ -94,6 +129,9 @@ private:
     RateChange rate_change_;
     std::uint64_t rate_serial_{};
     std::optional<RateChange> take_rate_change();
+    std::mutex stats_mutex_;
+    PipelineStats stats_;
+    Clock::time_point stats_since_{Clock::now()};
     std::thread thread_;
 };
 
