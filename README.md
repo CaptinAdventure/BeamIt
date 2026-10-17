@@ -342,7 +342,12 @@ The previous 13.1 headers exceeded the development driver's maximum API 13.0. Wi
 - `include/beamit/media/VideoFrame.hpp` — shared captured-frame and encoded-packet types
 - `PROTOCOL.md` — WSS signaling/stream protocol v1 specification
 - `src/main.cpp` — CLI entry point for the WSS host
-- `src/host/HostServer.hpp/.cpp` — HTTPS/WSS server, signaling sessions and stream sockets (Beast + wintls, Asio coroutines)
+- `src/host/HostServer.hpp/.cpp` — host entry point: TLS listener, desktop monitors (attention, clipboard, windows) and the network thread
+- `src/host/wss/` — the `PROTOCOL.md` implementation (Beast + wintls, Asio coroutines), namespace `beamit::host::wss`:
+  - `HttpFrontend` — TLS/HTTP connections, the test page, CSP and WebSocket upgrades of `/control` and `/streams/…`
+  - `ControlSession.hpp/.cpp` — signaling session: authentication, table-driven message dispatch, stream lifecycle
+  - `ControlInput.cpp` — keyboard/mouse messages (§5.9); `ControlDesktop.cpp` — windows, icons, clipboard and attention (§5.2, §5.10–5.13)
+  - `StreamSocket` — per-stream binary socket with bounded video queue; `Fields` — shared JSON field validation and HWND text helpers
 - `src/host/StreamPipeline.hpp/.cpp` — per-stream capture/encode thread
 - `src/host/InputInjector.hpp/.cpp` — remote keyboard/mouse injection, key table, coordinate mapping and focus
 - `src/host/AttentionMonitor.hpp/.cpp` — shell-hook taskbar attention (flash) tracking
@@ -358,6 +363,7 @@ The previous 13.1 headers exceeded the development driver's maximum API 13.0. Wi
 - `tests/AttentionTests.cpp` — taskbar attention tracker unit tests
 - `tests/WindowTrackerTests.cpp` — window role and window-list unit tests
 - `tests/WindowIconTests.cpp` — icon PNG conversion and source-selection tests
+- `tests/WssFieldsTests.cpp` — signaling field validation and HWND text round-trip tests
 - `scripts/Start-BeamItServer.ps1` — creates per-instance password/certificate files and starts the WSS host
 - `src/ApplicationWindows.hpp` and `src/ApplicationWindows.cpp` — window listing and PID selection heuristic (`list_windows`, `application` sources)
 - `src/media/CodecHeaders.hpp` and `src/media/CodecHeaders.cpp` — encoder-specific Annex B parameter-set generation

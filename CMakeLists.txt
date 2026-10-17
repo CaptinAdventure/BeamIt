@@ -79,6 +79,12 @@ set(BEAMIT_HOST_SOURCES
     src/host/TlsIdentity.cpp
     src/host/WindowIcon.cpp
     src/host/WindowTracker.cpp
+    src/host/wss/ControlDesktop.cpp
+    src/host/wss/ControlInput.cpp
+    src/host/wss/ControlSession.cpp
+    src/host/wss/Fields.cpp
+    src/host/wss/HttpFrontend.cpp
+    src/host/wss/StreamSocket.cpp
     src/media/BitstreamInfo.cpp
     src/net/Crypto.cpp
 )
@@ -125,6 +131,7 @@ if(BUILD_TESTING)
         tests/ClipboardTests.cpp
         tests/WindowTrackerTests.cpp
         tests/WindowIconTests.cpp
+        tests/WssFieldsTests.cpp
         src/ApplicationWindows.cpp
         ${BEAMIT_HOST_SOURCES}
         src/capture/DxgiCapturer.cpp
