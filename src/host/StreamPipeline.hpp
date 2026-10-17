@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -31,12 +33,21 @@ struct EncodedFrame {
     std::uint64_t sequence{};
 };
 
+// How a rate change was applied (PROTOCOL.md §5.14 `stream_rate.applied`).
+enum class RateChangeResult {
+    Unchanged,     // The requested values were already in effect.
+    InPlace,       // New bitrate within the current sequence: same generation, no IDR.
+    Reconfigured,  // Encoder restarted: new generation, IDR and `reconfigured` before this report.
+};
+
 // All callbacks run on the pipeline thread.
 struct PipelineCallbacks {
     std::function<void(const VideoParameters&)> ready;
     // code is a PROTOCOL.md error code: capture_failed or encoder_failed.
     std::function<void(std::string code, std::string message)> start_failed;
     std::function<void(const VideoParameters&)> reconfigured;
+    // Every rate change request up to and including `serial` has been applied.
+    std::function<void(const VideoParameters&, std::uint64_t serial, RateChangeResult)> rate_changed;
     std::function<void(std::shared_ptr<const EncodedFrame>)> frame;
     // reason is a PROTOCOL.md stream_stopped reason: source_closed or error.
     std::function<void(std::string reason, std::string message)> stopped;
@@ -55,6 +66,10 @@ public:
     void start(PipelineCallbacks callbacks);
     void activate() noexcept;
     void request_key_frame() noexcept;
+    // Queues a bitrate and/or frame-rate change, applied once the stream is active; later requests override the
+    // values of pending ones. Returns the serial reported by `rate_changed`.
+    std::uint64_t request_rate_change(std::optional<std::uint32_t> bitrate_kbps,
+                                      std::optional<std::uint32_t> frame_rate);
     // Joins the thread; no callbacks run after this returns.
     void stop() noexcept;
 
@@ -70,6 +85,15 @@ private:
     std::atomic<bool> stop_requested_{};
     std::atomic<bool> active_{};
     std::atomic<bool> key_frame_requested_{};
+    struct RateChange {
+        std::optional<std::uint32_t> bitrate_kbps;
+        std::optional<std::uint32_t> frame_rate;
+        std::uint64_t serial{};
+    };
+    std::mutex rate_mutex_;
+    RateChange rate_change_;
+    std::uint64_t rate_serial_{};
+    std::optional<RateChange> take_rate_change();
     std::thread thread_;
 };
 

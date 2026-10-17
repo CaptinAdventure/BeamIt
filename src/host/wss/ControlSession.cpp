@@ -78,8 +78,9 @@ StreamSource parse_source(const json::object& message) {
         if (!IsWindow(window) || GetAncestor(window, GA_ROOT) != window) {
             throw ProtocolError{"not_found", "not a valid top-level window"};
         }
-        if (!IsWindowVisible(window) || IsIconic(window)) {
-            throw ProtocolError{"capture_failed", "the window must be visible and not minimized"};
+        // Minimized windows are restored by the pipeline before capture starts (StreamPipeline::restore_window).
+        if (!IsWindowVisible(window)) {
+            throw ProtocolError{"capture_failed", "the window must be visible"};
         }
         GetWindowThreadProcessId(window, &result.pid);
         result.target.kind = capture::CaptureTargetKind::Window;
@@ -290,6 +291,7 @@ void ControlSession::handle(const std::string& text) {
         {"start_stream", &ControlSession::start_stream},
         {"stop_stream", &ControlSession::stop_stream},
         {"request_key_frame", &ControlSession::request_key_frame},
+        {"set_stream_rate", &ControlSession::set_stream_rate},
         // §5.9 input
         {"set_mouse_mode", &ControlSession::handle_input},
         {"mouse_move", &ControlSession::handle_input},
@@ -444,6 +446,23 @@ void ControlSession::start_pipeline(const std::shared_ptr<StreamEntry>& entry) {
                 self.send({{"type", "stream_config"}, {"stream_id", stream->id}, {"video", video_json(video)}});
             });
         },
+        .rate_changed = [on_network](const VideoParameters& video, std::uint64_t serial, RateChangeResult result) {
+            on_network([video, serial, result](ControlSession& self, const std::shared_ptr<StreamEntry>& stream) {
+                stream->video = video;
+                const char* applied = result == RateChangeResult::InPlace        ? "in_place"
+                                      : result == RateChangeResult::Reconfigured ? "reconfigured"
+                                                                                 : "unchanged";
+                // Merged requests are applied together, so every request up to the serial is answered.
+                std::erase_if(stream->rate_requests, [&](const auto& request) {
+                    if (request.first > serial) return false;
+                    self.reply(request.second, {{"type", "stream_rate"}, {"stream_id", stream->id},
+                                                {"applied", applied}, {"generation", video.generation},
+                                                {"frame_rate", video.frame_rate},
+                                                {"bitrate_kbps", video.bitrate_kbps}});
+                    return true;
+                });
+            });
+        },
         .frame = [on_network](std::shared_ptr<const EncodedFrame> frame) {
             on_network([frame = std::move(frame)](ControlSession&, const std::shared_ptr<StreamEntry>& stream) {
                 if (stream->socket && !stream->socket->deliver(frame)) stream->pipeline->request_key_frame();
@@ -487,6 +506,21 @@ void ControlSession::stop_stream(const json::object& message, const RequestId& i
 
 void ControlSession::request_key_frame(const json::object& message, const RequestId&) {
     find_stream(message)->pipeline->request_key_frame();
+}
+
+void ControlSession::set_stream_rate(const json::object& message, const RequestId& id) {
+    const auto stream = find_stream(message);
+    const auto bitrate = optional_integer(message, "bitrate_kbps", 1, 1'000'000);
+    const auto frame_rate = optional_integer(message, "frame_rate", 1, 240);
+    if (!bitrate && !frame_rate) {
+        throw ProtocolError{"invalid_request", "set_stream_rate needs bitrate_kbps or frame_rate"};
+    }
+    const auto to_u32 = [](std::optional<std::int64_t> value) -> std::optional<std::uint32_t> {
+        if (!value) return std::nullopt;
+        return static_cast<std::uint32_t>(*value);
+    };
+    const auto serial = stream->pipeline->request_rate_change(to_u32(bitrate), to_u32(frame_rate));
+    stream->rate_requests.emplace_back(serial, id);
 }
 
 void ControlSession::end_stream(const std::shared_ptr<StreamEntry>& entry, std::string_view reason,

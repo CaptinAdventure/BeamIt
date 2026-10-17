@@ -35,6 +35,10 @@ public:
     virtual EncoderSubmitResult try_repeat_frame() = 0;
     // Makes the next submitted picture an IDR with parameter sets; call from the encoding thread.
     virtual void request_key_frame() noexcept = 0;
+    // Changes the target bitrate of the current sequence in place: no new parameter sets, no IDR. Returns false,
+    // leaving the encoder usable, when the backend cannot; the caller then reconfigures. Call from the encoding
+    // thread after the previous picture was received.
+    virtual bool try_update_bitrate(std::uint32_t bitrate_kbps) = 0;
     // Returns no value while output is pending; check last_error() to distinguish failures.
     [[nodiscard]] virtual std::optional<EncodedPacket> try_receive() = 0;
     virtual void stop() noexcept = 0;

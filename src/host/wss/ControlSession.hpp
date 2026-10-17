@@ -59,6 +59,8 @@ struct StreamEntry {
     DWORD pid{};
     bool focus_error_sent{};
     bool input_error_sent{};
+    // Unanswered set_stream_rate requests by pipeline serial (§5.14).
+    std::vector<std::pair<std::uint64_t, RequestId>> rate_requests;
 
     // Releases held input, stops capture/encoding and closes the stream socket.
     void shut_down(websocket::close_reason reason);
@@ -110,6 +112,7 @@ private:
     void start_stream(const json::object& message, const RequestId& id);
     void stop_stream(const json::object& message, const RequestId& id);
     void request_key_frame(const json::object& message, const RequestId& id);
+    void set_stream_rate(const json::object& message, const RequestId& id);
     std::shared_ptr<StreamEntry> find_stream(const json::object& message);
     void start_pipeline(const std::shared_ptr<StreamEntry>& entry);
     void offer(const std::shared_ptr<StreamEntry>& entry, const VideoParameters& video);

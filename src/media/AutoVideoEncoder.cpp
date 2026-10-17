@@ -108,6 +108,16 @@ void AutoVideoEncoder::request_key_frame() noexcept {
     if (selected_) selected_->request_key_frame();
 }
 
+bool AutoVideoEncoder::try_update_bitrate(std::uint32_t bitrate_kbps) {
+    if (!configured_ || !bitrate_kbps || bitrate_kbps > std::numeric_limits<std::uint32_t>::max() / 1000) {
+        return false;
+    }
+    // Before selection, the backend chosen later is configured with the new bitrate.
+    if (selected_ && !selected_->try_update_bitrate(bitrate_kbps)) return false;
+    options_.target_bitrate_kbps = bitrate_kbps;
+    return true;
+}
+
 EncoderSubmitResult AutoVideoEncoder::try_repeat_frame() {
     if (!running_ || !selected_ || FAILED(last_error())) {
         error_ = E_UNEXPECTED;

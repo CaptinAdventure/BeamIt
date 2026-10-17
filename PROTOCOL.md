@@ -212,6 +212,15 @@ Duplication, the default for `"desktop"`) or `"wgc"` (Windows.Graphics.Capture).
 Window and application sources always use `"wgc"`; `"dxgi"` for them is an
 `invalid_request`. `stream_offer.source.capture` reports the API used.
 
+A minimized window or application target is restored first (as if its
+taskbar button were clicked; this normally activates it). If it is still
+minimized after about 2 seconds — for example an elevated window the host
+cannot control — or closes meanwhile, the reply is `capture_failed`. The
+restore is reported like any other change through `window_changed` (§5.12).
+Hidden (not visible) windows are rejected with `capture_failed`. When
+choosing an `application` window, minimized windows are compared by their
+restored size.
+
 `video` and each of its fields are optional; omitted fields default to
 `"h264"`, 60 FPS and 48000 kbps. `codec` is `"h264"` or `"h265"`; `frame_rate` is
 1–240; `bitrate_kbps` is 1–1000000. The host keeps the codec and picks the
@@ -279,15 +288,18 @@ omit this additive field; clients must not assume a measured DPI in that case.
   **without** `description` so it accepts Annex B input.
 * `width`/`height` are the displayed (captured) size; `codedWidth`/
   `codedHeight` may be passed as the same values.
-* `generation` starts at 1 and increments on every encoder reconfiguration.
+* `generation` starts at 1 and increments on every encoder reconfiguration
+  (size change, frame-rate change, or a bitrate change that could not be
+  applied in place, §5.14). An in-place bitrate change keeps the generation.
 * `encoder` is informative only.
 * Pictures are output in decode order equal to display order (I/P only, no
   B-frames), each packet decodes to exactly one picture.
 
 ### 5.6 `stream_config` (host → client)
 
-Sent when the source size changes and the encoder is reconfigured. The new
-generation starts with a key frame.
+Sent when the encoder is reconfigured: the source size changed, or a
+`set_stream_rate` (§5.14) changed the frame rate or a bitrate the encoder
+could not change in place. The new generation starts with a key frame.
 
 ```json
 { "type": "stream_config", "stream_id": "…", "video": { "generation": 2, … } }
@@ -791,6 +803,54 @@ Limitations (informative): windows hosted by another process (e.g. some
 packaged apps shown by `ApplicationFrameHost.exe`) may report the host
 process's icon. Taskbar overlay badges are not included.
 
+### 5.14 `set_stream_rate` / `stream_rate`
+
+Changes the target bitrate and/or frame rate of a running stream, e.g. for
+congestion control or a client that wants fewer pictures.
+
+```json
+{ "type": "set_stream_rate", "id": 14, "stream_id": "…", "bitrate_kbps": 12000, "frame_rate": 30 }
+```
+
+| Field          | Meaning |
+|----------------|---------|
+| `stream_id`    | Required; unknown streams give `not_found` |
+| `bitrate_kbps` | Optional new CBR target, integer 1–1000000 |
+| `frame_rate`   | Optional new frame rate, integer 1–240 |
+
+At least one of `bitrate_kbps`/`frame_rate` is required (`invalid_request`).
+The codec, size and sampling never change. The request may be sent any time
+after `stream_offer`; it takes effect once the stream socket is open.
+
+Reply, after the change took effect:
+
+```json
+{ "type": "stream_rate", "id": 14, "stream_id": "…", "applied": "reconfigured",
+  "generation": 2, "frame_rate": 30, "bitrate_kbps": 12000 }
+```
+
+`applied` tells how:
+
+| `applied`        | Meaning |
+|------------------|---------|
+| `"unchanged"`    | The requested values were already in effect |
+| `"in_place"`     | Only the bitrate changed and the encoder applied it within the current sequence: same `generation`, no key frame, no `stream_config`; the following pictures use the new rate |
+| `"reconfigured"` | The encoder restarted: `stream_config` with the next `generation` was sent first, and that generation starts with a key frame (§5.6) |
+
+* A frame-rate change is always `"reconfigured"`, because the frame rate is
+  part of the SPS timing information.
+* A bitrate-only change is `"in_place"` when the encoder supports it (NVENC
+  reconfiguration, D3D12 rate-control reconfiguration), otherwise
+  `"reconfigured"`.
+* Requests that arrive before the previous one was applied are merged: later
+  values win, and every merged request receives the same reply describing
+  the final values.
+* `frame_rate`/`bitrate_kbps`/`generation` are the values now in effect and
+  match the stream's current video parameters (§5.5).
+* If the stream ends first, no `stream_rate` is sent; `stream_stopped`
+  (§5.8) ends the stream as usual. Encoder failures while applying the
+  change also end the stream with `stream_stopped`.
+
 ## 6. Stream sockets
 
 * URL: `wss://{host}/streams/{stream_id}?token={token}`; `token` is 32
@@ -863,4 +923,3 @@ These are not implemented in version 1; the names are reserved:
 
 * Touch and pen input, clipboard file transfer.
 * Audio: `message_type` `2` on a dedicated audio stream socket.
-* Bitrate/frame-rate changes on a running stream.

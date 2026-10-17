@@ -27,6 +27,9 @@ struct NvencVideoEncoder::Impl {
     HANDLE completion{};
     HANDLE copy_completion{};
     NV_ENCODE_API_FUNCTION_LIST api{};
+    // Session parameters, kept for in-place reconfiguration; init.encodeConfig points to config.
+    NV_ENC_CONFIG config{};
+    NV_ENC_INITIALIZE_PARAMS init{};
     void* session{};
     NV_ENC_REGISTERED_PTR registered{};
     NV_ENC_INPUT_PTR mapped{};
@@ -193,16 +196,13 @@ struct NvencVideoEncoder::Impl {
         if (!check(api.nvEncGetEncodePresetConfigEx(session, NV_ENC_CODEC_H264_GUID,
                    NV_ENC_PRESET_P1_GUID, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &preset),
                    "query ultra-low-latency preset")) return false;
-        auto& config = preset.presetCfg;
+        config = preset.presetCfg;
         config.profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID;
         config.gopLength = 60;
         config.frameIntervalP = 1;
         config.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
         config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
-        config.rcParams.averageBitRate = options.target_bitrate_kbps * 1000;
-        config.rcParams.maxBitRate = config.rcParams.averageBitRate;
-        config.rcParams.vbvBufferSize = std::max(1u, config.rcParams.averageBitRate / options.frame_rate);
-        config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
+        set_bitrate(config, options.target_bitrate_kbps);
         config.rcParams.enableLookahead = 0;
         config.rcParams.lookaheadDepth = 0;
         config.rcParams.enableTemporalAQ = 0;
@@ -214,7 +214,7 @@ struct NvencVideoEncoder::Impl {
         h264.maxNumRefFrames = 1;
         h264.repeatSPSPPS = 1;
         h264.outputAUD = 1;
-        NV_ENC_INITIALIZE_PARAMS init{};
+        init = {};
         init.version = NV_ENC_INITIALIZE_PARAMS_VER;
         init.encodeGUID = NV_ENC_CODEC_H264_GUID;
         init.presetGUID = NV_ENC_PRESET_P1_GUID;
@@ -264,6 +264,37 @@ struct NvencVideoEncoder::Impl {
         event_registered = true;
         spdlog::info("NVENC D3D11: H.264 High 4:4:4 Predictive, 8-bit 4:4:4; GPU BGRA input; "
                      "CBR, GOP 60 I/P, no B-frames/lookahead, one-frame VBV");
+        return true;
+    }
+
+    // CBR with a one-frame VBV.
+    void set_bitrate(NV_ENC_CONFIG& target, std::uint32_t kbps) const {
+        target.rcParams.averageBitRate = kbps * 1000;
+        target.rcParams.maxBitRate = target.rcParams.averageBitRate;
+        target.rcParams.vbvBufferSize = std::max(1u, target.rcParams.averageBitRate / options.frame_rate);
+        target.rcParams.vbvInitialDelay = target.rcParams.vbvBufferSize;
+    }
+
+    // Applies a new rate-control target to the open session without an IDR or new SPS/PPS.
+    bool reconfigure_bitrate(std::uint32_t kbps) {
+        if (!api.nvEncReconfigureEncoder || pending) return false;
+        auto updated = config;
+        set_bitrate(updated, kbps);
+        NV_ENC_RECONFIGURE_PARAMS reconfigure{};
+        reconfigure.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+        reconfigure.reInitEncodeParams = init;
+        reconfigure.reInitEncodeParams.encodeConfig = &updated;
+        reconfigure.resetEncoder = 0;
+        reconfigure.forceIDR = 0;
+        const auto status = api.nvEncReconfigureEncoder(session, &reconfigure);
+        if (status != NV_ENC_SUCCESS) {
+            // Not fatal: the caller falls back to a full reconfiguration with a new session.
+            const char* detail = api.nvEncGetLastErrorString ? api.nvEncGetLastErrorString(session) : nullptr;
+            spdlog::warn("NVENC in-place bitrate change rejected (status {}): {}", static_cast<int>(status),
+                         detail ? detail : "no driver detail");
+            return false;
+        }
+        config = updated;
         return true;
     }
 
@@ -372,6 +403,17 @@ EncoderSubmitResult NvencVideoEncoder::try_submit(const CapturedFrame& frame) {
 
 void NvencVideoEncoder::request_key_frame() noexcept {
     impl_->key_frame_requested = true;
+}
+
+bool NvencVideoEncoder::try_update_bitrate(std::uint32_t bitrate_kbps) {
+    if (!impl_->configured || FAILED(impl_->error) || !bitrate_kbps ||
+        bitrate_kbps > std::numeric_limits<std::uint32_t>::max() / 1000) {
+        return false;
+    }
+    // Before deferred initialization the session is simply opened with the new bitrate.
+    if (impl_->session && !impl_->reconfigure_bitrate(bitrate_kbps)) return false;
+    impl_->options.target_bitrate_kbps = bitrate_kbps;
+    return true;
 }
 
 EncoderSubmitResult NvencVideoEncoder::try_repeat_frame() {

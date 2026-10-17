@@ -114,6 +114,9 @@ struct D3D12VideoEncoder::Impl {
     bool readback_queued{false};
     bool pending_key_frame{true};
     bool key_frame_requested{false};
+    // The driver accepts rate-control changes within a sequence; the next EncodeFrame carries the change.
+    bool rate_control_reconfigurable{false};
+    bool rate_control_changed{false};
     std::uint64_t frame_number{0};
     std::uint64_t shared_fence_value{0};
     std::uint64_t encode_fence_value{0};
@@ -177,6 +180,8 @@ struct D3D12VideoEncoder::Impl {
         readback_queued = false;
         frame_number = 0;
         key_frame_requested = false;
+        rate_control_reconfigurable = false;
+        rate_control_changed = false;
         parameter_sets.clear();
         shared_fence_value = 0;
         encode_fence_value = 0;
@@ -324,6 +329,16 @@ EncoderSubmitResult D3D12VideoEncoder::try_repeat_frame() {
 
 void D3D12VideoEncoder::request_key_frame() noexcept {
     impl_->key_frame_requested = true;
+}
+
+bool D3D12VideoEncoder::try_update_bitrate(std::uint32_t bitrate_kbps) {
+    if (!impl_->configured || FAILED(impl_->error) || !bitrate_kbps) return false;
+    if (impl_->initialized && !impl_->rate_control_reconfigurable) return false;
+    // Before deferred initialization the encoder is simply created with the new bitrate; the parameter sets carry no
+    // HRD bitrate, so they stay valid either way.
+    if (impl_->initialized && impl_->options.target_bitrate_kbps != bitrate_kbps) impl_->rate_control_changed = true;
+    impl_->options.target_bitrate_kbps = bitrate_kbps;
+    return true;
 }
 
 std::optional<EncodedPacket> D3D12VideoEncoder::try_receive() {
@@ -740,6 +755,8 @@ HRESULT D3D12VideoEncoder::Impl::initialize_format(ID3D11Texture2D* capture_text
         suggested_h264_profile != h264_profile || suggested_hevc_profile != hevc_profile) {
         return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     }
+    rate_control_reconfigurable =
+        (support.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_RATE_CONTROL_RECONFIGURATION_AVAILABLE) != 0;
     try {
         parameter_sets = detail::make_parameter_sets(
             options, support.SuggestedLevel, resolution_support.SubregionBlockPixelsSize, &hevc_config, format);
@@ -1261,6 +1278,9 @@ HRESULT D3D12VideoEncoder::Impl::encode() {
     sequence.RateControl.TargetFrameRate = DXGI_RATIONAL{options.frame_rate, 1};
     sequence.PictureTargetResolution = {options.width, options.height};
     sequence.SelectedLayoutMode = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME;
+    if (std::exchange(rate_control_changed, false)) {
+        sequence.Flags |= D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_FLAG_RATE_CONTROL_CHANGE;
+    }
     D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264 h264_gop{
         .GOPLength = detail::gop_length,
         .PPicturePeriod = 1,

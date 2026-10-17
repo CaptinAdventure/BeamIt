@@ -29,6 +29,11 @@ std::vector<ApplicationWindow> application_windows() {
             GetWindowThreadProcessId(hwnd, &pid);
             RECT rect{};
             GetWindowRect(hwnd, &rect);
+            // Minimized windows report a small off-screen rectangle; compare their restored size instead.
+            if (WINDOWPLACEMENT placement{.length = sizeof(WINDOWPLACEMENT)};
+                IsIconic(hwnd) && GetWindowPlacement(hwnd, &placement)) {
+                rect = placement.rcNormalPosition;
+            }
             const auto width = std::max<LONG>(0, rect.right - rect.left);
             const auto height = std::max<LONG>(0, rect.bottom - rect.top);
             state.windows.push_back({

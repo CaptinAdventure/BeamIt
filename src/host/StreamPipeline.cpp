@@ -22,6 +22,24 @@ struct StartFailure : std::runtime_error {
 
 struct Stopped {};
 
+// WGC delivers no frames for minimized windows, so restore the target first (like clicking its taskbar button). The
+// asynchronous request cannot block on a hung target; the pipeline thread waits for the result instead.
+template <typename CheckStop>
+void restore_minimized_window(const capture::CaptureTarget& target, FrameTimer& timer, CheckStop&& check_stop) {
+    if (target.kind != capture::CaptureTargetKind::Window || !IsIconic(target.window)) return;
+    spdlog::info("Restoring minimized window 0x{:X} before capture", reinterpret_cast<std::uintptr_t>(target.window));
+    ShowWindowAsync(target.window, SW_RESTORE);
+    const auto deadline = Clock::now() + 2s;
+    while (IsIconic(target.window)) {
+        check_stop();
+        if (!IsWindow(target.window)) throw StartFailure("capture_failed", "the window closed before capture started");
+        if (Clock::now() >= deadline) {
+            throw StartFailure("capture_failed", "the minimized window could not be restored within 2 seconds");
+        }
+        timer.wait_until(Clock::now() + 5ms);
+    }
+}
+
 } // namespace
 
 StreamPipeline::StreamPipeline(std::unique_ptr<capture::Capturer> capturer,
@@ -42,6 +60,21 @@ void StreamPipeline::activate() noexcept {
 }
 
 void StreamPipeline::request_key_frame() noexcept { key_frame_requested_ = true; }
+
+std::uint64_t StreamPipeline::request_rate_change(std::optional<std::uint32_t> bitrate_kbps,
+                                                  std::optional<std::uint32_t> frame_rate) {
+    std::lock_guard lock(rate_mutex_);
+    if (bitrate_kbps) rate_change_.bitrate_kbps = bitrate_kbps;
+    if (frame_rate) rate_change_.frame_rate = frame_rate;
+    rate_change_.serial = ++rate_serial_;
+    return rate_change_.serial;
+}
+
+std::optional<StreamPipeline::RateChange> StreamPipeline::take_rate_change() {
+    std::lock_guard lock(rate_mutex_);
+    if (rate_change_.serial == 0) return std::nullopt;
+    return std::exchange(rate_change_, RateChange{});
+}
 
 void StreamPipeline::stop() noexcept {
     stop_requested_ = true;
@@ -75,28 +108,35 @@ void StreamPipeline::loop() {
         if (stop_requested_) throw Stopped{};
     };
 
-    if (!capturer_->configure(target_, {}) || !capturer_->start()) {
-        throw StartFailure("capture_failed",
-            fmt::format("capture startup failed (HRESULT 0x{:08X})",
-                        static_cast<std::uint32_t>(capturer_->last_error())));
-    }
+    restore_minimized_window(target_, timer, check_stop);
     std::optional<CapturedFrame> latest;
-    const auto first_frame_deadline = Clock::now() + 5s;
-    while (!latest) {
-        check_stop();
-        latest = capturer_->try_acquire_frame();
-        if (FAILED(capturer_->last_error())) {
-            throw StartFailure("capture_failed", fmt::format("capture failed (HRESULT 0x{:08X})",
-                static_cast<std::uint32_t>(capturer_->last_error())));
+    // (Re)starts capture and waits for its first frame; a fresh capture session always delivers a full image.
+    const auto start_capture = [&](bool starting) {
+        const auto fail = [&](const std::string& message) {
+            if (starting) throw StartFailure("capture_failed", message);
+            throw std::runtime_error(message);
+        };
+        if (!capturer_->configure(target_, {}) || !capturer_->start()) {
+            fail(fmt::format("capture startup failed (HRESULT 0x{:08X})",
+                             static_cast<std::uint32_t>(capturer_->last_error())));
         }
-        if (!latest) {
-            if (Clock::now() >= first_frame_deadline) {
-                throw StartFailure("capture_failed",
-                    "no frame within 5 seconds; the source may be minimized, protected or on an inactive desktop");
+        const auto first_frame_deadline = Clock::now() + 5s;
+        while (!latest) {
+            check_stop();
+            latest = capturer_->try_acquire_frame();
+            if (FAILED(capturer_->last_error())) {
+                fail(fmt::format("capture failed (HRESULT 0x{:08X})",
+                                 static_cast<std::uint32_t>(capturer_->last_error())));
             }
-            timer.wait_until(Clock::now() + 1ms);
+            if (!latest) {
+                if (Clock::now() >= first_frame_deadline) {
+                    fail("no frame within 5 seconds; the source may be minimized, protected or on an inactive desktop");
+                }
+                timer.wait_until(Clock::now() + 1ms);
+            }
         }
-    }
+    };
+    start_capture(true);
 
     D3D11_TEXTURE2D_DESC description{};
     latest->texture->GetDesc(&description);
@@ -155,6 +195,55 @@ void StreamPipeline::loop() {
     callbacks_.ready(parameters);
 
     bool announce = false;
+    // A rate change that restarted the encoder is reported after the new generation is announced.
+    std::optional<std::uint64_t> announced_rate_serial;
+    const auto reconfigure = [&] {
+        ++parameters.generation;
+        configure(false);
+        if (!latest) {
+            // A borrowed (DXGI) surface was already returned and the new encoder has no image to repeat while the
+            // source is idle, so restart capture to obtain a complete frame.
+            capturer_->stop();
+            start_capture(false);
+        }
+        announce = true;
+    };
+    const auto apply_rate_change = [&](const RateChange& change) {
+        const auto frame_rate = change.frame_rate.value_or(options_.frame_rate);
+        const auto bitrate = change.bitrate_kbps.value_or(options_.target_bitrate_kbps);
+        auto result = RateChangeResult::Unchanged;
+        if (frame_rate != options_.frame_rate) {
+            // The frame rate is part of the SPS timing information, so it needs new parameter sets and an IDR.
+            options_.frame_rate = frame_rate;
+            options_.target_bitrate_kbps = bitrate;
+            reconfigure();
+            result = RateChangeResult::Reconfigured;
+        } else if (bitrate != options_.target_bitrate_kbps) {
+            options_.target_bitrate_kbps = bitrate;
+            if (encoder_->try_update_bitrate(bitrate)) {
+                result = RateChangeResult::InPlace;
+            } else {
+                check_hresult(encoder_->last_error(), "In-place bitrate change");
+                reconfigure();
+                result = RateChangeResult::Reconfigured;
+            }
+        }
+        parameters.frame_rate = options_.frame_rate;
+        parameters.bitrate_kbps = options_.target_bitrate_kbps;
+        spdlog::info("Stream rate change {}: {} FPS, {} kbps ({})", change.serial, parameters.frame_rate,
+                     parameters.bitrate_kbps,
+                     result == RateChangeResult::InPlace        ? "in place"
+                     : result == RateChangeResult::Reconfigured ? "encoder reconfigured"
+                                                                : "unchanged");
+        if (result == RateChangeResult::Reconfigured) {
+            announced_rate_serial = change.serial;
+        } else if (!announced_rate_serial) {
+            callbacks_.rate_changed(parameters, change.serial, result);
+        } else {
+            // An earlier change of this iteration already restarted the encoder; report both after the announcement.
+            announced_rate_serial = change.serial;
+        }
+    };
     std::uint64_t sequence = 0;
     auto next_frame = Clock::now();
     while (true) {
@@ -170,15 +259,14 @@ void StreamPipeline::loop() {
         check_hresult(capturer_->last_error(), "Capture");
         // Keep only the newest surface until the client connects, so activation shows current content.
         if (!active_) continue;
+        if (const auto change = take_rate_change()) apply_rate_change(*change);
         if (latest) {
             D3D11_TEXTURE2D_DESC current{};
             latest->texture->GetDesc(&current);
             if (current.Width != parameters.width || current.Height != parameters.height) {
                 parameters.width = current.Width;
                 parameters.height = current.Height;
-                ++parameters.generation;
-                configure(false);
-                announce = true;
+                reconfigure();
             }
         }
         if (key_frame_requested_.exchange(false)) encoder_->request_key_frame();
@@ -195,6 +283,10 @@ void StreamPipeline::loop() {
                          parameters.height, parameters.codec_string);
             callbacks_.reconfigured(parameters);
             announce = false;
+            if (announced_rate_serial) {
+                callbacks_.rate_changed(parameters, *announced_rate_serial, RateChangeResult::Reconfigured);
+                announced_rate_serial.reset();
+            }
         }
         auto frame = std::make_shared<EncodedFrame>();
         frame->packet = std::move(packet);
