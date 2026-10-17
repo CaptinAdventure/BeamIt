@@ -72,10 +72,12 @@ target_link_libraries(beamit_wintls INTERFACE Boost::beast crypt32 secur32 bcryp
 
 set(BEAMIT_HOST_SOURCES
     src/host/AttentionMonitor.cpp
+    src/host/Clipboard.cpp
     src/host/HostServer.cpp
     src/host/InputInjector.cpp
     src/host/StreamPipeline.cpp
     src/host/TlsIdentity.cpp
+    src/host/WindowTracker.cpp
     src/media/BitstreamInfo.cpp
     src/net/Crypto.cpp
 )
@@ -92,7 +94,7 @@ add_executable(BeamIt
 )
 target_include_directories(BeamIt PRIVATE include src "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(BeamIt PRIVATE spdlog CLI11::CLI11 Boost::beast Boost::json beamit_wintls
-    d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore)
+    d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs)
 target_compile_definitions(BeamIt PUBLIC NOMINMAX _WIN32_WINNT=0x0A00)
 if(TARGET NVIDIA::NVENCHeaders)
     target_sources(BeamIt PRIVATE src/media/NvencVideoEncoder.cpp)
@@ -119,6 +121,8 @@ if(BUILD_TESTING)
         tests/ProtocolTests.cpp
         tests/InputTests.cpp
         tests/AttentionTests.cpp
+        tests/ClipboardTests.cpp
+        tests/WindowTrackerTests.cpp
         src/ApplicationWindows.cpp
         ${BEAMIT_HOST_SOURCES}
         src/capture/DxgiCapturer.cpp
@@ -130,7 +134,7 @@ if(BUILD_TESTING)
     target_include_directories(BeamItTests PRIVATE include src "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_compile_definitions(BeamItTests PRIVATE BEAMIT_USE_CATCH2=1 NOMINMAX _WIN32_WINNT=0x0A00)
     target_link_libraries(BeamItTests PRIVATE Catch2::Catch2WithMain spdlog Boost::beast Boost::json beamit_wintls
-        d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore)
+        d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs)
     if(TARGET NVIDIA::NVENCHeaders)
         target_sources(BeamItTests PRIVATE tests/NvencVideoEncoderTests.cpp src/media/NvencVideoEncoder.cpp)
         target_link_libraries(BeamItTests PRIVATE NVIDIA::NVENCHeaders)

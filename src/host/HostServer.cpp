@@ -11,8 +11,10 @@
 #include "HtmlAssets.hpp"
 #include "Utf8.hpp"
 #include "host/AttentionMonitor.hpp"
+#include "host/Clipboard.hpp"
 #include "host/InputInjector.hpp"
 #include "host/StreamPipeline.hpp"
+#include "host/WindowTracker.hpp"
 #include "media/BitstreamInfo.hpp"
 #include "net/Protocol.hpp"
 
@@ -250,6 +252,9 @@ struct Server {
     std::weak_ptr<ControlSession> active;
     // Windows currently requesting attention (network thread only).
     std::map<HWND, AttentionEvent> attention;
+    // Reported top-level windows (network thread only).
+    WindowList windows;
+    ClipboardMonitor* clipboard{};
 };
 
 using Outgoing = std::variant<std::string, websocket::close_reason>;
@@ -271,9 +276,11 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
     bool authenticated{};
     bool auth_failed{};
 
-    void send(json::object message) {
+    void send(json::object message) { send_serialized(json::serialize(message)); }
+
+    void send_serialized(std::string message) {
         if (closing) return;
-        outbox.emplace_back(json::serialize(message));
+        outbox.emplace_back(std::move(message));
         pump();
     }
 
@@ -421,6 +428,10 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
                 send(std::move(pong));
             } else if (type == "list_windows") {
                 list_windows(id);
+            } else if (type == "get_clipboard") {
+                get_clipboard(message, id);
+            } else if (type == "set_clipboard") {
+                set_clipboard(message, id);
             } else if (type == "start_stream") {
                 start_stream(message, id);
             } else if (type == "stop_stream") {
@@ -484,11 +495,15 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
                             "superseded by a newer session");
         }
         server.active = shared_from_this();
+        ws->read_message_max(protocol::max_authenticated_signaling_message);
         const auto server_proof = beamit::net::auth_proof(server.options.auth_key, "server", server_nonce,
                                                           *client_nonce);
         send({{"type", "authenticated"}, {"server_proof", bytes_text(server_proof)},
               {"host_time_us", protocol::host_time_us(Clock::now())}});
         spdlog::info("Control client {} authenticated", remote);
+        for (const auto& window : server.windows.windows()) {
+            send_window_event({.kind = WindowEvent::Kind::Opened, .window = window});
+        }
     }
 
     void list_windows(const std::optional<json::value>& id) {
@@ -724,10 +739,149 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
         for (const auto& [window, event] : server.attention) send_attention(*entry, event);
     }
 
+    static constexpr std::array<std::pair<ClipboardFormat, std::string_view>, 3> clipboard_format_names{{
+        {clipboard_text, "text"}, {clipboard_html, "html"}, {clipboard_image, "image"}}};
+
+    static std::string_view clipboard_format_name(ClipboardFormat format) {
+        for (const auto& [value, name] : clipboard_format_names) {
+            if (value == format) return name;
+        }
+        return "unknown";
+    }
+
+    static json::array clipboard_format_list(unsigned formats) {
+        json::array list;
+        for (const auto& [value, name] : clipboard_format_names) {
+            if (formats & value) list.emplace_back(name);
+        }
+        return list;
+    }
+
+    void get_clipboard(const json::object& message, const std::optional<json::value>& id) {
+        unsigned formats = clipboard_all;
+        if (const auto* field = message.if_contains("formats")) {
+            if (!field->is_array() || field->as_array().empty()) {
+                throw ProtocolError{"invalid_request", "formats must be a non-empty array"};
+            }
+            formats = 0;
+            for (const auto& item : field->as_array()) {
+                const auto found = std::ranges::find_if(clipboard_format_names, [&](const auto& entry) {
+                    return item.is_string() && item.as_string() == entry.second;
+                });
+                if (found == clipboard_format_names.end()) {
+                    throw ProtocolError{"invalid_request", "formats may contain only text, html and image"};
+                }
+                formats |= found->first;
+            }
+        }
+        if (!server.clipboard) throw ProtocolError{"clipboard_unavailable", "clipboard access is unavailable"};
+        // Reading and PNG conversion happen on the clipboard thread; the reply is serialized there too so that large
+        // payloads do not stall the network thread.
+        server.clipboard->read(formats, protocol::max_clipboard_bytes,
+                               [executor = ws->get_executor(), weak_self = weak_from_this(), id](
+                                   ClipboardReadResult result) {
+            json::object reply;
+            if (!result.content) {
+                reply = {{"type", "error"}, {"code", "clipboard_unavailable"}, {"message", result.error}};
+            } else {
+                auto& content = *result.content;
+                reply = {{"type", "clipboard"}, {"sequence", content.sequence}};
+                if (content.text) reply["text"] = *content.text;
+                if (content.html) reply["html"] = *content.html;
+                if (content.image) {
+                    reply["image"] = {{"mime_type", "image/png"}, {"width", content.image->width},
+                                      {"height", content.image->height},
+                                      {"data", beamit::net::base64_encode(content.image->png)}};
+                }
+                json::array omitted;
+                for (const auto& omission : content.omitted) {
+                    omitted.push_back({{"format", clipboard_format_name(omission.format)}, {"reason", omission.reason}});
+                }
+                reply["omitted"] = std::move(omitted);
+            }
+            if (id) reply["id"] = *id;
+            asio::post(executor, [weak_self, message = json::serialize(reply)]() mutable {
+                if (auto self = weak_self.lock()) self->send_serialized(std::move(message));
+            });
+        });
+    }
+
+    void set_clipboard(const json::object& message, const std::optional<json::value>& id) {
+        ClipboardWrite content;
+        std::size_t total{};
+        const auto string_field = [&](std::string_view name) -> std::optional<std::string> {
+            const auto* field = message.if_contains(name);
+            if (!field) return std::nullopt;
+            if (!field->is_string()) throw ProtocolError{"invalid_request", fmt::format("{} must be a string", name)};
+            total += field->as_string().size();
+            return std::string(field->as_string());
+        };
+        content.text = string_field("text");
+        content.html = string_field("html");
+        if (const auto* field = message.if_contains("image")) {
+            const auto* data = field->is_object() ? field->as_object().if_contains("data") : nullptr;
+            const auto* mime = field->is_object() ? field->as_object().if_contains("mime_type") : nullptr;
+            if (!data || !data->is_string() || (mime && !(mime->is_string() && mime->as_string() == "image/png"))) {
+                throw ProtocolError{"invalid_request", "image must be {\"mime_type\": \"image/png\", \"data\": base64}"};
+            }
+            total += data->as_string().size();
+            content.image = std::string(data->as_string());
+        }
+        if (const auto* field = message.if_contains("sensitive")) {
+            if (!field->is_bool()) throw ProtocolError{"invalid_request", "sensitive must be a boolean"};
+            content.sensitive = field->as_bool();
+        }
+        if (!content.text && !content.html && !content.image) {
+            throw ProtocolError{"invalid_request", "set_clipboard needs text, html or image"};
+        }
+        if (total > protocol::max_clipboard_bytes) {
+            throw ProtocolError{"invalid_request", "clipboard content exceeds 10 MiB"};
+        }
+        if (!server.clipboard) throw ProtocolError{"clipboard_unavailable", "clipboard access is unavailable"};
+        server.clipboard->write(std::move(content), [executor = ws->get_executor(), weak_self = weak_from_this(),
+                                                     id](ClipboardWriteResult result) {
+            json::object reply;
+            if (result.error_code.empty()) {
+                reply = {{"type", "clipboard_set"}, {"sequence", result.sequence}};
+            } else {
+                reply = {{"type", "error"}, {"code", result.error_code}, {"message", result.error}};
+            }
+            if (id) reply["id"] = *id;
+            asio::post(executor, [weak_self, reply = std::move(reply)]() mutable {
+                if (auto self = weak_self.lock()) self->send(std::move(reply));
+            });
+        });
+    }
+
+    void on_clipboard_changed(const ClipboardChange& change) {
+        send({{"type", "clipboard_changed"}, {"sequence", change.sequence},
+              {"formats", clipboard_format_list(change.formats)}, {"excluded", change.excluded}});
+    }
+
     void on_attention(const AttentionEvent& event) {
         for (const auto& [id, entry] : streams) {
             if (entry->ready) send_attention(*entry, event);
         }
+    }
+
+    static json::object window_json(const WindowState& window) {
+        json::object object{
+            {"hwnd", hwnd_text(window.hwnd)},
+            {"pid", window.pid},
+            {"image_name", window.image_name},
+            {"title", window.title},
+            {"role", window_role_name(window.role)},
+            {"rect", {{"x", window.rect.x}, {"y", window.rect.y}, {"width", window.rect.width},
+                      {"height", window.rect.height}}},
+            {"state", window_show_state_name(window.show)},
+        };
+        if (window.owner) object["owner"] = hwnd_text(window.owner);
+        return object;
+    }
+
+    void send_window_event(const WindowEvent& event) {
+        static constexpr std::array<std::string_view, 3> types{"window_opened", "window_changed", "window_closed"};
+        send({{"type", types[static_cast<std::size_t>(event.kind)]}, {"window", window_json(event.window)}});
     }
 
     void send_attention(const StreamEntry& entry, const AttentionEvent& event) {
@@ -1139,6 +1293,24 @@ void run_host_server(HostServerOptions options) {
                 server.attention.erase(event.window);
             }
             if (auto session = server.active.lock()) session->on_attention(event);
+        });
+    });
+
+    // Clipboard notifications arrive on the clipboard thread; only the authenticated session receives them.
+    ClipboardMonitor clipboard_monitor([&server](const ClipboardChange& change) {
+        asio::post(server.io, [&server, change] {
+            if (auto session = server.active.lock()) session->on_clipboard_changed(change);
+        });
+    });
+    server.clipboard = &clipboard_monitor;
+
+    // Window snapshots arrive on the tracking thread; the authenticated session receives the differences.
+    WindowMonitor window_monitor([&server](std::vector<WindowState> windows) {
+        asio::post(server.io, [&server, windows = std::move(windows)] {
+            const auto events = server.windows.update(windows);
+            if (auto session = server.active.lock()) {
+                for (const auto& event : events) session->send_window_event(event);
+            }
         });
     });
 

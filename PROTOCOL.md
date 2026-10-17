@@ -24,6 +24,7 @@ client                                   host
   |<-------------------------- hello --------|  (auth challenge)
   |--- authenticate ------------------------>|
   |<------------------- authenticated -------|  (mutual proof)
+  |<------------------- window_opened -------|  (every host window, §5.12)
   |--- list_windows ------------------------>|
   |<------------------------- windows -------|
   |--- start_stream ------------------------>|  (host starts capture + encoder)
@@ -33,6 +34,12 @@ client                                   host
   |<-------------------- stream_config ------|  (only when the encoder is reconfigured)
   |--- mouse_move / mouse_button / key ----->|  (input, tagged with stream_id)
   |<------------------------ attention ------|  (taskbar flash set/clear, §5.10)
+  |<-------- window_changed / window_closed -|  (§5.12)
+  |<----------------- clipboard_changed -----|  (host clipboard changed, §5.11)
+  |--- get_clipboard ----------------------->|
+  |<------------------------- clipboard -----|  (text / HTML / PNG)
+  |--- set_clipboard ----------------------->|
+  |<--------------------- clipboard_set -----|
   |--- stop_stream ------------------------->|
   |<------------------ stream_stopped -------|
 ```
@@ -57,7 +64,8 @@ client                                   host
 * If a browser `Origin` header is present on any WebSocket upgrade, its
   `host:port` must equal the request `Host` header, otherwise the upgrade is
   rejected with `403`. Non-browser clients may omit `Origin`.
-* Limits: signaling messages are at most 64 KiB; an unauthenticated control
+* Limits: signaling messages are at most 64 KiB before authentication and
+  16 MiB afterwards (for `set_clipboard`, §5.11.3); an unauthenticated control
   socket is closed after 10 s; at most 8 concurrent streams per session.
   The WebSocket layer uses ping/pong keep-alives; idle peers are dropped
   after about 30 s without a response.
@@ -95,6 +103,7 @@ produce an `error` with code `unknown_type` but do not close the socket.
 | `not_ready`          | Input sent before the stream socket opened                      | no            |
 | `focus_failed`       | Target window could not be brought to the foreground (§5.9)     | no            |
 | `input_failed`       | The OS rejected injected input (§5.9)                           | no            |
+| `clipboard_unavailable` | The host clipboard could not be opened, read or written (§5.11) | no         |
 | `internal_error`     | Unexpected host failure                                         | no            |
 
 ## 4. Handshake and authentication
@@ -222,7 +231,8 @@ produces an `error` (`not_found`, `capture_failed`, `encoder_failed`,
   "url": "wss://host:port/streams/Q2hOc3kV2bTqjG6dAVu0Sg?token=…",
   "token_expires_in_ms": 10000,
   "source": { "kind": "window", "hwnd": "0x1A2B3C", "pid": 4242, "title": "Microsoft Teams", "capture": "wgc", "dpi": { "x": 144, "y": 144 } },
-  "video": { …video parameters, §5.5… }
+  "video": { …video parameters, §5.5… },
+  "input": { "mouse_mode": "absolute" }
 }
 ```
 
@@ -491,8 +501,9 @@ succeeds again). Desktop streams never change focus.
 * The secure desktop (UAC prompt, lock screen, Ctrl+Alt+Del screen) cannot
   receive input; the host reports `input_failed` (rate-limited).
 * The host must run in the interactive user session (not as a service).
-* Pop-up menus outside the window's rectangle cannot be reached in
-  absolute/window-relative mode until secondary-window streaming exists.
+* Pop-up menus outside the window's rectangle cannot be reached through the
+  stream of the window that opened them. Clients can open a stream for the
+  pop-up itself after its `window_opened` (§5.12).
 
 ### 5.10 `attention` (host → client)
 
@@ -519,8 +530,8 @@ Scope:
 
 * **Window streams** receive events for every top-level window of the
   streamed window's process (`pid`), not only the streamed `hwnd`, because
-  applications such as Teams flash secondary windows. `window.hwnd` tells the
-  client which one; it may differ from the stream's `source.hwnd`.
+  applications such as Teams flash secondary windows. `window.hwnd` tells the client which one; it
+  may differ from the stream's `source.hwnd`.
 * **Desktop streams** receive events for all windows.
 * Each event is sent once per matching stream, so a client with several
   streams may receive the same transition several times (distinct
@@ -547,6 +558,189 @@ or destroyed, which matches the taskbar button that stays highlighted until
 activation. Badge overlays (e.g. unread counts on the taskbar icon) and toast
 notifications are not reported. The host must run in the interactive user
 session.
+
+### 5.11 Clipboard
+
+Session-level (no `stream_id`): lets a client mirror the host clipboard
+locally (§5.11.1–2) and copy its own clipboard to the host (§5.11.3).
+
+#### 5.11.1 `clipboard_changed` (host → client)
+
+Sent to the authenticated session whenever the host clipboard changes. It
+carries no content; the client calls `get_clipboard` if it wants the data.
+
+```json
+{ "type": "clipboard_changed", "sequence": 917, "formats": ["text", "html"], "excluded": false }
+```
+
+* `sequence` is the Windows clipboard sequence number; it increases on every
+  change. One copy operation may produce several notifications (applications
+  often add formats one by one); clients should debounce or compare
+  `sequence` with the latest `clipboard` reply.
+* `formats` lists which of `"text"`, `"html"` and `"image"` are available.
+* `excluded` is `true` (and `formats` empty) when the owner marked the content
+  with `ExcludeClipboardContentFromMonitorProcessing`, as password managers
+  do. Clients should not fetch or mirror such content.
+
+#### 5.11.2 `get_clipboard` / `clipboard`
+
+```json
+{ "type": "get_clipboard", "id": 8, "formats": ["text", "html", "image"] }
+```
+
+`formats` is optional (default: all three) and must be a non-empty array of
+`"text"`, `"html"`, `"image"`. Reply:
+
+```json
+{
+  "type": "clipboard",
+  "id": 8,
+  "sequence": 917,
+  "text": "Bold & café",
+  "html": "<b>Bold</b> &amp; café",
+  "image": { "mime_type": "image/png", "width": 320, "height": 200, "data": "iVBORw0KGgo…" },
+  "omitted": [ { "format": "image", "reason": "too_large" } ]
+}
+```
+
+* Each content field is present only if requested and available.
+  `sequence` identifies the clipboard state that was read.
+* `text`: `CF_UNICODETEXT` as a JSON string (Windows `\r\n` line endings are
+  preserved).
+* `html`: the fragment of the Windows `"HTML Format"` data (between
+  `StartFragment` and `EndFragment`, or the whole document if those are
+  missing), suitable for the client's `text/html` clipboard flavour.
+  Invalid UTF-8 is replaced with U+FFFD.
+* `image`: PNG, **standard base64 with padding** (RFC 4648 §4, usable in a
+  `data:image/png;base64,` URL), unlike the base64url used elsewhere. An
+  application-provided `"PNG"` format is passed through (keeping
+  transparency); otherwise the device-independent bitmap is converted
+  (opaque).
+* Size limit: text bytes + HTML bytes + base64 image characters must not
+  exceed **10 MiB** (10,485,760) per reply, counted before JSON escaping and
+  filled in the order text, HTML, image. A format that does not fit is listed
+  in `omitted` with reason `"too_large"`; request fewer formats to fetch it
+  alone.
+* Other `omitted` reasons: `"excluded"` (see §5.11.1; nothing is returned)
+  and `"unsupported"` (the data could not be decoded or converted).
+* If another application holds the clipboard open for more than about
+  100 ms, or it cannot be read, the reply is `error`
+  `clipboard_unavailable`.
+* Replies to `get_clipboard` may arrive after later replies (reading and PNG
+  conversion happen off the network thread); match them by `id`.
+
+#### 5.11.3 `set_clipboard` / `clipboard_set`
+
+Replaces the whole host clipboard, as a local copy would:
+
+```json
+{
+  "type": "set_clipboard",
+  "id": 9,
+  "text": "Hello ✓",
+  "html": "<b>Hello</b> ✓",
+  "image": { "mime_type": "image/png", "data": "iVBORw0KGgo…" },
+  "sensitive": false
+}
+```
+
+* At least one of `text`, `html`, `image` is required; omitted formats are
+  not on the clipboard afterwards. Include `text` with `html`, because many
+  applications only paste plain text; the host does not derive one from the
+  other.
+* `text` becomes `CF_UNICODETEXT`. `html` is a fragment that the host wraps
+  in the Windows `"HTML Format"` header.
+* `image.data` is a PNG in standard base64 (padding optional);
+  `mime_type` is optional and must be `"image/png"`. The host places it as
+  `"PNG"` (keeping transparency) and as a 32-bit `CF_DIB` (alpha composited
+  onto white, since most applications ignore DIB alpha). Images are limited to
+  16384 pixels per side and 64 Mpixel.
+* `sensitive: true` (default `false`) marks the content as excluded from
+  Windows clipboard history, cloud clipboard and clipboard monitors
+  (`ExcludeClipboardContentFromMonitorProcessing`,
+  `CanIncludeInClipboardHistory` = 0, `CanUploadToCloudClipboard` = 0). Use it
+  for passwords (e.g. macOS `org.nspasteboard.ConcealedType`). The host will
+  then report it as `excluded` to `get_clipboard` too.
+* The same 10 MiB budget applies: text bytes + HTML bytes + base64 image
+  characters. Larger requests get `invalid_request`; messages over 16 MiB
+  close the socket with `1009`.
+* Reply on success: `{ "type": "clipboard_set", "id": 9, "sequence": 962 }`.
+  The host does **not** send `clipboard_changed` for its own write, so
+  clients do not loop; `sequence` is the new clipboard sequence number.
+* Errors: `invalid_request` (missing/ill-typed fields, invalid base64 or PNG,
+  too large) and `clipboard_unavailable` (clipboard held by another
+  application for more than about 100 ms, or the write failed; nothing is
+  changed). Replies may arrive after later replies; match them by `id`.
+
+Files (`CF_HDROP`), RTF and other formats are not exposed or accepted.
+
+### 5.12 Windows (host → client)
+
+Session-level (no `stream_id`): the host always reports every top-level window
+on its desktop, so a client can decide which ones to present, for example by
+starting a `window` stream (§5.3) for each new Teams window. These are
+unsolicited events with no `id` and no reply.
+
+```json
+{ "type": "window_opened",  "window": { …window object… } }
+{ "type": "window_changed", "window": { …window object… } }
+{ "type": "window_closed",  "window": { …window object… } }
+```
+
+Window object:
+
+```json
+{
+  "hwnd": "0x2A0C14",
+  "pid": 4242,
+  "image_name": "ms-teams.exe",
+  "title": "Meeting with Alex | Microsoft Teams",
+  "role": "main",
+  "owner": "0x4EA0C14",
+  "rect": { "x": 807, "y": 150, "width": 1280, "height": 720 },
+  "state": "normal"
+}
+```
+
+| Field        | Meaning |
+|--------------|---------|
+| `hwnd`       | Opaque window handle string; usable as `start_stream` `source.hwnd` |
+| `pid`        | Owning process |
+| `image_name` | Executable file name of the process; empty if it cannot be queried (e.g. some elevated or protected processes) |
+| `title`      | Window text (UTF-8); may be empty |
+| `role`       | `"main"`: has a taskbar button (unowned and activatable, or `WS_EX_APPWINDOW`), e.g. a main window, pop-out chat or meeting window. `"owned"`: owned activatable window such as a dialog. `"popup"`: menu, tooltip, flyout or other non-activatable / frameless transient window. `"tool"`: captioned tool window (palette). Advisory only |
+| `owner`      | Owner window handle; omitted for unowned windows |
+| `rect`       | Visible frame bounds (DWM extended frame bounds, without invisible resize borders and shadows) in **virtual-screen physical pixels**; the primary monitor's top-left is `0,0`, coordinates may be negative. For minimized windows: the last rectangle seen while not minimized (or the restore position) |
+| `state`      | `"normal"`, `"minimized"` or `"maximized"` |
+
+Rules:
+
+* A window is reported while it is top-level, visible, not cloaked by DWM
+  (e.g. on another virtual desktop) and has a non-empty rectangle. Hiding or
+  cloaking reports `window_closed`; showing it again reports `window_opened`
+  with the same `hwnd`. The host's own windows are not reported.
+* Right after `authenticated`, the host sends `window_opened` for every
+  current window, then live changes.
+* `window_changed` carries the complete new object and is sent when any
+  field differs. `window_closed` carries the last known object.
+* Each batch is ordered: `window_closed`, then `window_opened`, then
+  `window_changed`. A handle reused by another process is reported as closed,
+  then opened.
+* Changes are coalesced: a snapshot is taken about 2 ms after the first
+  notification and at most once per 16 ms (about 60 Hz during a drag), plus
+  every 250 ms to catch changes Windows does not announce. Intermediate states
+  can be skipped.
+* Closing a streamed window reports `window_closed` and stops the stream
+  (`source_closed`); the order between the two is not guaranteed.
+
+`rect` is for placement, not the video size; use the stream's `video`
+dimensions (§5.5) for the picture. Absolute mouse coordinates (§5.9) remain
+relative to each stream's video.
+
+Limitations (informative): the host uses out-of-context `SetWinEventHook`
+notifications plus `EnumWindows` snapshots and must run in the interactive
+user session. Z-order, focus and icons are not reported. Opening a stream
+for a short-lived `popup` costs capture and encoder startup time.
 
 ## 6. Stream sockets
 
@@ -618,9 +812,6 @@ if unsupported, restart the stream with `"codec": "h265"`.
 
 These are not implemented in version 1; the names are reserved:
 
-* `window_opened` / `window_closed` events so clients can open streams for
-  secondary windows (e.g. Teams pop-outs and meeting windows) automatically,
-  plus window geometry/z-order metadata for remote composition.
-* Touch and pen input, clipboard transfer.
+* Touch and pen input, clipboard file transfer.
 * Audio: `message_type` `2` on a dedicated audio stream socket.
 * Bitrate/frame-rate changes on a running stream.

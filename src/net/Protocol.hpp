@@ -11,7 +11,11 @@ inline constexpr int version = 1;
 inline constexpr std::uint32_t pbkdf2_iterations = 600'000;
 inline constexpr std::size_t nonce_bytes = 32;
 inline constexpr std::size_t max_signaling_message = 64 * 1024;
+// After authentication, so that set_clipboard can carry max_clipboard_bytes of (JSON-escaped) content.
+inline constexpr std::size_t max_authenticated_signaling_message = 16ULL * 1024 * 1024;
 inline constexpr std::size_t max_streams_per_session = 8;
+// Text/HTML bytes plus base64 PNG bytes in one `clipboard` reply (PROTOCOL.md §5.11).
+inline constexpr std::size_t max_clipboard_bytes = 10ULL * 1024 * 1024;
 // Largest wheel movement accepted in one mouse_wheel message (120 units = one notch).
 inline constexpr std::int64_t max_wheel_units = 120 * 100;
 inline constexpr std::chrono::seconds auth_timeout{10};

@@ -15,6 +15,10 @@ using Sha256 = std::array<std::byte, 32>;
 
 [[nodiscard]] std::vector<std::byte> random_bytes(std::size_t count);
 [[nodiscard]] std::string base64url_encode(std::span<const std::byte> bytes);
+// RFC 4648 section 4 base64 with padding (browser atob/data: URL compatible).
+[[nodiscard]] std::string base64_encode(std::span<const std::byte> bytes);
+// Strict RFC 4648 section 4 decoding; padding is optional, whitespace is rejected.
+[[nodiscard]] std::optional<std::vector<std::byte>> base64_decode(std::string_view text);
 [[nodiscard]] std::optional<std::vector<std::byte>> base64url_decode(std::string_view text);
 [[nodiscard]] Sha256 pbkdf2_sha256(std::string_view password, std::span<const std::byte> salt,
                                    std::uint32_t iterations);

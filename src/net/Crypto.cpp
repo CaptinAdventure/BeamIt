@@ -5,6 +5,7 @@
 
 #include <spdlog/fmt/fmt.h>
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 
@@ -49,6 +50,41 @@ std::string base64url_encode(std::span<const std::byte> bytes) {
     }
     if (bits > 0) text.push_back(alphabet[(buffer << (6 - bits)) & 0x3F]);
     return text;
+}
+
+std::string base64_encode(std::span<const std::byte> bytes) {
+    constexpr std::string_view standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string text;
+    text.reserve((bytes.size() + 2) / 3 * 4);
+    std::size_t index = 0;
+    for (; index + 3 <= bytes.size(); index += 3) {
+        const auto value = (std::to_integer<std::uint32_t>(bytes[index]) << 16) |
+                           (std::to_integer<std::uint32_t>(bytes[index + 1]) << 8) |
+                           std::to_integer<std::uint32_t>(bytes[index + 2]);
+        for (const int shift : {18, 12, 6, 0}) text.push_back(standard[(value >> shift) & 0x3F]);
+    }
+    if (const auto remaining = bytes.size() - index; remaining > 0) {
+        auto value = std::to_integer<std::uint32_t>(bytes[index]) << 16;
+        if (remaining == 2) value |= std::to_integer<std::uint32_t>(bytes[index + 1]) << 8;
+        text.push_back(standard[(value >> 18) & 0x3F]);
+        text.push_back(standard[(value >> 12) & 0x3F]);
+        text.push_back(remaining == 2 ? standard[(value >> 6) & 0x3F] : '=');
+        text.push_back('=');
+    }
+    return text;
+}
+
+std::optional<std::vector<std::byte>> base64_decode(std::string_view text) {
+    if (text.size() % 4 == 0 && text.ends_with("==")) {
+        text.remove_suffix(2);
+    } else if (text.size() % 4 == 0 && text.ends_with('=')) {
+        text.remove_suffix(1);
+    }
+    if (text.find('-') != std::string_view::npos || text.find('_') != std::string_view::npos) return std::nullopt;
+    std::string url(text);
+    std::ranges::replace(url, '+', '-');
+    std::ranges::replace(url, '/', '_');
+    return base64url_decode(url);
 }
 
 std::optional<std::vector<std::byte>> base64url_decode(std::string_view text) {
