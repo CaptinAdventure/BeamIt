@@ -191,7 +191,7 @@ The wire protocol is specified in [`PROTOCOL.md`](PROTOCOL.md); clients are writ
 - Each binary message is a 32-byte big-endian header (version, type, flags, generation, sequence, capture time) followed by one Annex B access unit. At most two frames are queued per stream socket; on overflow the queue is flushed, frames are skipped until a requested IDR, and the next frame carries the discontinuity flag. The host never sends a P-picture whose references were dropped.
 - Keyboard and mouse input are JSON messages on the signaling socket, each naming its `stream_id` (§5.9 of the protocol); see *Remote input* below.
 - Taskbar attention requests (window flashing) are reported as `attention` `set`/`clear` events (§5.10); see *Taskbar attention* below.
-- Every top-level window is reported with `window_opened`/`window_changed`/`window_closed` (pid, image name, title, role, owner, rect, state; §5.12); see *Window events* below.
+- Every top-level window is reported with `window_opened`/`window_changed`/`window_closed` (pid, image name, title, role, owner, rect, state; §5.12); see *Window events* below. `get_window_icon` returns a window's icon as a base64 PNG of at most 256×256 (§5.13); see *Window icons* below.
 - The host clipboard can be read (`get_clipboard`) and written (`set_clipboard`) as text, HTML and PNG, and changes are announced with `clipboard_changed` (§5.11); see *Clipboard* below.
 
 **Security.** TLS comes from Windows Schannel via [boost-wintls](https://github.com/laudrup/boost-wintls) (header-only, pinned SHA-256). Without `--tls-cert`/`--tls-key`, BeamIt creates (and reuses) a self-signed RSA-2048 certificate `CN=BeamIt host` in `CurrentUser\My`, valid for two years and regenerated when near expiry; its SHA-256 fingerprint is logged at startup. Browsers must accept it once by opening `https://host:port/`; native clients should pin the fingerprint, because password authentication is not bound to the TLS channel and an unpinned, accepted certificate allows an active relay. `--tls-key` must be an unencrypted RSA PKCS#8 PEM (`BEGIN PRIVATE KEY`).
@@ -235,9 +235,19 @@ The host always reports every top-level window to the authenticated session: `wi
 
 Decisions: events are session-level and unfiltered so that application grouping and presentation policy stay in the client (an earlier per-stream, per-application-family design with z-order and an opt-out flag was judged too complex). `role` follows the taskbar rule (unowned activatable or `WS_EX_APPWINDOW` → `main`) and is advisory. Geometry uses DWM extended frame bounds, expected to match what WGC captures, rather than `GetWindowRect` (includes invisible resize borders). Rejected alternatives: polling only (latency and CPU), hooks only (Windows does not announce every change), and delta updates (clients would need merge logic).
 
-Limitations: z-order, focus and icons are not reported; `role` is a heuristic for applications that draw custom frames; cloaked windows (other virtual desktops) are reported as closed; the host must run in the interactive session.
+Limitations: z-order and focus are not reported (icons are requested separately, see below); `role` is a heuristic for applications that draw custom frames; cloaked windows (other virtual desktops) are reported as closed; the host must run in the interactive session.
 
 Verified live with a PowerShell/WinForms application: about 15 existing windows reported after authentication; `window_opened` for the new main window and its owned dialog (`role` `owned`, `owner` set); `window_changed` for the moved and renamed dialog and for minimizing the main window (Windows hides the owned dialog, which is then reported closed); `window_closed` on close. `[windows]` Catch2 tests cover role classification, the snapshot diff and handle reuse.
+
+### Window icons
+
+`get_window_icon` (`hwnd`, optional `size` 16–256, default 256) replies with `window_icon`: a standard-base64 32-bit PNG with straight alpha, at most `size`×`size`, plus `width`, `height` and `source` (PROTOCOL.md §5.13). `src/host/WindowIcon.cpp` uses the window's own icon (`WM_GETICON` via `SendMessageTimeout` with a 200 ms hung-window limit, then the class icon) when it is at least `size` pixels wide. Otherwise it extracts the process executable's first icon at `size` with `SHDefExtractIconW`, and falls back to the smaller window icon. WIC converts the `HICON` (`CreateBitmapFromHICON`, which applies masks for icons without alpha), scales it down with high-quality cubic interpolation if needed and encodes the PNG. Extraction runs on a dedicated one-thread pool so hung windows and disk reads never stall the network thread.
+
+Decisions: on request rather than in every window event, because icons are large and rarely change; the executable icon is preferred when the window's icon is small, because `WM_GETICON` usually yields only 32 px images while executables typically carry 256 px images. Rejected alternatives: `IShellItemImageFactory` (returns an `HBITMAP` whose alpha handling varies), sending icons inside `window_opened` (bulk at login), and upscaling small icons on the host (clients can scale).
+
+Limitations: per-window icons smaller than `size` are replaced by the application icon; windows hosted by another process (e.g. `ApplicationFrameHost.exe`) may show the host process icon; taskbar overlay badges are not included; icon changes are not announced.
+
+Verified live: 256×256 icons with transparency for Teams, CLion, Slack, Outlook, Edge, VS Code, Explorer, Task Manager and Windows Terminal (`source` `executable`); `size` 32 returned the 32×32 window icon (`source` `window`); an unknown handle gave `not_found`, a malformed handle and out-of-range sizes gave `invalid_request`. `[icons]` Catch2 tests cover conversion, downscaling and window-icon preference.
 
 ### Clipboard
 
@@ -338,6 +348,7 @@ The previous 13.1 headers exceeded the development driver's maximum API 13.0. Wi
 - `src/host/AttentionMonitor.hpp/.cpp` — shell-hook taskbar attention (flash) tracking
 - `src/host/Clipboard.hpp/.cpp` — clipboard change listener and text/HTML/PNG reader/writer
 - `src/host/WindowTracker.hpp/.cpp` — top-level window tracking (WinEvent hooks, snapshots, diffs)
+- `src/host/WindowIcon.hpp/.cpp` — window/executable icon extraction and PNG conversion
 - `src/host/TlsIdentity.hpp/.cpp` — PEM certificate loading and persistent self-signed certificate
 - `src/net/Crypto.hpp/.cpp` — CNG random, base64url, PBKDF2, HMAC and authentication proofs
 - `src/net/Protocol.hpp` — protocol constants and binary frame header
@@ -346,6 +357,7 @@ The previous 13.1 headers exceeded the development driver's maximum API 13.0. Wi
 - `tests/InputTests.cpp` — input mapping and validation unit tests
 - `tests/AttentionTests.cpp` — taskbar attention tracker unit tests
 - `tests/WindowTrackerTests.cpp` — window role and window-list unit tests
+- `tests/WindowIconTests.cpp` — icon PNG conversion and source-selection tests
 - `scripts/Start-BeamItServer.ps1` — creates per-instance password/certificate files and starts the WSS host
 - `src/ApplicationWindows.hpp` and `src/ApplicationWindows.cpp` — window listing and PID selection heuristic (`list_windows`, `application` sources)
 - `src/media/CodecHeaders.hpp` and `src/media/CodecHeaders.cpp` — encoder-specific Annex B parameter-set generation

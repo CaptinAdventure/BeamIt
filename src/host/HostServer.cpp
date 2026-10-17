@@ -14,6 +14,7 @@
 #include "host/Clipboard.hpp"
 #include "host/InputInjector.hpp"
 #include "host/StreamPipeline.hpp"
+#include "host/WindowIcon.hpp"
 #include "host/WindowTracker.hpp"
 #include "media/BitstreamInfo.hpp"
 #include "net/Protocol.hpp"
@@ -247,6 +248,9 @@ struct Server {
     explicit Server(HostServerOptions host_options) : options(std::move(host_options)) {}
 
     asio::io_context io{1};
+    // Icon extraction can block on hung windows and disk; it runs here, never on the network thread. Declared after
+    // `io` so that it is joined before the io_context it posts replies to is destroyed.
+    asio::thread_pool icon_worker{1};
     wintls::context tls{wintls::method::system_default};
     HostServerOptions options;
     std::weak_ptr<ControlSession> active;
@@ -428,6 +432,8 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
                 send(std::move(pong));
             } else if (type == "list_windows") {
                 list_windows(id);
+            } else if (type == "get_window_icon") {
+                get_window_icon(message, id);
             } else if (type == "get_clipboard") {
                 get_clipboard(message, id);
             } else if (type == "set_clipboard") {
@@ -755,6 +761,41 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
             if (formats & value) list.emplace_back(name);
         }
         return list;
+    }
+
+    void get_window_icon(const json::object& message, const std::optional<json::value>& id) {
+        const auto* hwnd_field = message.if_contains("hwnd");
+        const auto window = hwnd_field && hwnd_field->is_string() ? parse_hwnd(hwnd_field->as_string()) : std::nullopt;
+        if (!window) throw ProtocolError{"invalid_request", "hwnd must be a window handle string"};
+        std::uint32_t size = max_window_icon_size;
+        if (const auto* field = message.if_contains("size")) {
+            if (!field->is_int64() || field->as_int64() < 16 || field->as_int64() > max_window_icon_size) {
+                throw ProtocolError{"invalid_request", "size must be an integer from 16 to 256"};
+            }
+            size = static_cast<std::uint32_t>(field->as_int64());
+        }
+        if (!IsWindow(*window) || GetAncestor(*window, GA_ROOT) != *window) {
+            throw ProtocolError{"not_found", "hwnd is not an existing top-level window"};
+        }
+        asio::post(server.icon_worker, [executor = ws->get_executor(), weak_self = weak_from_this(), id,
+                                        window = *window, size] {
+            const auto icon = window_icon(window, size);
+            json::object reply;
+            if (icon) {
+                reply = {{"type", "window_icon"}, {"hwnd", hwnd_text(window)}, {"source", icon->source},
+                         {"mime_type", "image/png"}, {"width", icon->width}, {"height", icon->height},
+                         {"data", beamit::net::base64_encode(icon->png)}};
+            } else {
+                reply = {{"type", "error"},
+                         {"code", IsWindow(window) ? "icon_unavailable" : "not_found"},
+                         {"message", IsWindow(window) ? "the window and its executable have no usable icon"
+                                                      : "the window was closed"}};
+            }
+            if (id) reply["id"] = *id;
+            asio::post(executor, [weak_self, message = json::serialize(reply)]() mutable {
+                if (auto self = weak_self.lock()) self->send_serialized(std::move(message));
+            });
+        });
     }
 
     void get_clipboard(const json::object& message, const std::optional<json::value>& id) {

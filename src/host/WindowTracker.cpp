@@ -46,7 +46,7 @@ std::string_view window_show_state_name(WindowShowState state) {
     return "normal";
 }
 
-std::string process_image_name(DWORD pid) {
+std::wstring process_image_path(DWORD pid) {
     const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!process) return {};
     std::wstring path(32768, L'\0');
@@ -55,6 +55,12 @@ std::string process_image_name(DWORD pid) {
     CloseHandle(process);
     if (!queried) return {};
     path.resize(size);
+    return path;
+}
+
+std::string process_image_name(DWORD pid) {
+    const auto path = process_image_path(pid);
+    if (path.empty()) return {};
     return to_utf8(std::wstring_view(path).substr(path.find_last_of(L"\\/") + 1));
 }
 

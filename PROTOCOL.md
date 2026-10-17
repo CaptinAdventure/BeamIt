@@ -104,6 +104,7 @@ produce an `error` with code `unknown_type` but do not close the socket.
 | `focus_failed`       | Target window could not be brought to the foreground (§5.9)     | no            |
 | `input_failed`       | The OS rejected injected input (§5.9)                           | no            |
 | `clipboard_unavailable` | The host clipboard could not be opened, read or written (§5.11) | no         |
+| `icon_unavailable`   | Neither the window nor its executable has a usable icon (§5.13) | no            |
 | `internal_error`     | Unexpected host failure                                         | no            |
 
 ## 4. Handshake and authentication
@@ -739,8 +740,56 @@ relative to each stream's video.
 
 Limitations (informative): the host uses out-of-context `SetWinEventHook`
 notifications plus `EnumWindows` snapshots and must run in the interactive
-user session. Z-order, focus and icons are not reported. Opening a stream
-for a short-lived `popup` costs capture and encoder startup time.
+user session. Z-order and focus are not reported; icons are fetched on
+request (§5.13). Opening a stream for a short-lived `popup` costs capture and
+encoder startup time.
+
+### 5.13 `get_window_icon` / `window_icon`
+
+Fetches a window's icon as a PNG, e.g. for a Dock tile or window switcher.
+
+```json
+{ "type": "get_window_icon", "id": 12, "hwnd": "0x2A0C14", "size": 256 }
+```
+
+| Field  | Meaning |
+|--------|---------|
+| `hwnd` | Required top-level window handle string (as in §5.12) |
+| `size` | Optional maximum width and height in pixels, integer 16–256; default 256 |
+
+Reply:
+
+```json
+{
+  "type": "window_icon",
+  "id": 12,
+  "hwnd": "0x2A0C14",
+  "source": "executable",
+  "mime_type": "image/png",
+  "width": 256,
+  "height": 256,
+  "data": "standard base64 PNG"
+}
+```
+
+* `data` is a 32-bit PNG with straight (non-premultiplied) alpha, at most
+  `size` × `size` (never larger than 256 × 256). `width`/`height` match the
+  PNG and may be smaller than `size` when only a smaller icon exists; icons
+  are scaled down, never up. Clients scale for display themselves.
+* `source` is `"window"` when the window's own icon (`WM_GETICON`, then the
+  class icon) is at least `size` pixels wide, otherwise `"executable"` (the
+  first icon of the process image, extracted at `size`), falling back to a
+  smaller window icon when the executable has none. Per-window icons smaller
+  than `size` are therefore replaced by the sharper application icon.
+* Errors: `invalid_request` (bad `hwnd` or `size`), `not_found` (not an
+  existing top-level window, or it closed meanwhile), `icon_unavailable`.
+* The icon is read on a worker thread; replies to other requests may arrive
+  first. A hung window delays its reply by at most about 200 ms per query.
+  Icon changes are not announced; request again when needed.
+
+Limitations (informative): windows hosted by another process (e.g. some
+packaged apps shown by `ApplicationFrameHost.exe`) may report the host
+process's icon. Taskbar overlay badges are not included.
 
 ## 6. Stream sockets
 

@@ -46,6 +46,8 @@ struct WindowState {
 [[nodiscard]] WindowRole classify_window(DWORD style, DWORD ex_style, bool owned, std::wstring_view class_name);
 [[nodiscard]] std::string_view window_role_name(WindowRole role);
 [[nodiscard]] std::string_view window_show_state_name(WindowShowState state);
+// Full executable path of a process; empty on failure.
+[[nodiscard]] std::wstring process_image_path(DWORD pid);
 // Executable file name of a process, e.g. "ms-teams.exe" (UTF-8); empty on failure.
 [[nodiscard]] std::string process_image_name(DWORD pid);
 
