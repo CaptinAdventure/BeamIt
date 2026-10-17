@@ -47,17 +47,17 @@ TEST_CASE("NVENC validates configuration without loading a driver", "[encoder][n
 TEST_CASE("Bitrate updates before the first picture only change the options", "[encoder][nvenc]") {
     EncoderOptions options{64, 64, 60, 12000, VideoCodec::H264};
     NvencVideoEncoder nvenc;
-    REQUIRE_FALSE(nvenc.try_update_bitrate(24000));
+    REQUIRE_FALSE(nvenc.try_update_bitrate(24000, 0));
     REQUIRE(nvenc.configure(options));
-    REQUIRE_FALSE(nvenc.try_update_bitrate(0));
-    REQUIRE_FALSE(nvenc.try_update_bitrate(std::numeric_limits<std::uint32_t>::max()));
-    REQUIRE(nvenc.try_update_bitrate(24000));
+    REQUIRE_FALSE(nvenc.try_update_bitrate(0, 0));
+    REQUIRE_FALSE(nvenc.try_update_bitrate(std::numeric_limits<std::uint32_t>::max(), 0));
+    REQUIRE(nvenc.try_update_bitrate(24000, 0));
     REQUIRE(nvenc.last_error() == S_OK);
 
     AutoVideoEncoder automatic;
-    REQUIRE_FALSE(automatic.try_update_bitrate(24000));
+    REQUIRE_FALSE(automatic.try_update_bitrate(24000, 0));
     REQUIRE(automatic.configure(options));
-    REQUIRE(automatic.try_update_bitrate(24000));
+    REQUIRE(automatic.try_update_bitrate(24000, 0));
     REQUIRE(automatic.last_error() == S_OK);
 }
 

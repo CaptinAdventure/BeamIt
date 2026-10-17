@@ -55,6 +55,7 @@ void ControlSession::send_stream_stats() {
             {"height", stream->video.height},
             {"frame_rate", stream->video.frame_rate},
             {"bitrate_kbps", stream->video.bitrate_kbps},
+            {"max_bitrate_kbps", stream->video.max_bitrate_kbps},
             {"interval_ms", milliseconds(pipeline.elapsed)},
             {"frames_captured", pipeline.frames_captured},
             {"frames_encoded", pipeline.frames_encoded},

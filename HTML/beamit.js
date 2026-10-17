@@ -179,6 +179,13 @@ function validateVideo(video) {
     }
     result.bitrate_kbps = video.bitrate_kbps;
   }
+  if (video.max_bitrate_kbps !== undefined) {
+    if (!Number.isInteger(video.max_bitrate_kbps) || video.max_bitrate_kbps < 0 ||
+        video.max_bitrate_kbps > 4_000_000) {
+      throw new TypeError("video.max_bitrate_kbps must be an integer from 0 to 4000000");
+    }
+    result.max_bitrate_kbps = video.max_bitrate_kbps;
+  }
   return result;
 }
 

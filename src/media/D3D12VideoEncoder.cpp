@@ -101,6 +101,54 @@ void wait_for_fence(ID3D12Fence* fence, UINT64 value) noexcept {
 
 } // namespace
 
+// D3D12 rate-control description; it points into itself, so build it in place and never copy it.
+struct RateControlParams {
+    D3D12_VIDEO_ENCODER_RATE_CONTROL_CBR cbr{};
+    D3D12_VIDEO_ENCODER_RATE_CONTROL_VBR vbr{};
+    D3D12_VIDEO_ENCODER_RATE_CONTROL desc{};
+
+    RateControlParams(const EncoderOptions& options, D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE mode,
+                      D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAGS flags) {
+        const auto target = static_cast<UINT64>(options.target_bitrate_kbps) * 1000;
+        // One frame at the average target: a scene change cannot queue more than about one frame time of data.
+        const bool vbv = (flags & D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_ENABLE_VBV_SIZES) != 0;
+        const UINT64 vbv_bits = vbv ? std::max<UINT64>(1, target / options.frame_rate) : 0;
+        desc.Mode = mode;
+        desc.Flags = flags;
+        desc.TargetFrameRate = DXGI_RATIONAL{options.frame_rate, 1};
+        if (mode == D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_VBR) {
+            vbr = {.InitialQP = 0, .MinQP = 0, .MaxQP = 51, .MaxFrameBitSize = 0, .TargetAvgBitRate = target,
+                   .PeakBitRate = static_cast<UINT64>(peak_bitrate_kbps(options)) * 1000,
+                   .VBVCapacity = vbv_bits, .InitialVBVFullness = vbv_bits};
+            desc.ConfigParams.DataSize = sizeof(vbr);
+            desc.ConfigParams.pConfiguration_VBR = &vbr;
+        } else {
+            cbr = {.InitialQP = 0, .MinQP = 0, .MaxQP = 51, .MaxFrameBitSize = 0, .TargetBitRate = target,
+                   .VBVCapacity = vbv_bits, .InitialVBVFullness = vbv_bits};
+            desc.ConfigParams.DataSize = sizeof(cbr);
+            desc.ConfigParams.pConfiguration_CBR = &cbr;
+        }
+    }
+    RateControlParams(const RateControlParams&) = delete;
+    RateControlParams& operator=(const RateControlParams&) = delete;
+};
+
+struct RateControlCandidate {
+    D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE mode;
+    D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAGS flags;
+    const char* name;
+};
+
+// Preferred first. Without configurable VBV sizes the driver chooses the buffer, which may hold several frames.
+constexpr RateControlCandidate rate_control_candidates[]{
+    {D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_VBR, D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_ENABLE_VBV_SIZES,
+     "VBR, one-frame VBV"},
+    {D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_VBR, D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_NONE, "VBR, driver VBV"},
+    {D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CBR, D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_ENABLE_VBV_SIZES,
+     "CBR, one-frame VBV"},
+    {D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CBR, D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_NONE, "CBR, driver VBV"},
+};
+
 struct D3D12VideoEncoder::Impl {
     EncoderOptions options{};
     detail::EncodeFormat format{detail::default_encode_format};
@@ -117,6 +165,7 @@ struct D3D12VideoEncoder::Impl {
     // The driver accepts rate-control changes within a sequence; the next EncodeFrame carries the change.
     bool rate_control_reconfigurable{false};
     bool rate_control_changed{false};
+    const RateControlCandidate* rate_control{&rate_control_candidates[0]};
     std::uint64_t frame_number{0};
     std::uint64_t shared_fence_value{0};
     std::uint64_t encode_fence_value{0};
@@ -331,14 +380,26 @@ void D3D12VideoEncoder::request_key_frame() noexcept {
     impl_->key_frame_requested = true;
 }
 
-bool D3D12VideoEncoder::try_update_bitrate(std::uint32_t bitrate_kbps) {
+bool D3D12VideoEncoder::try_update_bitrate(std::uint32_t bitrate_kbps, std::uint32_t max_bitrate_kbps) {
     if (!impl_->configured || FAILED(impl_->error) || !bitrate_kbps) return false;
     if (impl_->initialized && !impl_->rate_control_reconfigurable) return false;
     // Before deferred initialization the encoder is simply created with the new bitrate; the parameter sets carry no
     // HRD bitrate, so they stay valid either way.
-    if (impl_->initialized && impl_->options.target_bitrate_kbps != bitrate_kbps) impl_->rate_control_changed = true;
-    impl_->options.target_bitrate_kbps = bitrate_kbps;
+    auto updated = impl_->options;
+    updated.target_bitrate_kbps = bitrate_kbps;
+    updated.max_bitrate_kbps = max_bitrate_kbps;
+    if (impl_->initialized && (impl_->options.target_bitrate_kbps != bitrate_kbps ||
+                               peak_bitrate_kbps(impl_->options) != peak_bitrate_kbps(updated))) {
+        impl_->rate_control_changed = true;
+    }
+    impl_->options = updated;
     return true;
+}
+
+RateControlMode D3D12VideoEncoder::rate_control() const noexcept {
+    return impl_->rate_control && impl_->rate_control->mode == D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CBR
+               ? RateControlMode::Cbr
+               : RateControlMode::Vbr;
 }
 
 std::optional<EncodedPacket> D3D12VideoEncoder::try_receive() {
@@ -465,9 +526,10 @@ HRESULT D3D12VideoEncoder::Impl::initialize(ID3D11Texture2D* capture_texture) {
         }
         if (SUCCEEDED(result)) {
             running = true;
-            spdlog::info("Encoder sampling: {} {}-bit {} ({})",
+            spdlog::info("Encoder sampling: {} {}-bit {} ({}); rate control {}, {} kbps target, {} kbps peak",
                          format.sampling, format.bit_depth, format.name,
-                         options.codec == VideoCodec::H264 ? "H.264" : "HEVC");
+                         options.codec == VideoCodec::H264 ? "H.264" : "HEVC", rate_control->name,
+                         options.target_bitrate_kbps, peak_bitrate_kbps(options));
             return S_OK;
         }
         spdlog::warn("Encoder candidate {} {}-bit {} failed at {} (HRESULT 0x{:08X})",
@@ -698,20 +760,6 @@ HRESULT D3D12VideoEncoder::Impl::initialize_format(ID3D11Texture2D* capture_text
         gop.pHEVCGroupOfPictures = &hevc_gop;
     }
 
-    D3D12_VIDEO_ENCODER_RATE_CONTROL_CBR cbr{
-        .InitialQP = 0,
-        .MinQP = 0,
-        .MaxQP = 51,
-        .MaxFrameBitSize = 0,
-        .TargetBitRate = static_cast<UINT64>(options.target_bitrate_kbps) * 1000,
-        .VBVCapacity = 0,
-        .InitialVBVFullness = 0,
-    };
-    D3D12_VIDEO_ENCODER_RATE_CONTROL rate_control{};
-    rate_control.Mode = D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CBR;
-    rate_control.ConfigParams.DataSize = sizeof(cbr);
-    rate_control.ConfigParams.pConfiguration_CBR = &cbr;
-    rate_control.TargetFrameRate = DXGI_RATIONAL{options.frame_rate, 1};
 
     const D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC resolution{
         options.width,
@@ -732,7 +780,7 @@ HRESULT D3D12VideoEncoder::Impl::initialize_format(ID3D11Texture2D* capture_text
         .InputFormat = format.texture,
         .CodecConfiguration = codec_config,
         .CodecGopSequence = gop,
-        .RateControl = rate_control,
+        .RateControl = {},
         .IntraRefresh = D3D12_VIDEO_ENCODER_INTRA_REFRESH_MODE_NONE,
         .SubregionFrameEncoding = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME,
         .ResolutionsListCount = 1,
@@ -743,16 +791,29 @@ HRESULT D3D12VideoEncoder::Impl::initialize_format(ID3D11Texture2D* capture_text
         .pResolutionDependentSupport = &resolution_support,
     };
     initialization_stage = "I/P encode configuration support";
-    result = video_device->CheckFeatureSupport(
-        D3D12_FEATURE_VIDEO_ENCODER_SUPPORT,
-        &support,
-        sizeof(support));
-    if (FAILED(result)) {
-        return result;
+    rate_control = nullptr;
+    for (const auto& candidate : rate_control_candidates) {
+        const RateControlParams params(options, candidate.mode, candidate.flags);
+        support.RateControl = params.desc;
+        result = video_device->CheckFeatureSupport(
+            D3D12_FEATURE_VIDEO_ENCODER_SUPPORT,
+            &support,
+            sizeof(support));
+        if (FAILED(result)) {
+            return result;
+        }
+        const bool vbv_ok = (candidate.flags & D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_ENABLE_VBV_SIZES) == 0 ||
+                            (support.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_RATE_CONTROL_VBV_SIZE_CONFIG_AVAILABLE);
+        if (support.ValidationFlags == D3D12_VIDEO_ENCODER_VALIDATION_FLAG_NONE && vbv_ok &&
+            (support.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_GENERAL_SUPPORT_OK) != 0 &&
+            suggested_h264_profile == h264_profile && suggested_hevc_profile == hevc_profile) {
+            rate_control = &candidate;
+            break;
+        }
+        spdlog::info("D3D12 rate control {} rejected (validation 0x{:X}, support 0x{:X})", candidate.name,
+                     static_cast<unsigned>(support.ValidationFlags), static_cast<unsigned>(support.SupportFlags));
     }
-    if (support.ValidationFlags != D3D12_VIDEO_ENCODER_VALIDATION_FLAG_NONE ||
-        (support.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_GENERAL_SUPPORT_OK) == 0 ||
-        suggested_h264_profile != h264_profile || suggested_hevc_profile != hevc_profile) {
+    if (!rate_control) {
         return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     }
     rate_control_reconfigurable =
@@ -1263,19 +1324,8 @@ HRESULT D3D12VideoEncoder::Impl::encode() {
     picture_control.PictureControlCodecData = picture_data;
 
     D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_DESC sequence{};
-    sequence.RateControl.Mode = D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CBR;
-    sequence.RateControl.ConfigParams.DataSize = sizeof(D3D12_VIDEO_ENCODER_RATE_CONTROL_CBR);
-    D3D12_VIDEO_ENCODER_RATE_CONTROL_CBR cbr{
-        .InitialQP = 0,
-        .MinQP = 0,
-        .MaxQP = 51,
-        .MaxFrameBitSize = 0,
-        .TargetBitRate = static_cast<UINT64>(options.target_bitrate_kbps) * 1000,
-        .VBVCapacity = 0,
-        .InitialVBVFullness = 0,
-    };
-    sequence.RateControl.ConfigParams.pConfiguration_CBR = &cbr;
-    sequence.RateControl.TargetFrameRate = DXGI_RATIONAL{options.frame_rate, 1};
+    const RateControlParams rate_params(options, rate_control->mode, rate_control->flags);
+    sequence.RateControl = rate_params.desc;
     sequence.PictureTargetResolution = {options.width, options.height};
     sequence.SelectedLayoutMode = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME;
     if (std::exchange(rate_control_changed, false)) {

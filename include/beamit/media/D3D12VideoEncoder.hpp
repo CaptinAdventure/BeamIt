@@ -20,7 +20,8 @@ public:
     EncoderSubmitResult try_submit(const CapturedFrame& frame) override;
     EncoderSubmitResult try_repeat_frame() override;
     void request_key_frame() noexcept override;
-    bool try_update_bitrate(std::uint32_t bitrate_kbps) override;
+    bool try_update_bitrate(std::uint32_t bitrate_kbps, std::uint32_t max_bitrate_kbps) override;
+    [[nodiscard]] RateControlMode rate_control() const noexcept override;
     [[nodiscard]] std::optional<EncodedPacket> try_receive() override;
     void stop() noexcept override;
     [[nodiscard]] bool is_running() const noexcept override;

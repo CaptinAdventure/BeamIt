@@ -42,6 +42,15 @@ TEST_CASE("QPC capture timestamps map onto steady_clock", "[capture]") {
     REQUIRE(qpc_100ns_to_steady(0) >= before);
 }
 
+TEST_CASE("VBR peak defaults to twice the target and never drops below it", "[encoder]") {
+    using beamit::media::peak_bitrate_kbps;
+    REQUIRE(peak_bitrate_kbps(12000, 0) == 24000);
+    REQUIRE(peak_bitrate_kbps(12000, 30000) == 30000);
+    REQUIRE(peak_bitrate_kbps(12000, 8000) == 12000);
+    REQUIRE(peak_bitrate_kbps(3'000'000, 0) == beamit::media::max_bitrate_limit_kbps);
+    REQUIRE(peak_bitrate_kbps(beamit::media::EncoderOptions{.target_bitrate_kbps = 5000}) == 10000);
+}
+
 TEST_CASE("duration statistics keep count, total and maximum", "[stats]") {
     using namespace std::chrono_literals;
     beamit::host::DurationStats stats;

@@ -2,6 +2,7 @@
 
 #include "beamit/media/VideoFrame.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -14,7 +15,31 @@ struct EncoderOptions {
     std::uint32_t frame_rate{0};
     std::uint32_t target_bitrate_kbps{0};
     VideoCodec codec{VideoCodec::H264};
+    // VBR peak; 0 selects default_peak_factor x target. Values below the target are raised to it.
+    std::uint32_t max_bitrate_kbps{0};
 };
+
+inline constexpr std::uint32_t default_peak_factor = 2;
+inline constexpr std::uint32_t max_bitrate_limit_kbps = 4'000'000;
+
+[[nodiscard]] constexpr std::uint32_t peak_bitrate_kbps(std::uint32_t target_kbps, std::uint32_t max_kbps) noexcept {
+    const auto peak = max_kbps ? std::uint64_t{max_kbps} : std::uint64_t{target_kbps} * default_peak_factor;
+    return static_cast<std::uint32_t>(std::max<std::uint64_t>(target_kbps, std::min<std::uint64_t>(peak, max_bitrate_limit_kbps)));
+}
+
+[[nodiscard]] constexpr std::uint32_t peak_bitrate_kbps(const EncoderOptions& options) noexcept {
+    return peak_bitrate_kbps(options.target_bitrate_kbps, options.max_bitrate_kbps);
+}
+
+// VBR: average target with a peak and a one-frame (at the target) VBV. CBR is used only when a driver lacks VBR.
+enum class RateControlMode {
+    Vbr,
+    Cbr,
+};
+
+[[nodiscard]] constexpr const char* rate_control_name(RateControlMode mode) noexcept {
+    return mode == RateControlMode::Cbr ? "cbr" : "vbr";
+}
 
 enum class EncoderSubmitResult {
     Accepted,
@@ -35,10 +60,12 @@ public:
     virtual EncoderSubmitResult try_repeat_frame() = 0;
     // Makes the next submitted picture an IDR with parameter sets; call from the encoding thread.
     virtual void request_key_frame() noexcept = 0;
-    // Changes the target bitrate of the current sequence in place: no new parameter sets, no IDR. Returns false,
-    // leaving the encoder usable, when the backend cannot; the caller then reconfigures. Call from the encoding
-    // thread after the previous picture was received.
-    virtual bool try_update_bitrate(std::uint32_t bitrate_kbps) = 0;
+    // Changes the target and peak (EncoderOptions::max_bitrate_kbps semantics) bitrates of the current sequence in
+    // place: no new parameter sets, no IDR. Returns false, leaving the encoder usable, when the backend cannot; the
+    // caller then reconfigures. Call from the encoding thread after the previous picture was received.
+    virtual bool try_update_bitrate(std::uint32_t bitrate_kbps, std::uint32_t max_bitrate_kbps) = 0;
+    // The rate control in use; meaningful once the first picture was accepted.
+    [[nodiscard]] virtual RateControlMode rate_control() const noexcept = 0;
     // Returns no value while output is pending; check last_error() to distinguish failures.
     [[nodiscard]] virtual std::optional<EncodedPacket> try_receive() = 0;
     virtual void stop() noexcept = 0;

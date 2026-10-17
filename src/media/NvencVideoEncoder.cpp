@@ -201,8 +201,8 @@ struct NvencVideoEncoder::Impl {
         config.gopLength = 60;
         config.frameIntervalP = 1;
         config.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
-        config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
-        set_bitrate(config, options.target_bitrate_kbps);
+        config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
+        set_bitrate(config, options.target_bitrate_kbps, options.max_bitrate_kbps);
         config.rcParams.enableLookahead = 0;
         config.rcParams.lookaheadDepth = 0;
         config.rcParams.enableTemporalAQ = 0;
@@ -262,24 +262,25 @@ struct NvencVideoEncoder::Impl {
         event.completionEvent = completion;
         if (!check(api.nvEncRegisterAsyncEvent(session, &event), "register completion event")) return false;
         event_registered = true;
-        spdlog::info("NVENC D3D11: H.264 High 4:4:4 Predictive, 8-bit 4:4:4; GPU BGRA input; "
-                     "CBR, GOP 60 I/P, no B-frames/lookahead, one-frame VBV");
+        spdlog::info("NVENC D3D11: H.264 High 4:4:4 Predictive, 8-bit 4:4:4; GPU BGRA input; VBR {} kbps target, "
+                     "{} kbps peak, one-frame VBV, GOP 60 I/P, no B-frames/lookahead", options.target_bitrate_kbps,
+                     peak_bitrate_kbps(options));
         return true;
     }
 
-    // CBR with a one-frame VBV.
-    void set_bitrate(NV_ENC_CONFIG& target, std::uint32_t kbps) const {
+    // VBR with a one-frame VBV at the average target, so a burst cannot queue much more than one frame time.
+    void set_bitrate(NV_ENC_CONFIG& target, std::uint32_t kbps, std::uint32_t max_kbps) const {
         target.rcParams.averageBitRate = kbps * 1000;
-        target.rcParams.maxBitRate = target.rcParams.averageBitRate;
+        target.rcParams.maxBitRate = peak_bitrate_kbps(kbps, max_kbps) * 1000;
         target.rcParams.vbvBufferSize = std::max(1u, target.rcParams.averageBitRate / options.frame_rate);
         target.rcParams.vbvInitialDelay = target.rcParams.vbvBufferSize;
     }
 
     // Applies a new rate-control target to the open session without an IDR or new SPS/PPS.
-    bool reconfigure_bitrate(std::uint32_t kbps) {
+    bool reconfigure_bitrate(std::uint32_t kbps, std::uint32_t max_kbps) {
         if (!api.nvEncReconfigureEncoder || pending) return false;
         auto updated = config;
-        set_bitrate(updated, kbps);
+        set_bitrate(updated, kbps, max_kbps);
         NV_ENC_RECONFIGURE_PARAMS reconfigure{};
         reconfigure.version = NV_ENC_RECONFIGURE_PARAMS_VER;
         reconfigure.reInitEncodeParams = init;
@@ -405,16 +406,19 @@ void NvencVideoEncoder::request_key_frame() noexcept {
     impl_->key_frame_requested = true;
 }
 
-bool NvencVideoEncoder::try_update_bitrate(std::uint32_t bitrate_kbps) {
+bool NvencVideoEncoder::try_update_bitrate(std::uint32_t bitrate_kbps, std::uint32_t max_bitrate_kbps) {
     if (!impl_->configured || FAILED(impl_->error) || !bitrate_kbps ||
         bitrate_kbps > std::numeric_limits<std::uint32_t>::max() / 1000) {
         return false;
     }
     // Before deferred initialization the session is simply opened with the new bitrate.
-    if (impl_->session && !impl_->reconfigure_bitrate(bitrate_kbps)) return false;
+    if (impl_->session && !impl_->reconfigure_bitrate(bitrate_kbps, max_bitrate_kbps)) return false;
     impl_->options.target_bitrate_kbps = bitrate_kbps;
+    impl_->options.max_bitrate_kbps = max_bitrate_kbps;
     return true;
 }
+
+RateControlMode NvencVideoEncoder::rate_control() const noexcept { return RateControlMode::Vbr; }
 
 EncoderSubmitResult NvencVideoEncoder::try_repeat_frame() {
     if (!impl_->running || FAILED(impl_->error) || !impl_->has_image) {

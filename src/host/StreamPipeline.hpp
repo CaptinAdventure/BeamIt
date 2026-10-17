@@ -28,6 +28,9 @@ struct VideoParameters {
     std::uint32_t bit_depth{8};
     std::uint32_t frame_rate{};
     std::uint32_t bitrate_kbps{};
+    // Effective VBR peak.
+    std::uint32_t max_bitrate_kbps{};
+    media::RateControlMode rate_control{media::RateControlMode::Vbr};
     std::string encoder;
 };
 
@@ -99,9 +102,10 @@ public:
     void start(PipelineCallbacks callbacks);
     void activate() noexcept;
     void request_key_frame() noexcept;
-    // Queues a bitrate and/or frame-rate change, applied once the stream is active; later requests override the
-    // values of pending ones. Returns the serial reported by `rate_changed`.
+    // Queues a bitrate, peak (0 = automatic) and/or frame-rate change, applied once the stream is active; later
+    // requests override the values of pending ones. Returns the serial reported by `rate_changed`.
     std::uint64_t request_rate_change(std::optional<std::uint32_t> bitrate_kbps,
+                                      std::optional<std::uint32_t> max_bitrate_kbps,
                                       std::optional<std::uint32_t> frame_rate);
     // Thread-safe: returns and resets the counters.
     PipelineStats take_stats();
@@ -122,6 +126,7 @@ private:
     std::atomic<bool> key_frame_requested_{};
     struct RateChange {
         std::optional<std::uint32_t> bitrate_kbps;
+        std::optional<std::uint32_t> max_bitrate_kbps;
         std::optional<std::uint32_t> frame_rate;
         std::uint64_t serial{};
     };

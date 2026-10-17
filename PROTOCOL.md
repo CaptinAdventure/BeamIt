@@ -199,7 +199,7 @@ candidate of that process, so several windows of one process may be
   "type": "start_stream",
   "id": 3,
   "source": { "kind": "window", "hwnd": "0x1A2B3C" },
-  "video": { "codec": "h264", "frame_rate": 60, "bitrate_kbps": 20000 }
+  "video": { "codec": "h264", "frame_rate": 60, "bitrate_kbps": 20000, "max_bitrate_kbps": 40000 }
 }
 ```
 
@@ -227,6 +227,14 @@ restored size.
 `"h264"`, 60 FPS and 48000 kbps. `codec` is `"h264"` or `"h265"`; `frame_rate` is
 1–240; `bitrate_kbps` is 1–1000000. The host keeps the codec and picks the
 best available chroma sampling (§8).
+
+Encoding uses variable bit rate (VBR): `bitrate_kbps` is the average target
+and `max_bitrate_kbps` (0–4000000, default 0) the peak. 0 selects twice the
+target; a peak below the target is raised to it. The decoder buffer (VBV)
+holds one frame at the average target, so a burst cannot queue much more
+than one frame time of data. Drivers may enforce it loosely for key frames.
+A D3D12 driver without VBR support falls back to CBR, reported as
+`rate_control` (§5.5).
 
 The host captures the first frame and configures the encoder before
 replying, so the reply already carries exact decoder parameters. A failure
@@ -279,6 +287,8 @@ omit this additive field; clients must not assume a measured DPI in that case.
   "bit_depth": 8,
   "frame_rate": 60,
   "bitrate_kbps": 20000,
+  "max_bitrate_kbps": 40000,
+  "rate_control": "vbr",
   "key_frame_interval": 60,
   "b_frames": 0,
   "encoder": "NVENC D3D11 H.264 4:4:4"
@@ -293,6 +303,9 @@ omit this additive field; clients must not assume a measured DPI in that case.
 * `generation` starts at 1 and increments on every encoder reconfiguration
   (size change, frame-rate change, or a bitrate change that could not be
   applied in place, §5.14). An in-place bitrate change keeps the generation.
+* `bitrate_kbps` is the average target; `max_bitrate_kbps` is the effective
+  peak (after defaulting and clamping, §5.3). `rate_control` is `"vbr"`, or
+  `"cbr"` when the encoder had to fall back; with CBR the peak is not used.
 * `encoder` is informative only.
 * Pictures are output in decode order equal to display order (I/P only, no
   B-frames), each packet decodes to exactly one picture.
@@ -807,20 +820,23 @@ process's icon. Taskbar overlay badges are not included.
 
 ### 5.14 `set_stream_rate` / `stream_rate`
 
-Changes the target bitrate and/or frame rate of a running stream, e.g. for
-congestion control or a client that wants fewer pictures.
+Changes the target bitrate, peak bitrate and/or frame rate of a running
+stream, e.g. for congestion control or a client that wants fewer pictures.
 
 ```json
-{ "type": "set_stream_rate", "id": 14, "stream_id": "…", "bitrate_kbps": 12000, "frame_rate": 30 }
+{ "type": "set_stream_rate", "id": 14, "stream_id": "…", "bitrate_kbps": 12000, "max_bitrate_kbps": 0,
+  "frame_rate": 30 }
 ```
 
 | Field          | Meaning |
 |----------------|---------|
 | `stream_id`    | Required; unknown streams give `not_found` |
-| `bitrate_kbps` | Optional new CBR target, integer 1–1000000 |
+| `bitrate_kbps` | Optional new average VBR target, integer 1–1000000 |
+| `max_bitrate_kbps` | Optional new peak, integer 0–4000000; 0 = twice the target (§5.3). When omitted, the previous setting is kept: an explicit peak stays fixed, an automatic one follows a new `bitrate_kbps` |
 | `frame_rate`   | Optional new frame rate, integer 1–240 |
 
-At least one of `bitrate_kbps`/`frame_rate` is required (`invalid_request`).
+At least one of `bitrate_kbps`/`max_bitrate_kbps`/`frame_rate` is required
+(`invalid_request`).
 The codec, size and sampling never change. The request may be sent any time
 after `stream_offer`; it takes effect once the stream socket is open.
 
@@ -828,7 +844,7 @@ Reply, after the change took effect:
 
 ```json
 { "type": "stream_rate", "id": 14, "stream_id": "…", "applied": "reconfigured",
-  "generation": 2, "frame_rate": 30, "bitrate_kbps": 12000 }
+  "generation": 2, "frame_rate": 30, "bitrate_kbps": 12000, "max_bitrate_kbps": 24000 }
 ```
 
 `applied` tells how:
@@ -836,18 +852,18 @@ Reply, after the change took effect:
 | `applied`        | Meaning |
 |------------------|---------|
 | `"unchanged"`    | The requested values were already in effect |
-| `"in_place"`     | Only the bitrate changed and the encoder applied it within the current sequence: same `generation`, no key frame, no `stream_config`; the following pictures use the new rate |
+| `"in_place"`     | Only the bitrate and/or peak changed and the encoder applied it within the current sequence: same `generation`, no key frame, no `stream_config`; the following pictures use the new rate |
 | `"reconfigured"` | The encoder restarted: `stream_config` with the next `generation` was sent first, and that generation starts with a key frame (§5.6) |
 
 * A frame-rate change is always `"reconfigured"`, because the frame rate is
   part of the SPS timing information.
-* A bitrate-only change is `"in_place"` when the encoder supports it (NVENC
+* A bitrate/peak-only change is `"in_place"` when the encoder supports it (NVENC
   reconfiguration, D3D12 rate-control reconfiguration), otherwise
   `"reconfigured"`.
 * Requests that arrive before the previous one was applied are merged: later
   values win, and every merged request receives the same reply describing
   the final values.
-* `frame_rate`/`bitrate_kbps`/`generation` are the values now in effect and
+* `frame_rate`/`bitrate_kbps`/`max_bitrate_kbps`/`generation` are the values now in effect and
   match the stream's current video parameters (§5.5).
 * If the stream ends first, no `stream_rate` is sent; `stream_stopped`
   (§5.8) ends the stream as usual. Encoder failures while applying the
@@ -871,7 +887,7 @@ covers the time since its `start_stream`.
       "stream_id": "…",
       "connected": true,
       "generation": 1, "width": 1920, "height": 1080,
-      "frame_rate": 60, "bitrate_kbps": 20000,
+      "frame_rate": 60, "bitrate_kbps": 20000, "max_bitrate_kbps": 40000,
       "interval_ms": 10000.4,
       "frames_captured": 567, "frames_encoded": 599, "key_frames": 10, "frames_sent": 599,
       "frames_dropped_encoder": 15, "frames_dropped_network": 0, "network_recoveries": 0,
@@ -894,7 +910,7 @@ covers the time since its `start_stream`.
 | `interval_ms` (top level) | Time since the previous report (or authentication) |
 | `streams` | Every stream that has been offered (`stream_offer` sent); `[]` if none |
 | `connected` | The stream socket is open; network counters stay 0 until then |
-| `generation` … `bitrate_kbps` | Current video parameters (§5.5): the targets in effect |
+| `generation` … `max_bitrate_kbps` | Current video parameters (§5.5): the targets in effect |
 | `interval_ms` (per stream) | Period covered by this stream's counters |
 | `frames_captured` | Encoded pictures with new source content |
 | `frames_encoded` | All encoded pictures, including re-encodes of an unchanged source (an idle source still produces `frame_rate` pictures) |

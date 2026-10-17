@@ -62,9 +62,11 @@ void StreamPipeline::activate() noexcept {
 void StreamPipeline::request_key_frame() noexcept { key_frame_requested_ = true; }
 
 std::uint64_t StreamPipeline::request_rate_change(std::optional<std::uint32_t> bitrate_kbps,
+                                                  std::optional<std::uint32_t> max_bitrate_kbps,
                                                   std::optional<std::uint32_t> frame_rate) {
     std::lock_guard lock(rate_mutex_);
     if (bitrate_kbps) rate_change_.bitrate_kbps = bitrate_kbps;
+    if (max_bitrate_kbps) rate_change_.max_bitrate_kbps = max_bitrate_kbps;
     if (frame_rate) rate_change_.frame_rate = frame_rate;
     rate_change_.serial = ++rate_serial_;
     return rate_change_.serial;
@@ -153,7 +155,8 @@ void StreamPipeline::loop() {
     latest->texture->GetDesc(&description);
     VideoParameters parameters{.generation = 1, .codec = options_.codec, .width = description.Width,
                                .height = description.Height, .frame_rate = options_.frame_rate,
-                               .bitrate_kbps = options_.target_bitrate_kbps};
+                               .bitrate_kbps = options_.target_bitrate_kbps,
+                               .max_bitrate_kbps = peak_bitrate_kbps(options_)};
 
     const auto receive = [&](bool starting) -> EncodedPacket {
         const auto deadline = Clock::now() + 5s;
@@ -191,6 +194,7 @@ void StreamPipeline::loop() {
         parameters.chroma_format_idc = info->chroma_format_idc;
         parameters.bit_depth = info->bit_depth_luma;
         parameters.encoder = to_utf8(encoder_->backend_name());
+        parameters.rate_control = encoder_->rate_control();
     };
 
     configure(true);
@@ -200,9 +204,10 @@ void StreamPipeline::loop() {
     }
     describe(receive(true), true);
     if (latest->lifetime) latest.reset();
-    spdlog::info("Stream ready: {}x{} {} {} {}-bit, {} FPS, {} kbps via {}", parameters.width, parameters.height,
-                 parameters.codec_string, chroma_format_name(parameters.chroma_format_idc), parameters.bit_depth,
-                 parameters.frame_rate, parameters.bitrate_kbps, parameters.encoder);
+    spdlog::info("Stream ready: {}x{} {} {} {}-bit, {} FPS, {} {} kbps (peak {}) via {}", parameters.width,
+                 parameters.height, parameters.codec_string, chroma_format_name(parameters.chroma_format_idc),
+                 parameters.bit_depth, parameters.frame_rate, rate_control_name(parameters.rate_control),
+                 parameters.bitrate_kbps, parameters.max_bitrate_kbps, parameters.encoder);
     callbacks_.ready(parameters);
 
     bool announce = false;
@@ -222,16 +227,20 @@ void StreamPipeline::loop() {
     const auto apply_rate_change = [&](const RateChange& change) {
         const auto frame_rate = change.frame_rate.value_or(options_.frame_rate);
         const auto bitrate = change.bitrate_kbps.value_or(options_.target_bitrate_kbps);
+        const auto max_bitrate = change.max_bitrate_kbps.value_or(options_.max_bitrate_kbps);
         auto result = RateChangeResult::Unchanged;
         if (frame_rate != options_.frame_rate) {
             // The frame rate is part of the SPS timing information, so it needs new parameter sets and an IDR.
             options_.frame_rate = frame_rate;
             options_.target_bitrate_kbps = bitrate;
+            options_.max_bitrate_kbps = max_bitrate;
             reconfigure();
             result = RateChangeResult::Reconfigured;
-        } else if (bitrate != options_.target_bitrate_kbps) {
+        } else if (bitrate != options_.target_bitrate_kbps ||
+                   peak_bitrate_kbps(bitrate, max_bitrate) != peak_bitrate_kbps(options_)) {
             options_.target_bitrate_kbps = bitrate;
-            if (encoder_->try_update_bitrate(bitrate)) {
+            options_.max_bitrate_kbps = max_bitrate;
+            if (encoder_->try_update_bitrate(bitrate, max_bitrate)) {
                 result = RateChangeResult::InPlace;
             } else {
                 check_hresult(encoder_->last_error(), "In-place bitrate change");
@@ -241,8 +250,9 @@ void StreamPipeline::loop() {
         }
         parameters.frame_rate = options_.frame_rate;
         parameters.bitrate_kbps = options_.target_bitrate_kbps;
-        spdlog::info("Stream rate change {}: {} FPS, {} kbps ({})", change.serial, parameters.frame_rate,
-                     parameters.bitrate_kbps,
+        parameters.max_bitrate_kbps = peak_bitrate_kbps(options_);
+        spdlog::info("Stream rate change {}: {} FPS, {} kbps, peak {} kbps ({})", change.serial,
+                     parameters.frame_rate, parameters.bitrate_kbps, parameters.max_bitrate_kbps,
                      result == RateChangeResult::InPlace        ? "in place"
                      : result == RateChangeResult::Reconfigured ? "encoder reconfigured"
                                                                 : "unchanged");

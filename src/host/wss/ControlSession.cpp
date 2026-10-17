@@ -28,6 +28,8 @@ json::object video_json(const VideoParameters& video) {
         {"bit_depth", video.bit_depth},
         {"frame_rate", video.frame_rate},
         {"bitrate_kbps", video.bitrate_kbps},
+        {"max_bitrate_kbps", video.max_bitrate_kbps},
+        {"rate_control", media::rate_control_name(video.rate_control)},
         {"key_frame_interval", 60},
         {"b_frames", 0},
         {"encoder", video.encoder},
@@ -127,6 +129,8 @@ media::EncoderOptions parse_video(const json::object& message, const HostServerO
         static_cast<std::uint32_t>(optional_integer(*video, "frame_rate", 1, 240).value_or(options.frame_rate));
     options.target_bitrate_kbps = static_cast<std::uint32_t>(
         optional_integer(*video, "bitrate_kbps", 1, 1'000'000).value_or(options.target_bitrate_kbps));
+    options.max_bitrate_kbps = static_cast<std::uint32_t>(
+        optional_integer(*video, "max_bitrate_kbps", 0, media::max_bitrate_limit_kbps).value_or(0));
     return options;
 }
 
@@ -461,7 +465,8 @@ void ControlSession::start_pipeline(const std::shared_ptr<StreamEntry>& entry) {
                     self.reply(request.second, {{"type", "stream_rate"}, {"stream_id", stream->id},
                                                 {"applied", applied}, {"generation", video.generation},
                                                 {"frame_rate", video.frame_rate},
-                                                {"bitrate_kbps", video.bitrate_kbps}});
+                                                {"bitrate_kbps", video.bitrate_kbps},
+                                                {"max_bitrate_kbps", video.max_bitrate_kbps}});
                     return true;
                 });
             });
@@ -514,15 +519,17 @@ void ControlSession::request_key_frame(const json::object& message, const Reques
 void ControlSession::set_stream_rate(const json::object& message, const RequestId& id) {
     const auto stream = find_stream(message);
     const auto bitrate = optional_integer(message, "bitrate_kbps", 1, 1'000'000);
+    const auto max_bitrate = optional_integer(message, "max_bitrate_kbps", 0, media::max_bitrate_limit_kbps);
     const auto frame_rate = optional_integer(message, "frame_rate", 1, 240);
-    if (!bitrate && !frame_rate) {
-        throw ProtocolError{"invalid_request", "set_stream_rate needs bitrate_kbps or frame_rate"};
+    if (!bitrate && !max_bitrate && !frame_rate) {
+        throw ProtocolError{"invalid_request", "set_stream_rate needs bitrate_kbps, max_bitrate_kbps or frame_rate"};
     }
     const auto to_u32 = [](std::optional<std::int64_t> value) -> std::optional<std::uint32_t> {
         if (!value) return std::nullopt;
         return static_cast<std::uint32_t>(*value);
     };
-    const auto serial = stream->pipeline->request_rate_change(to_u32(bitrate), to_u32(frame_rate));
+    const auto serial =
+        stream->pipeline->request_rate_change(to_u32(bitrate), to_u32(max_bitrate), to_u32(frame_rate));
     stream->rate_requests.emplace_back(serial, id);
 }
 
