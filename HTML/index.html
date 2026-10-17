@@ -136,6 +136,7 @@
         </div>
         <div class="metrics">
           <span id="resolution">—</span>
+          <span id="dpi-info">DPI unavailable</span>
           <span id="codec-info">—</span>
           <span id="frame-info">Waiting for video</span>
           <span id="latency-info"></span>
@@ -275,6 +276,7 @@
         canvas.width = 0;
         canvas.height = 0;
         $("resolution").textContent = "—";
+        $("dpi-info").textContent = "DPI unavailable";
         $("codec-info").textContent = "—";
         $("frame-info").textContent = "Waiting for video";
         $("latency-info").textContent = "";
@@ -364,6 +366,10 @@
         stream.on("error", (error) => log(error.message, true));
         const streamId = stream.id;
         const config = stream.video;
+        const dpi = stream.offer.source.dpi;
+        $("dpi-info").textContent = dpi
+          ? `Host display: ${dpi.x}×${dpi.y} DPI (${(dpi.x / 96 * 100).toFixed(0)}% scaling)`
+          : "DPI unavailable";
         $("resolution").textContent = `${config.width}×${config.height}`;
         $("codec-info").textContent = `${config.codec.toUpperCase()} · ${config.chroma_format ?? "sampling unknown"} · ${config.codec_string}`;
         try {

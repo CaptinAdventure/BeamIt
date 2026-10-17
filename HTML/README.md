@@ -31,6 +31,13 @@ Browsers do not expose native Dock/taskbar flashing through this page.
 
 ## Capture and video settings
 
+`stream.offer.source.dpi` contains the target monitor's effective `x`/`y`
+DPI at startup (96 = 100% scaling). The page displays it beside the video.
+Clients can convert video pixels to Windows logical units with `96 / dpi`
+per axis before applying their own display scale. The test page retains
+its fit-to-container rendering; input mapping stays in video pixels.
+This metadata is a startup snapshot, not a live monitor-change event.
+
 The page offers DXGI Desktop Duplication (the default) or WGC for desktop
 streams. Window and application streams always use WGC; DXGI is rejected
 locally for those sources. The streaming status reports the capture API

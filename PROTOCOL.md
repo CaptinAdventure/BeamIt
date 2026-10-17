@@ -221,7 +221,7 @@ produces an `error` (`not_found`, `capture_failed`, `encoder_failed`,
   "stream_id": "Q2hOc3kV2bTqjG6dAVu0Sg",
   "url": "wss://host:port/streams/Q2hOc3kV2bTqjG6dAVu0Sg?token=…",
   "token_expires_in_ms": 10000,
-  "source": { "kind": "window", "hwnd": "0x1A2B3C", "pid": 4242, "title": "Microsoft Teams", "capture": "wgc" },
+  "source": { "kind": "window", "hwnd": "0x1A2B3C", "pid": 4242, "title": "Microsoft Teams", "capture": "wgc", "dpi": { "x": 144, "y": 144 } },
   "video": { …video parameters, §5.5… }
 }
 ```
@@ -230,6 +230,18 @@ The `url` authority is copied from the `Host` header of the `/control`
 upgrade so it matches the certificate exception the browser already holds.
 The client should open it within `token_expires_in_ms`; otherwise the host
 stops the stream with reason `token_expired`.
+
+`source.dpi` reports the target monitor's effective Windows display DPI at
+stream startup, with positive integer `x` and `y` values. Window/application
+streams use the monitor containing the target window; desktop streams use
+the primary monitor. This is display scaling metadata, not physical panel
+density or the source application's DPI-awareness setting. 96 DPI means
+100% scaling; 144 DPI means 150%. Video dimensions and input coordinates
+remain video pixels. To obtain a Windows logical size, multiply video width
+by `96 / dpi.x` and height by `96 / dpi.y`; clients must then account for
+their own display scale. This startup snapshot is not updated by
+`stream_config` when the window moves to another monitor. Older hosts may
+omit this additive field; clients must not assume a measured DPI in that case.
 
 ### 5.5 Video parameters object
 

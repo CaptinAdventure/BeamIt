@@ -17,6 +17,7 @@
 #include "net/Protocol.hpp"
 
 #include <spdlog/spdlog.h>
+#include <shellscalingapi.h>
 
 #include <algorithm>
 #include <array>
@@ -586,6 +587,18 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
         } else {
             throw ProtocolError{"invalid_request", "source.kind must be window, application or desktop"};
         }
+
+        const auto monitor = target.window
+            ? MonitorFromWindow(target.window, MONITOR_DEFAULTTONEAREST)
+            : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        UINT dpi_x{};
+        UINT dpi_y{};
+        const auto dpi_result = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y);
+        if (FAILED(dpi_result) || dpi_x == 0 || dpi_y == 0) {
+            throw ProtocolError{"capture_failed", fmt::format("could not query target display DPI (HRESULT 0x{:08X})",
+                                                             static_cast<std::uint32_t>(dpi_result))};
+        }
+        source_out["dpi"] = json::object{{"x", dpi_x}, {"y", dpi_y}};
 
         const auto& defaults = server.options;
         media::EncoderOptions options{.frame_rate = defaults.frame_rate,

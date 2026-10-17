@@ -221,7 +221,7 @@ test("capture selection is preserved and invalid source/backend combinations are
     const id = `capture-${index}`;
     socket.receive({
       type: "stream_offer", id: request.id, stream_id: id,
-      source: { ...source, capture: source.capture ?? "dxgi" },
+      source: { ...source, capture: source.capture ?? "dxgi", dpi: { x: 144, y: 144 } },
       url: `wss://test:8443/streams/${id}?token=${base64UrlEncode(new Uint8Array(32))}`,
       token_expires_in_ms: 10000, input: { mouse_mode: "absolute" },
       video: { generation: 1, codec: "h264", codec_string: "avc1.4D001F", width: 1920, height: 1080 },
@@ -230,6 +230,7 @@ test("capture selection is preserved and invalid source/backend combinations are
     FakeSocket.instances.at(-1).open();
     const opened = await starting;
     assert.equal(opened.offer.source.capture, source.capture ?? "dxgi");
+    assert.deepEqual(opened.offer.source.dpi, { x: 144, y: 144 });
     opened.close();
   }
   const count = socket.sent.length;
