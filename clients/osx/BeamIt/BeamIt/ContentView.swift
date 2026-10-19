@@ -1,42 +1,5 @@
 import SwiftUI
 
-@main
-struct BeamItApp: App {
-    @AppStorage("clipboardSyncEnabled") private var clipboardSyncEnabled = false
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-                .frame(minWidth: 520, minHeight: 560)
-        }
-        .commands {
-            CommandMenu("Stream") {
-                Button("Add New Stream") {
-                    BeamItMainWindow.show()
-                }
-                Button("Change Parameters…") {
-                    BeamItStreamWindowController.changeActiveStreamParameters()
-                }
-                Button("Stream info…") {
-                    BeamItStreamWindowController.showActiveStreamInfo()
-                }
-                Toggle("Clipboard Sync", isOn: $clipboardSyncEnabled)
-                Button("Sync Host to macOS") {
-                    BeamItClipboardMenu.shared.synchronize(hostToMac: true)
-                }
-                .disabled(BeamItClipboardMenu.shared.sync == nil)
-                Button("Sync macOS to Host") {
-                    BeamItClipboardMenu.shared.synchronize(hostToMac: false)
-                }
-                .disabled(BeamItClipboardMenu.shared.sync == nil)
-                Divider()
-                Button("Send Text to Target…") {
-                    BeamItStreamWindowController.presentSendTextForActiveStream()
-                }
-            }
-        }
-    }
-}
-
 struct ContentView: View {
     @AppStorage("clipboardSyncEnabled") private var clipboardSyncEnabled = false
     @State private var serverURL = UserDefaults.standard.string(forKey: "lastSuccessfulServerURL") ?? ""

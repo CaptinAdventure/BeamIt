@@ -18,7 +18,7 @@ The project is intentionally close to the problem space of RDP and Sunshine, but
 ## Current status
 
 This repository has full-monitor DXGI capture, monitor or single-window WGC capture, and automatic codec-preserving selection between D3D12 Video Encode and native NVENC DirectX 11 encoding, prioritizing 4:4:4 sampling.
-The host serves the authenticated **WSS protocol** in [`PROTOCOL.md`](PROTOCOL.md) : one JSON signaling WebSocket plus one binary WebSocket per video stream, over TLS with a shared password. This is the executable's only mode; the earlier recorder, plaintext TCP test streamer, window listing and capability probes were removed. Remote keyboard and mouse input is routed per stream over the signaling socket. The `HTML/` browser test client is served at `/`. The host reports every top-level window (`window_opened`/`window_changed`/`window_closed`) so clients can choose secondary windows to stream. Native clients are not implemented.
+The host serves the authenticated **WSS protocol** in [`PROTOCOL.md`](PROTOCOL.md) : one JSON signaling WebSocket plus one binary WebSocket per video stream, over TLS with a shared password. This is the executable's only mode; the earlier recorder, plaintext TCP test streamer, window listing and capability probes were removed. Remote keyboard and mouse input is routed per stream over the signaling socket. The `HTML/` browser test client is served at `/`. The host reports every top-level window (`window_opened`/`window_changed`/`window_closed`) so clients can choose secondary windows to stream. The macOS client lives in `clients/osx`; the [Windows client integration scaffold](clients/windows/README.md) is not yet a functional streaming client and awaits Windows validation.
 
 ### Current near-term goal
 
@@ -208,6 +208,40 @@ Tested from a stdlib Python WSS client on the development machine: authenticatio
 
 ### Remote input
 
+Fullscreen exit restores the titled window and its pixel scale after AppKit completes the native transition; transition resize events do not update the saved windowed scale. Standalone restoration regression checks (no host or fullscreen Space switch):
+
+```sh
+xcrun swiftc -default-isolation MainActor -parse-as-library clients/osx/BeamIt/BeamIt/BeamItAntiIdle.swift clients/osx/BeamIt/BeamIt/BeamItConnectionModels.swift clients/osx/BeamIt/BeamIt/BeamItScalingMenu.swift clients/osx/BeamIt/BeamIt/BeamItStreamSurface.swift clients/osx/BeamIt/BeamIt/BeamItStreamWindowController.swift clients/osx/BeamIt/Tests/FullscreenTests.swift -o /tmp/beamit-fullscreen-checks
+/tmp/beamit-fullscreen-checks
+```
+
+**macOS fullscreen.** **Window > Fullscreen** toggles native fullscreen for the focused stream, independently of the windowed scaling setting. Video fills the screen without stretching, with black bars when the aspect ratios differ; pointer coordinates and popup placement use the actual video rectangle. In fullscreen, press **Escape twice within one second** to return to a **1×** window, whether or not mouse capture is active. Any active capture is released. Key auto-repeat does not count as a second press. The first Escape is forwarded normally; the second is consumed locally and held host input is released. A normal fullscreen exit restores the previous windowed scale. Control+Option+G still releases capture without leaving fullscreen.
+
+**macOS window scaling.** **Stream > Allow Aspect Ratio Scaling** enables proportional resizing of the focused stream window and the **0.5×**, **1×**, and **2×** size presets. Scaling is per stream and initially disabled. At 1×, one video pixel maps to one display pixel (a 1920×1080 stream occupies 960×540 points on a 2× Retina display). Disabling scaling immediately resets the window to 1× and disables manual resizing. Video-size and display-scale changes preserve the selected scale; transient popup windows follow their parent's scale.
+
+During macOS mouse capture, the stream title includes **Control+Option+G to release mouse**. The original title returns as soon as capture ends.
+
+**macOS anti-idle.** **Stream > Auto Move Mouse When Not in Focus** (persisted) moves the host pointer while no BeamIt stream window has keyboard focus (another window or application is focused). Only the most recently focused top-level stream is affected: absolute `mouse_move` events at 30 Hz drift smoothly (eased start/stop) toward a new random point every 5 seconds, within a centred circle whose diameter is 20% of the shorter video side. Moves never change host focus (PROTOCOL.md §5.9); no buttons or keys are sent. Movement stops as soon as a stream window is focused again, the option is turned off, or the target stream closes. It pauses while that stream is in relative (captured) mode or a mode change is pending. Standalone geometry checks:
+
+```sh
+printf 'import AppKit\nfinal class BeamItStreamWindowController: NSWindowController { let isPopup = false; func antiIdleMove(offset: CGPoint) {}; func antiIdleStopped() {} }\n' > /tmp/beamit-antiidle-stub.swift
+xcrun swiftc -default-isolation MainActor -parse-as-library clients/osx/BeamIt/BeamIt/BeamItAntiIdle.swift /tmp/beamit-antiidle-stub.swift clients/osx/BeamIt/Tests/AntiIdleTests.swift -o /tmp/beamit-antiidle
+/tmp/beamit-antiidle
+```
+
+**macOS mouse capture.** Focus a stream and choose **Stream > Capture Mouse** for VM-style input. The client waits for the host's `set_mouse_mode` acknowledgement, hides and disconnects the local pointer from mouse movement, and sends relative deltas without display-edge limits. Desktop streams use raw deltas; window streams scale them to video pixels, with host-side window clamping (PROTOCOL.md §5.9). Input pauses during mode changes to avoid mixing absolute coordinates and relative deltas.
+
+While captured, physical Control sends Ctrl, Command sends the Windows key, and Option sends Alt; Command-W/Q and Command-V are forwarded rather than closing/quitting or invoking clipboard paste. **Control+Option+G** releases capture, restores the local cursor and usual Command/Ctrl remapping, and releases held host input. Focus loss, stream closure, disconnection and input errors also release capture. macOS-reserved shortcuts may still be handled by the OS: this uses an app-local event monitor, not a privileged global keyboard tap. Automatic clipboard synchronization, if enabled, is unchanged.
+
+To check with a host, capture a desktop stream, move beyond a local display edge, exercise Ctrl/Command and Command-W in a safe target, then release with Control+Option+G and verify normal pointer positioning and shortcut remapping. Repeat with a window stream and with focus loss/stream shutdown during capture. Cursor confinement and live host input require this interactive check.
+
+Keyboard-policy regression checks (no host or cursor capture required):
+
+```sh
+xcrun swiftc -parse-as-library clients/osx/BeamIt/BeamIt/BeamItInput.swift clients/osx/BeamIt/Tests/InputTests.swift -o /tmp/beamit-input-checks
+/tmp/beamit-input-checks
+```
+
 Input messages (`mouse_move`, `mouse_button`, `mouse_wheel`, `key`, `text`, `release_all`, `set_mouse_mode`, `get_input_state`) carry a `stream_id`; the host injects them with `SendInput` into the interactive desktop (`src/host/InputInjector.cpp`). Success is silent; errors use the normal `error` message.
 
 - **Mouse modes, per stream.** *Absolute* (default): `x`/`y` in video pixels from the stream's top-left, mapped proportionally onto the window's visible frame (`DWMWA_EXTENDED_FRAME_BOUNDS`, which matches what WGC records) or the primary monitor, clamped, and sent as `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`. *Relative*: `dx`/`dy` deltas. For desktop streams they are real relative motion (host pointer acceleration applies; raw-input apps see deltas). For window streams the host adds the scaled delta to the cursor and clamps it inside the window, so pointer-locked clients cannot wander onto other host windows.
@@ -353,6 +387,8 @@ Unlike the previous headers-only 13.1.15 package, this is the full SDK archive. 
 The previous 13.1 headers exceeded the development driver's maximum API 13.0. With the genuine SDK 13.0.37 headers, the former `--probe-nvenc` diagnostic reported **headers 13.0, driver maximum 13.0** on the Quadro T1000: **H.264 High444 profile YES, YUV444 encode capability YES, planar YUV444 input YES**. This demonstrated native NVENC exposes a 4:4:4 path that the current D3D12 queries do not expose on this driver. The SDK's real versioned structures are used, not rewritten version constants.
 
 ## Repository files
+
+The macOS client sources live in `clients/osx/BeamIt/BeamIt/`. `BeamItApp.swift` owns the app scene and menus, while `ContentView.swift` owns connection/source selection. `BeamItConnection.swift` handles signaling; its wire/source models and TLS certificate delegate live in `BeamItConnectionModels.swift` and `CertificatePinDelegate.swift`. Stream reception (`BeamItVideoStream.swift`), VideoToolbox decoding (`BeamItVideoDecoder.swift`), native window lifecycle (`BeamItStreamWindowController.swift`), aspect-fit layout (`BeamItStreamSurface.swift`), frame presentation (`BeamItFrameView.swift`), scaling-menu state (`BeamItScalingMenu.swift`) and anti-idle movement (`BeamItAntiIdle.swift`) are separate files. Small related models and private helpers stay with their owning component.
 
 - `include/beamit/capture/Capturer.hpp` — common capture interface and target types
 - `include/beamit/capture/DxgiCapturer.hpp` and `src/capture/DxgiCapturer.cpp` — DXGI monitor capture backend

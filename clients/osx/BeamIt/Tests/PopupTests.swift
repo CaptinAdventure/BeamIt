@@ -85,6 +85,25 @@ struct PopupTests {
         coordinator.update(host("menu", owner: "main", x: 500, y: 500), closed: false)
         precondition(menu.window?.frame.origin == NSPoint(x: 300, y: 520))
         precondition(connection.requested.count == 1, "changed events must not duplicate streams")
+        let originalParentFrame = parent.window!.frame
+        parent.window?.setContentSize(NSSize(width: 400, height: 300))
+        coordinator.reposition()
+        precondition(menu.window?.frame.size == NSSize(width: 50, height: 40),
+                     "popup surfaces must scale with the parent")
+        parent.window?.setFrame(originalParentFrame, display: true)
+        coordinator.reposition()
+        precondition(menu.window?.frame.size == NSSize(width: 100, height: 80))
+        precondition(menu.window?.frame.origin == NSPoint(x: 300, y: 520))
+        let container = parent.window!.contentView!
+        let videoSurface = NSView(frame: NSRect(x: 100, y: 50, width: 600, height: 450))
+        container.addSubview(videoSurface)
+        coordinator.reposition()
+        let videoRect = parent.window!.convertToScreen(videoSurface.convert(videoSurface.bounds, to: nil))
+        precondition(menu.window?.frame == NSRect(
+            x: videoRect.minX + 150, y: videoRect.maxY - 150 - 60, width: 75, height: 60
+        ), "letterboxed fullscreen popups must use the video rectangle, not the black bars")
+        videoSurface.removeFromSuperview()
+        coordinator.reposition()
         coordinator.update(host("submenu", owner: "menu"), closed: false)
         try await settle()
         precondition(connection.requested.contains("submenu"), "nested ownership must resolve")
