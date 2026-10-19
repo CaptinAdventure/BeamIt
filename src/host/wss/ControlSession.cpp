@@ -136,6 +136,23 @@ media::EncoderOptions parse_video(const json::object& message, const HostServerO
 
 } // namespace
 
+bool Server::stream_connected() {
+    ++connected_streams;
+    if (execution_state_active) return true;
+    if (!SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)) return false;
+    execution_state_active = true;
+    return true;
+}
+
+bool Server::stream_disconnected() {
+    if (connected_streams == 0) return false;
+    --connected_streams;
+    if (connected_streams != 0 || !execution_state_active) return true;
+    if (!SetThreadExecutionState(ES_CONTINUOUS)) return false;
+    execution_state_active = false;
+    return true;
+}
+
 void StreamEntry::shut_down(websocket::close_reason reason) {
     if (token_timer) token_timer->cancel();
     input->release_all();
@@ -443,6 +460,7 @@ void ControlSession::start_pipeline(const std::shared_ptr<StreamEntry>& entry) {
         .start_failed = [on_network](std::string code, std::string text) {
             on_network([code, text](ControlSession& self, const std::shared_ptr<StreamEntry>& stream) {
                 self.streams_.erase(stream->id);
+                self.release_stream_execution_state(*stream);
                 stream->shut_down({websocket::close_code::normal, "stream failed"});
                 self.send_error(stream->request_id, code, text);
             });
@@ -536,6 +554,7 @@ void ControlSession::set_stream_rate(const json::object& message, const RequestI
 void ControlSession::end_stream(const std::shared_ptr<StreamEntry>& entry, std::string_view reason,
                                 std::string_view message, const RequestId& id) {
     if (streams_.erase(entry->id) == 0) return;
+    release_stream_execution_state(*entry);
     entry->shut_down({websocket::close_code::normal, reason});
     json::object stopped{{"type", "stream_stopped"}, {"stream_id", entry->id}, {"reason", reason}};
     if (!message.empty()) stopped["message"] = message;
@@ -543,8 +562,19 @@ void ControlSession::end_stream(const std::shared_ptr<StreamEntry>& entry, std::
     spdlog::info("Stream {} stopped: {}{}{}", entry->id, reason, message.empty() ? "" : " - ", message);
 }
 
+void ControlSession::release_stream_execution_state(StreamEntry& entry) {
+    if (!entry.connected) return;
+    entry.connected = false;
+    if (!server_.stream_disconnected()) {
+        spdlog::warn("Could not restore normal power policy after stream {} disconnected", entry.id);
+    }
+}
+
 void ControlSession::stop_all_streams(websocket::close_code code) {
-    for (auto& [id, entry] : std::exchange(streams_, {})) entry->shut_down({code, "signaling session ended"});
+    for (auto& [id, entry] : std::exchange(streams_, {})) {
+        release_stream_execution_state(*entry);
+        entry->shut_down({code, "signaling session ended"});
+    }
 }
 
 std::shared_ptr<StreamEntry> ControlSession::claim(std::string_view stream_id, std::string_view token) {
@@ -571,6 +601,10 @@ void ControlSession::attach(const std::shared_ptr<StreamEntry>& entry, std::shar
         if (self && stream) self->end_stream(stream, "disconnected");
     };
     entry->socket = stream_socket;
+    if (!server_.stream_connected()) {
+        spdlog::warn("Could not prevent screensaver/display timeout for stream {}", entry->id);
+    }
+    entry->connected = true;
     asio::co_spawn(stream_socket->ws->get_executor(), StreamSocket::read_loop(stream_socket), asio::detached);
     entry->pipeline->activate();
     spdlog::info("Stream {} connected", entry->id);

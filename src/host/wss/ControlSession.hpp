@@ -38,6 +38,12 @@ struct Server {
     // Reported top-level windows (network thread only).
     WindowList windows;
     ClipboardMonitor* clipboard{};
+    // Connected stream count and execution state are owned by the network thread.
+    std::size_t connected_streams{};
+    bool execution_state_active{};
+
+    bool stream_connected();
+    bool stream_disconnected();
 };
 
 // One stream of a control session, from `start_stream` until it stops.
@@ -49,6 +55,7 @@ struct StreamEntry {
     VideoParameters video;
     bool ready{};
     bool token_used{};
+    bool connected{};
     Clock::time_point token_expiry{};
     std::unique_ptr<StreamPipeline> pipeline;
     std::shared_ptr<StreamSocket> socket;
@@ -118,6 +125,7 @@ private:
     void offer(const std::shared_ptr<StreamEntry>& entry, const VideoParameters& video);
     void end_stream(const std::shared_ptr<StreamEntry>& entry, std::string_view reason, std::string_view message = {},
                     const RequestId& id = std::nullopt);
+    void release_stream_execution_state(StreamEntry& entry);
     void stop_all_streams(websocket::close_code code);
 
     // Input (ControlInput.cpp).
