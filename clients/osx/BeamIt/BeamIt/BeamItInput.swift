@@ -4,7 +4,8 @@ import AppKit
 ///
 /// Keys are sent as physical `KeyboardEvent.code` names, so the host keyboard layout decides the
 /// produced character. Mac shortcuts are kept familiar: Command sends Ctrl and Control sends the
-/// Windows key. ⌘W and ⌘Q stay local to the Mac client.
+/// Windows key. ⌘W and ⌘Q stay local unless mouse capture is active.
+@MainActor
 final class BeamItInputHandler {
     private let stream: BeamItVideoStream
     private var heldKeys = Set<String>()
@@ -12,6 +13,133 @@ final class BeamItInputHandler {
     private var lastPosition: CGPoint?
     private var wheelRemainder = CGPoint.zero
     private var pasteTask: Task<Void, Never>?
+    var onMouseCaptureChanged: ((Bool) -> Void)?
+    private(set) var isMouseCaptured = false {
+        didSet {
+            if isMouseCaptured != oldValue { onMouseCaptureChanged?(isMouseCaptured) }
+        }
+    }
+    private var captureRequested = false
+    private var modeTask: Task<Void, Never>?
+    private var mouseMonitor: Any?
+    private var captureObservers: [NSObjectProtocol] = []
+    private var savedCursorPosition: CGPoint?
+    private var mouseModeIsKnown = true
+
+    func captureMouse(in view: NSView) {
+        guard !isMouseCaptured, modeTask == nil, let window = view.window,
+              window.isKeyWindow, window.attachedSheet == nil else { return }
+        releaseAll()
+        captureRequested = true
+        modeTask = Task { [weak self, weak view, weak window] in
+            guard let self else { return }
+            var failure: String?
+            do {
+                try await stream.setMouseMode("relative")
+                if captureRequested, let view, let window, NSApp.isActive,
+                   window.isKeyWindow, window.attachedSheet == nil {
+                    // Keep the disconnected cursor inside the video so AppKit continues routing
+                    // movement to this window, without hitting a display edge.
+                    let original = CGEvent(source: nil)?.location
+                    let center = window.convertPoint(toScreen: view.convert(
+                        CGPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil
+                    ))
+                    let displayTop = CGDisplayBounds(CGMainDisplayID()).maxY
+                    let result = CGWarpMouseCursorPosition(CGPoint(x: center.x, y: displayTop - center.y))
+                    guard result == .success else {
+                        throw CaptureError.cursorOperation(result.rawValue)
+                    }
+                    let association = CGAssociateMouseAndMouseCursorPosition(0)
+                    guard association == .success else {
+                        if let original { CGWarpMouseCursorPosition(original) }
+                        throw CaptureError.cursorOperation(association.rawValue)
+                    }
+                    savedCursorPosition = original
+                    NSCursor.hide()
+                    isMouseCaptured = true
+                    mouseModeIsKnown = true
+                    for name in [NSApplication.didResignActiveNotification, NSApplication.willTerminateNotification] {
+                        captureObservers.append(NotificationCenter.default.addObserver(
+                            forName: name, object: nil, queue: .main
+                        ) { [weak self] _ in
+                            MainActor.assumeIsolated { self?.releaseMouseCapture() }
+                        })
+                    }
+                    mouseMonitor = NSEvent.addLocalMonitorForEvents(
+                        matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+                    ) { [weak self, weak view] event in
+                        guard let self, self.isMouseCaptured, let view else { return event }
+                        self.mouseMoved(event, in: view)
+                        return nil
+                    }
+                    for (keyCode, _) in Self.modifiers where CGEventSource.keyState(
+                        .combinedSessionState, key: CGKeyCode(keyCode)
+                    ) {
+                        if let code = Self.modifierCode(keyCode, captured: true) {
+                            heldKeys.insert(code)
+                            stream.sendInput("key", ["code": code, "down": true])
+                        }
+                    }
+                    modeTask = nil
+                    return
+                }
+            } catch {
+                if !stream.isClosed { failure = "Mouse capture failed: \(error.localizedDescription)" }
+            }
+            captureRequested = false
+            await restoreAbsoluteMode(failure: failure)
+        }
+    }
+
+    func releaseMouseCapture() {
+        captureRequested = false
+        guard isMouseCaptured else { return }
+        isMouseCaptured = false
+        for observer in captureObservers { NotificationCenter.default.removeObserver(observer) }
+        captureObservers.removeAll()
+        if let mouseMonitor {
+            NSEvent.removeMonitor(mouseMonitor)
+            self.mouseMonitor = nil
+        }
+        let result = CGAssociateMouseAndMouseCursorPosition(1)
+        if let savedCursorPosition { CGWarpMouseCursorPosition(savedCursorPosition) }
+        savedCursorPosition = nil
+        NSCursor.unhide()
+        releaseAll()
+        modeTask = Task {
+            await restoreAbsoluteMode(
+                failure: result == .success ? nil : "Could not restore the local mouse (error \(result.rawValue))."
+            )
+        }
+    }
+
+    private func restoreAbsoluteMode(failure: String?) async {
+        var failure = failure
+        do {
+            try await stream.setMouseMode("absolute")
+            mouseModeIsKnown = true
+        } catch {
+            mouseModeIsKnown = false
+            if !stream.isClosed {
+                let message = "Could not restore absolute mouse mode: \(error.localizedDescription)"
+                failure = failure.map { "\($0)\n\(message)" } ?? message
+            }
+        }
+        lastPosition = nil
+        modeTask = nil
+        if let failure { stream.onInputError?(failure) }
+    }
+
+    private enum CaptureError: LocalizedError {
+        case cursorOperation(Int32)
+        var errorDescription: String? {
+            switch self {
+            case .cursorOperation(let code): return "macOS rejected mouse capture (error \(code))."
+            }
+        }
+    }
+
+    private var canSendInput: Bool { modeTask == nil && mouseModeIsKnown }
 
     init(stream: BeamItVideoStream) {
         self.stream = stream
@@ -20,10 +148,20 @@ final class BeamItInputHandler {
     // MARK: Mouse
 
     func mouseMoved(_ event: NSEvent, in view: NSView) {
-        sendPosition(event, in: view)
+        guard canSendInput else { return }
+        if isMouseCaptured {
+            guard event.deltaX != 0 || event.deltaY != 0 else { return }
+            let isDesktop = stream.offer.source.kind == "desktop"
+            let scaleX = isDesktop ? 1 : CGFloat(stream.video.width) / max(1, view.bounds.width)
+            let scaleY = isDesktop ? 1 : CGFloat(stream.video.height) / max(1, view.bounds.height)
+            stream.sendInput("mouse_move", ["dx": event.deltaX * scaleX, "dy": event.deltaY * scaleY])
+        } else {
+            sendPosition(event, in: view)
+        }
     }
 
     func mouseButton(_ event: NSEvent, in view: NSView, down: Bool) {
+        guard canSendInput else { return }
         guard let button = Self.buttonName(event) else { return }
         sendPosition(event, in: view)
         if down {
@@ -35,6 +173,7 @@ final class BeamItInputHandler {
     }
 
     func scrollWheel(_ event: NSEvent, in view: NSView) {
+        guard canSendInput else { return }
         sendPosition(event, in: view)
         // AppKit deltas are positive when content moves down/right; the protocol uses the DOM
         // sign (positive scrolls down/right). Precise (trackpad) deltas are in points, others in lines.
@@ -52,7 +191,23 @@ final class BeamItInputHandler {
         stream.sendInput("mouse_wheel", fields)
     }
 
+    /// Sends an absolute position not originating from the local mouse (anti-idle movement).
+    /// The next real mouse event is always resent afterwards.
+    func sendSyntheticPosition(_ point: CGPoint) {
+        guard canSendInput, !isMouseCaptured, !captureRequested else { return }
+        lastPosition = nil
+        stream.sendInput("mouse_move", [
+            "x": Double((point.x * 100).rounded() / 100),
+            "y": Double((point.y * 100).rounded() / 100),
+        ])
+    }
+
+    func forgetPosition() {
+        lastPosition = nil
+    }
+
     private func sendPosition(_ event: NSEvent, in view: NSView) {
+        guard !isMouseCaptured else { return }
         let bounds = view.bounds
         guard bounds.width > 0, bounds.height > 0 else { return }
         let point = view.convert(event.locationInWindow, from: nil)
@@ -88,16 +243,20 @@ final class BeamItInputHandler {
 
     /// Returns `true` when the event was forwarded to the host and must not be handled locally.
     func handleKeyEvent(_ event: NSEvent) -> Bool {
+        if (captureRequested || isMouseCaptured), Self.isCaptureReleaseShortcut(event) {
+            releaseMouseCapture()
+            return true
+        }
+        guard canSendInput else { return true }
         switch event.type {
         case .flagsChanged:
             handleModifier(event)
             return true
         case .keyDown:
-            if Self.isLocalShortcut(event) {
+            if Self.isLocalShortcut(event, captured: isMouseCaptured) {
                 return false
             }
-            if stream.clipboardSyncEnabled, event.modifierFlags.contains(.command),
-               event.charactersIgnoringModifiers?.lowercased() == "v" {
+            if stream.clipboardSyncEnabled, Self.isClipboardPaste(event, captured: isMouseCaptured) {
                 pasteClipboard(event)
                 return true
             }
@@ -158,23 +317,44 @@ final class BeamItInputHandler {
             return
         }
         guard let modifier = Self.modifiers[event.keyCode] else { return }
+        guard let code = Self.modifierCode(event.keyCode, captured: isMouseCaptured) else { return }
         let down = event.modifierFlags.rawValue & modifier.deviceMask != 0
         if down {
-            guard heldKeys.insert(modifier.code).inserted else { return }
+            guard heldKeys.insert(code).inserted else { return }
         } else {
-            guard heldKeys.remove(modifier.code) != nil else { return }
+            guard heldKeys.remove(code) != nil else { return }
         }
-        stream.sendInput("key", ["code": modifier.code, "down": down])
+        stream.sendInput("key", ["code": code, "down": down])
     }
 
-    private static func isLocalShortcut(_ event: NSEvent) -> Bool {
-        guard event.modifierFlags.contains(.command),
+    static func isCaptureReleaseShortcut(_ event: NSEvent) -> Bool {
+        event.type == .keyDown && event.keyCode == 5 &&
+        event.modifierFlags.intersection([.control, .option, .command, .shift]) == [.control, .option]
+    }
+
+    static func isClipboardPaste(_ event: NSEvent, captured: Bool) -> Bool {
+        !captured && event.modifierFlags.contains(.command) &&
+        event.charactersIgnoringModifiers?.lowercased() == "v"
+    }
+
+    static func modifierCode(_ keyCode: UInt16, captured: Bool) -> String? {
+        if captured, let code = capturedModifierCodes[keyCode] { return code }
+        return modifiers[keyCode]?.code
+    }
+
+    static func isLocalShortcut(_ event: NSEvent, captured: Bool) -> Bool {
+        guard !captured, event.modifierFlags.contains(.command),
               let key = event.charactersIgnoringModifiers?.lowercased()
         else { return false }
         return key == "w" || key == "q"
     }
 
     // Device-dependent modifier bits (IOKit NX_DEVICE*KEYMASK) distinguish left and right keys.
+    private static let capturedModifierCodes: [UInt16: String] = [
+        55: "MetaLeft", 54: "MetaRight",
+        59: "ControlLeft", 62: "ControlRight",
+    ]
+
     private static let modifiers: [UInt16: (code: String, deviceMask: UInt)] = [
         55: ("ControlLeft", 0x0008),   // Left Command → Ctrl
         54: ("ControlRight", 0x0010),  // Right Command → Ctrl

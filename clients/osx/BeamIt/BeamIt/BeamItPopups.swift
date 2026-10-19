@@ -154,13 +154,17 @@ final class BeamItPopups {
                           parent: BeamItStreamWindowController, hostParent: BeamItHostWindow) {
         guard let view = parent.window?.contentView, let window = parent.window,
               let child = controller.window, hostParent.rect.width > 0, hostParent.rect.height > 0 else { return }
-        let content = window.convertToScreen(view.convert(view.bounds, to: nil))
+        // The video surface is inset when fullscreen needs letterboxing.
+        let videoView = view.subviews.first ?? view
+        let content = window.convertToScreen(videoView.convert(videoView.bounds, to: nil))
         let sx = content.width / hostParent.rect.width
         let sy = content.height / hostParent.rect.height
-        child.setFrameOrigin(NSPoint(
+        child.setFrame(NSRect(
             x: content.minX + (popup.rect.x - hostParent.rect.x) * sx,
-            y: content.maxY - (popup.rect.y - hostParent.rect.y) * sy - child.frame.height
-        ))
+            y: content.maxY - (popup.rect.y - hostParent.rect.y + popup.rect.height) * sy,
+            width: popup.rect.width * sx,
+            height: popup.rect.height * sy
+        ), display: true)
     }
 
     private func remove(_ hwnd: String) {
