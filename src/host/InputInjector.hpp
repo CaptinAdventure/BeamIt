@@ -5,6 +5,8 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
@@ -12,6 +14,7 @@
 
 namespace beamit::host::input {
 
+class ElevatedInput;
 enum class MouseMode { Absolute, Relative };
 enum class MouseButton : std::uint8_t { Left, Right, Middle, Back, Forward };
 
@@ -39,11 +42,33 @@ struct ScreenPoint {
 
 enum class InputResult { Ok, FocusFailed, InjectFailed, TargetGone };
 
+struct ProcessIntegrity {
+    DWORD level{};
+    DWORD error{};
+};
+
+struct InjectionDiagnostic {
+    DWORD inserted{};
+    DWORD requested{};
+    DWORD error{};
+    DWORD injector_pid{};
+    DWORD foreground_pid{};
+    ProcessIntegrity injector;
+    ProcessIntegrity foreground;
+};
+// Numeric-only diagnostics cross the helper boundary; never keys/text/titles.
+[[nodiscard]] std::optional<InjectionDiagnostic> take_injection_diagnostic();
+void log_injection_diagnostic(const InjectionDiagnostic& diagnostic);
+
+// Token mandatory-integrity RID, or a Win32 error when the process/token cannot be queried.
+[[nodiscard]] ProcessIntegrity process_integrity(DWORD process_id);
+
 [[nodiscard]] std::optional<MouseMode> parse_mouse_mode(std::string_view mode);
 [[nodiscard]] std::string_view mouse_mode_name(MouseMode mode);
 [[nodiscard]] std::optional<MouseButton> parse_mouse_button(std::string_view button);
 // Maps a UI Events KeyboardEvent.code value to the key to inject.
 [[nodiscard]] std::optional<KeyCode> key_for_code(std::string_view code);
+[[nodiscard]] bool supported_key(KeyCode key);
 
 // Maps a video-pixel position (x right, y down from the stream origin) onto `rect`, clamped inside it.
 [[nodiscard]] ScreenPoint map_to_rect(double x, double y, std::uint32_t video_width, std::uint32_t video_height,
@@ -77,7 +102,7 @@ inline constexpr std::size_t max_text_units = 1024;
 // primary monitor (desktop stream). Methods must be called from one thread.
 class StreamInput {
 public:
-    explicit StreamInput(HWND window);
+    explicit StreamInput(HWND window, std::shared_ptr<ElevatedInput> elevated = {});
     ~StreamInput();
     StreamInput(const StreamInput&) = delete;
     StreamInput& operator=(const StreamInput&) = delete;
@@ -96,6 +121,9 @@ public:
                                                              std::uint32_t video_height) const;
     // Releases every key and button this stream holds down.
     void release_all();
+    [[nodiscard]] ModifierState modifiers() const;
+    // Helper watchdog only: revoke further injections and release held state, even during a hung focus call.
+    void cancel();
 
 private:
     [[nodiscard]] std::optional<ScreenRect> target_rect() const;
@@ -103,6 +131,10 @@ private:
     InputResult send_mouse_to(ScreenPoint point);
 
     HWND window_{};
+    std::shared_ptr<ElevatedInput> elevated_;
+    std::uint64_t remote_stream_{};
+    std::mutex held_mutex_;
+    bool cancelled_{};
     DWORD process_id_{};
     std::set<KeyCode> pressed_keys_;
     // Physical button injected for each held logical button, so releases match presses even if the

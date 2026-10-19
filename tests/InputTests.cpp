@@ -6,6 +6,16 @@
 
 using namespace beamit::host::input;
 
+TEST_CASE("Input diagnostics query process integrity without requiring elevation", "[input]") {
+    const auto current = process_integrity(GetCurrentProcessId());
+    REQUIRE(current.error == ERROR_SUCCESS);
+    CHECK(current.level >= SECURITY_MANDATORY_LOW_RID);
+
+    const auto missing = process_integrity(0);
+    CHECK(missing.error != ERROR_SUCCESS);
+    CHECK(missing.level == 0);
+}
+
 TEST_CASE("KeyboardEvent.code values map to Set-1 scan codes", "[input]") {
     const auto a = key_for_code("KeyA");
     REQUIRE(a);

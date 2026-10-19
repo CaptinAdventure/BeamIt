@@ -525,7 +525,21 @@ succeeds again). Desktop streams never change focus.
 #### 5.9.10 Limitations (informative)
 
 * Windows blocks input into windows of elevated (administrator) processes
-  unless the host itself runs elevated; such input is silently ignored.
+  unless the input injector is elevated. The optional host-side
+  `--elevate-input` switch uses a separate, same-session UAC-elevated input
+  helper; it does not elevate the network host or change any WSS messages.
+  All input, focus and pointer/modifier queries for that instance use the
+  helper. Password holders thereby gain input access to administrator
+  windows on the interactive desktop. UAC denial, unexpected helper exit
+  or failed/timed-out local IPC **stops the host**, disconnecting clients;
+  there is no silent fallback to normal input. Graceful host shutdown also
+  shuts down the helper. Held input is released on stream teardown and
+  helper channel disconnect/host exit. Failed injection is reported as
+  `input_failed` (rate-limited). The host also logs failed `SendInput` calls,
+  at most once every five seconds per input thread, with foreground PID,
+  injector/foreground token integrity levels and Win32/query errors
+  (the injector is the helper when enabled). UIPI is only a suspected
+  cause: Windows does not identify it in `SendInput`'s failure result.
 * The secure desktop (UAC prompt, lock screen, Ctrl+Alt+Del screen) cannot
   receive input; the host reports `input_failed` (rate-limited).
 * The host must run in the interactive user session (not as a service).

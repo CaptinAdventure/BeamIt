@@ -5,6 +5,7 @@
 
 #include "FrameTimer.hpp"
 #include "ThreadPriority.hpp"
+#include "host/ElevatedInput.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -15,6 +16,8 @@ namespace beamit::host {
 using namespace wss;
 
 void run_host_server(HostServerOptions options) {
+    // Complete UAC and authenticate the local peer before opening any listener.
+    if (options.elevate_input) options.elevated_input = std::make_shared<input::ElevatedInput>();
     // Pipeline threads join the MTA and exit with each stream. Without a process-wide MTA reference, COM tears the
     // MTA down after the last stream and unloads WinRT DLLs that C++/WinRT's factory cache still points into.
     CO_MTA_USAGE_COOKIE mta_cookie{};
@@ -71,15 +74,37 @@ void run_host_server(HostServerOptions options) {
     });
 
     asio::signal_set signals(server.io, SIGINT, SIGTERM);
-    signals.async_wait([&](beast::error_code error, int) {
-        if (error) return;
+    bool helper_failed{};
+    const auto stop = [&] {
         spdlog::info("Shutting down");
         beast::error_code ignored;
         acceptor.close(ignored);
         // Join every pipeline before the io_context stops accepting their posted callbacks.
         if (auto session = server.active.lock()) session->close(websocket::close_code::going_away, "host shutting down");
         server.io.stop();
+    };
+    signals.async_wait([&](beast::error_code error, int) {
+        if (error) return;
+        stop();
     });
+    asio::steady_timer helper_monitor(server.io);
+    std::function<void()> check_helper;
+    if (server.options.elevated_input) {
+        check_helper = [&] {
+            helper_monitor.expires_after(std::chrono::milliseconds(50));
+            helper_monitor.async_wait([&](beast::error_code error) {
+                if (error) return;
+                if (!server.options.elevated_input->healthy()) {
+                    helper_failed = true;
+                    spdlog::critical("Elevated input helper stopped or IPC failed; stopping host (no fallback)");
+                    stop();
+                    return;
+                }
+                check_helper();
+            });
+        };
+        check_helper();
+    }
     asio::co_spawn(server.io, accept_loop(server, acceptor), asio::detached);
     // The io_context thread performs every TLS/WebSocket write and input injection, so it is time critical too.
     const TimerResolutionGuard timer_resolution;
@@ -87,6 +112,7 @@ void run_host_server(HostServerOptions options) {
     const MmcssTaskGuard mmcss(set_realtime_priority_with_handle());
     if (!mmcss.registered()) spdlog::warn("MMCSS registration failed; using a time-critical thread priority");
     server.io.run();
+    if (helper_failed) throw std::runtime_error("Elevated input helper failed; host stopped");
 }
 
 } // namespace beamit::host

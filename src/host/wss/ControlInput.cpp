@@ -26,7 +26,7 @@ void ControlSession::handle_input(const json::object& message, const RequestId& 
         if (!entry->ready) throw ProtocolError{"not_ready", "the stream has not been offered yet"};
         const auto position =
             state.cursor_position(entry->video.width, entry->video.height).value_or(input::ScreenPoint{-1, -1});
-        const auto modifiers = input::modifier_state();
+        const auto modifiers = state.modifiers();
         reply(id, {
             {"type", "input_state"},
             {"stream_id", entry->id},

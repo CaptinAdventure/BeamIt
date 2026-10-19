@@ -155,7 +155,12 @@ bool Server::stream_disconnected() {
 
 void StreamEntry::shut_down(websocket::close_reason reason) {
     if (token_timer) token_timer->cancel();
-    input->release_all();
+    try {
+        input->release_all();
+    } catch (const std::exception& error) {
+        // A failed elevated channel is fail-closed at host level, but must not skip pipeline teardown.
+        spdlog::error("Input cleanup failed: {}", error.what());
+    }
     pipeline->stop();
     if (socket) socket->close(std::move(reason));
 }
@@ -433,7 +438,7 @@ void ControlSession::start_stream(const json::object& message, const RequestId& 
     entry->source = std::move(source.description);
     entry->pipeline =
         std::make_unique<StreamPipeline>(std::move(capturer), std::move(encoder), source.target, options);
-    entry->input = std::make_unique<input::StreamInput>(source.target.window);
+    entry->input = std::make_unique<input::StreamInput>(source.target.window, server_.options.elevated_input);
     entry->input->mouse_mode = mouse_mode;
     entry->pid = source.pid;
     streams_.emplace(entry->id, entry);

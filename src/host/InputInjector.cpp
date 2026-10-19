@@ -1,14 +1,19 @@
 #include "host/InputInjector.hpp"
+#include "host/ElevatedInput.hpp"
 
 #include <dwmapi.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <span>
 #include <vector>
 
 namespace beamit::host::input {
 namespace {
+
+thread_local std::optional<InjectionDiagnostic> pending_diagnostic;
 
 struct KeyEntry {
     std::string_view code;
@@ -114,8 +119,25 @@ INPUT button_input(MouseButton physical, bool down) {
 
 InputResult send(std::span<INPUT> inputs) {
     if (inputs.empty()) return InputResult::Ok;
+    SetLastError(ERROR_SUCCESS);
     const UINT sent = SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
-    return sent == inputs.size() ? InputResult::Ok : InputResult::InjectFailed;
+    if (sent == inputs.size()) return InputResult::Ok;
+    const DWORD error = GetLastError();
+
+    // UIPI has no dedicated SendInput error; inspect tokens only on failure, at most once every five seconds.
+    static thread_local std::optional<std::chrono::steady_clock::time_point> last_warning;
+    const auto now = std::chrono::steady_clock::now();
+    if (!last_warning || now - *last_warning >= std::chrono::seconds(5)) {
+        last_warning = now;
+        DWORD foreground_pid{};
+        GetWindowThreadProcessId(GetForegroundWindow(), &foreground_pid);
+        const auto host = process_integrity(GetCurrentProcessId());
+        const auto foreground = process_integrity(foreground_pid);
+        pending_diagnostic = InjectionDiagnostic{sent, static_cast<DWORD>(inputs.size()), error,
+            GetCurrentProcessId(), foreground_pid, host, foreground};
+        log_injection_diagnostic(*pending_diagnostic);
+    }
+    return InputResult::InjectFailed;
 }
 
 bool is_foreground_process(DWORD process_id) {
@@ -127,6 +149,46 @@ bool is_foreground_process(DWORD process_id) {
 }
 
 } // namespace
+
+std::optional<InjectionDiagnostic> take_injection_diagnostic() {
+    return std::exchange(pending_diagnostic, std::nullopt);
+}
+
+void log_injection_diagnostic(const InjectionDiagnostic& d) {
+    const bool higher = d.injector.error == ERROR_SUCCESS && d.foreground.error == ERROR_SUCCESS &&
+                        d.foreground.level > d.injector.level;
+    spdlog::warn("Remote control blocked: SendInput inserted {}/{} events (Win32 error {}); "
+                 "injector PID {}, foreground PID {}, injector integrity RID {} (query error {}), "
+                 "foreground integrity RID {} (query error {}). {}",
+                 d.inserted, d.requested, d.error, d.injector_pid, d.foreground_pid,
+                 d.injector.level, d.injector.error, d.foreground.level, d.foreground.error,
+                 higher ? "Higher-integrity foreground process: UIPI is suspected; consider --elevate-input."
+                        : "Cause unknown; secure desktop, UIPI or another input restriction may be responsible.");
+}
+
+ProcessIntegrity process_integrity(DWORD process_id) {
+    const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+    if (!process) return {.error = GetLastError()};
+    HANDLE token{};
+    const bool opened = OpenProcessToken(process, TOKEN_QUERY, &token) != FALSE;
+    const DWORD open_error = opened ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(process);
+    if (!opened) return {.error = open_error};
+
+    // A mandatory-label SID has one RID; reserve SECURITY_MAX_SID_SIZE to avoid a second token query.
+    struct TokenLabel {
+        TOKEN_MANDATORY_LABEL label;
+        BYTE sid[SECURITY_MAX_SID_SIZE];
+    } info{};
+    DWORD size{};
+    const bool queried = GetTokenInformation(token, TokenIntegrityLevel, &info, sizeof(info), &size) != FALSE;
+    const DWORD query_error = queried ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(token);
+    if (!queried) return {.error = query_error};
+    const PSID sid = info.label.Label.Sid;
+    if (!IsValidSid(sid) || *GetSidSubAuthorityCount(sid) == 0) return {.error = ERROR_INVALID_SID};
+    return {.level = *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1)};
+}
 
 std::optional<MouseMode> parse_mouse_mode(std::string_view mode) {
     if (mode == "absolute") return MouseMode::Absolute;
@@ -151,6 +213,10 @@ std::optional<KeyCode> key_for_code(std::string_view code) {
     const auto found = std::ranges::find(key_table, code, &KeyEntry::code);
     if (found == key_table.end()) return std::nullopt;
     return found->key;
+}
+
+bool supported_key(KeyCode key) {
+    return std::ranges::any_of(key_table, [&](const KeyEntry& entry) { return entry.key == key; });
 }
 
 ScreenPoint map_to_rect(double x, double y, std::uint32_t video_width, std::uint32_t video_height,
@@ -226,11 +292,16 @@ std::optional<std::wstring> text_to_utf16(std::string_view utf8) {
     return text;
 }
 
-StreamInput::StreamInput(HWND window) : window_(window) {
+StreamInput::StreamInput(HWND window, std::shared_ptr<ElevatedInput> elevated)
+    : window_(window), elevated_(std::move(elevated)) {
+    if (elevated_) remote_stream_ = elevated_->create(window);
     if (window_ != nullptr) GetWindowThreadProcessId(window_, &process_id_);
 }
 
-StreamInput::~StreamInput() { release_all(); }
+StreamInput::~StreamInput() {
+    if (elevated_) elevated_->destroy(remote_stream_);
+    else release_all();
+}
 
 std::optional<ScreenRect> StreamInput::target_rect() const {
     RECT rect{};
@@ -251,6 +322,15 @@ std::optional<ScreenRect> StreamInput::target_rect() const {
 
 std::optional<ScreenPoint> StreamInput::cursor_position(std::uint32_t video_width,
                                                         std::uint32_t video_height) const {
+    if (elevated_) {
+        ipc::Request request;
+        request.operation = ipc::Operation::Cursor;
+        request.stream = remote_stream_;
+        request.width = video_width;
+        request.height = video_height;
+        const auto response = elevated_->transact(request);
+        return response.present ? std::optional(ScreenPoint{response.x, response.y}) : std::nullopt;
+    }
     POINT cursor{};
     const auto rect = target_rect();
     if (!rect || !GetCursorPos(&cursor)) return std::nullopt;
@@ -263,7 +343,7 @@ InputResult StreamInput::ensure_focus() {
     if (window_ == nullptr) return InputResult::Ok;
     if (!IsWindow(window_)) return InputResult::TargetGone;
     if (is_foreground_process(process_id_)) return InputResult::Ok;
-    if (IsIconic(window_)) ShowWindow(window_, SW_RESTORE);
+    if (IsIconic(window_)) ShowWindowAsync(window_, SW_RESTORE);
     if (SetForegroundWindow(window_) && is_foreground_process(process_id_)) return InputResult::Ok;
 
     // The foreground lock refused us; share the foreground thread's input state for the switch.
@@ -279,6 +359,8 @@ InputResult StreamInput::ensure_focus() {
 }
 
 InputResult StreamInput::send_mouse_to(ScreenPoint point) {
+    std::lock_guard lock(held_mutex_);
+    if (cancelled_) return InputResult::InjectFailed;
     const ScreenRect desk{GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
                           GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
                           GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN)};
@@ -289,6 +371,14 @@ InputResult StreamInput::send_mouse_to(ScreenPoint point) {
 }
 
 InputResult StreamInput::move_absolute(double x, double y, std::uint32_t video_width, std::uint32_t video_height) {
+    if (elevated_) {
+        ipc::Request request;
+        request.operation = ipc::Operation::Absolute;
+        request.stream = remote_stream_;
+        request.x = x; request.y = y;
+        request.width = video_width; request.height = video_height;
+        return static_cast<InputResult>(elevated_->transact(request).result);
+    }
     const auto rect = target_rect();
     if (!rect) return InputResult::TargetGone;
     if (window_ != nullptr && IsIconic(window_)) return InputResult::Ok;
@@ -298,8 +388,18 @@ InputResult StreamInput::move_absolute(double x, double y, std::uint32_t video_w
 }
 
 InputResult StreamInput::move_relative(double dx, double dy, std::uint32_t video_width, std::uint32_t video_height) {
+    if (elevated_) {
+        ipc::Request request;
+        request.operation = ipc::Operation::Relative;
+        request.stream = remote_stream_;
+        request.x = dx; request.y = dy;
+        request.width = video_width; request.height = video_height;
+        return static_cast<InputResult>(elevated_->transact(request).result);
+    }
     if (!std::isfinite(dx) || !std::isfinite(dy)) return InputResult::Ok;
     if (window_ == nullptr) {
+        std::lock_guard lock(held_mutex_);
+        if (cancelled_) return InputResult::InjectFailed;
         // Desktop: genuine relative motion so raw-input applications see deltas.
         residual_x_ += dx;
         residual_y_ += dy;
@@ -333,6 +433,19 @@ InputResult StreamInput::move_relative(double dx, double dy, std::uint32_t video
 }
 
 InputResult StreamInput::button(MouseButton logical, bool down) {
+    if (elevated_) {
+        ipc::Request request;
+        request.operation = ipc::Operation::Button;
+        request.stream = remote_stream_;
+        request.first = static_cast<int>(logical);
+        request.flags = down;
+        return static_cast<InputResult>(elevated_->transact(request).result);
+    }
+    if (down) {
+        if (const auto focus = ensure_focus(); focus != InputResult::Ok) return focus;
+    }
+    std::lock_guard lock(held_mutex_);
+    if (cancelled_) return InputResult::InjectFailed;
     auto& held = pressed_buttons_[static_cast<std::size_t>(logical)];
     if (!down) {
         if (!held) return InputResult::Ok;
@@ -340,7 +453,6 @@ InputResult StreamInput::button(MouseButton logical, bool down) {
         held.reset();
         return send(std::span(&input, 1));
     }
-    if (const auto focus = ensure_focus(); focus != InputResult::Ok) return focus;
     MouseButton physical = logical;
     if (GetSystemMetrics(SM_SWAPBUTTON)) {
         if (logical == MouseButton::Left) physical = MouseButton::Right;
@@ -353,6 +465,15 @@ InputResult StreamInput::button(MouseButton logical, bool down) {
 }
 
 InputResult StreamInput::wheel(int dx, int dy) {
+    if (elevated_) {
+        ipc::Request request;
+        request.operation = ipc::Operation::Wheel;
+        request.stream = remote_stream_;
+        request.first = dx; request.second = dy;
+        return static_cast<InputResult>(elevated_->transact(request).result);
+    }
+    std::lock_guard lock(held_mutex_);
+    if (cancelled_) return InputResult::InjectFailed;
     std::array<INPUT, 2> inputs{};
     std::size_t count = 0;
     // Protocol dy > 0 scrolls down (DOM deltaY); Windows uses positive for scrolling up.
@@ -362,9 +483,20 @@ InputResult StreamInput::wheel(int dx, int dy) {
 }
 
 InputResult StreamInput::key(KeyCode key, bool down) {
+    if (elevated_) {
+        ipc::Request request;
+        request.operation = ipc::Operation::Key;
+        request.stream = remote_stream_;
+        request.first = key.scan;
+        request.second = key.virtual_key;
+        request.flags = (down ? 1u : 0u) | (key.extended ? 2u : 0u);
+        return static_cast<InputResult>(elevated_->transact(request).result);
+    }
     if (down) {
         if (const auto focus = ensure_focus(); focus != InputResult::Ok) return focus;
     }
+    std::lock_guard lock(held_mutex_);
+    if (cancelled_) return InputResult::InjectFailed;
     INPUT input = keyboard_input(key, down);
     const auto result = send(std::span(&input, 1));
     if (down && result == InputResult::Ok) pressed_keys_.insert(key);
@@ -373,8 +505,19 @@ InputResult StreamInput::key(KeyCode key, bool down) {
 }
 
 InputResult StreamInput::text(std::wstring_view text) {
+    if (elevated_) {
+        if (text.size() > max_text_units) return InputResult::InjectFailed;
+        ipc::Request request;
+        request.operation = ipc::Operation::Text;
+        request.stream = remote_stream_;
+        request.length = static_cast<std::uint32_t>(text.size());
+        std::ranges::copy(text, request.text);
+        return static_cast<InputResult>(elevated_->transact(request).result);
+    }
     if (text.empty()) return InputResult::Ok;
     if (const auto focus = ensure_focus(); focus != InputResult::Ok) return focus;
+    std::lock_guard lock(held_mutex_);
+    if (cancelled_) return InputResult::InjectFailed;
     std::vector<INPUT> inputs;
     inputs.reserve(text.size() * 2);
     for (std::size_t index = 0; index < text.size(); ++index) {
@@ -398,6 +541,14 @@ InputResult StreamInput::text(std::wstring_view text) {
 }
 
 void StreamInput::release_all() {
+    if (elevated_) {
+        ipc::Request request;
+        request.operation = ipc::Operation::Release;
+        request.stream = remote_stream_;
+        elevated_->transact(request);
+        return;
+    }
+    std::lock_guard lock(held_mutex_);
     std::vector<INPUT> inputs;
     for (const auto& key : pressed_keys_) inputs.push_back(keyboard_input(key, false));
     for (auto& held : pressed_buttons_) {
@@ -406,6 +557,24 @@ void StreamInput::release_all() {
     }
     pressed_keys_.clear();
     if (!inputs.empty()) send(inputs);
+}
+
+void StreamInput::cancel() {
+    {
+        std::lock_guard lock(held_mutex_);
+        cancelled_ = true;
+    }
+    release_all();
+}
+
+ModifierState StreamInput::modifiers() const {
+    if (!elevated_) return modifier_state();
+    ipc::Request request;
+    request.operation = ipc::Operation::Modifiers;
+    request.stream = remote_stream_;
+    const auto bits = elevated_->transact(request).modifiers;
+    return {bool(bits & 1), bool(bits & 2), bool(bits & 4), bool(bits & 8),
+            bool(bits & 16), bool(bits & 32), bool(bits & 64)};
 }
 
 } // namespace beamit::host::input

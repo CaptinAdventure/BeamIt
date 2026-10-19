@@ -36,6 +36,9 @@ int main(int argc, char** argv) {
     std::string tls_key;
     unsigned short port{};
     std::string bind_address{"0.0.0.0"};
+    bool elevate_input{};
+    app.add_flag("--elevate-input", elevate_input,
+        "Use a separate UAC-elevated input helper; stop the host if it cannot start or stops");
     app.add_option("--port", port, "TCP listening port")->required()->check(CLI::Range(1, 65535));
     app.add_option("--bind", bind_address, "Numeric listen address (IPv4 or IPv6)")->default_val("0.0.0.0");
     app.add_option("--password-file", password_file,
@@ -51,6 +54,7 @@ int main(int argc, char** argv) {
         beamit::host::HostServerOptions options;
         options.bind_address = bind_address;
         options.port = port;
+        options.elevate_input = elevate_input;
         options.identity = *cert_option ? beamit::host::load_pem_identity(tls_cert, tls_key)
                                         : beamit::host::self_signed_identity();
         options.auth_salt = beamit::net::random_bytes(16);

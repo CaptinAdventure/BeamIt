@@ -13,6 +13,7 @@
 
 namespace beamit::host {
 
+namespace input { class ElevatedInput; }
 enum class CaptureBackend { Wgc, Dxgi };
 
 struct HostServerOptions {
@@ -26,6 +27,8 @@ struct HostServerOptions {
     media::VideoCodec codec{media::VideoCodec::H264};
     std::uint32_t frame_rate{60};
     std::uint32_t bitrate_kbps{48000};
+    bool elevate_input{};
+    std::shared_ptr<input::ElevatedInput> elevated_input;
     std::function<std::unique_ptr<capture::Capturer>(CaptureBackend)> make_capturer;
     std::function<std::unique_ptr<media::Encoder>(media::VideoCodec)> make_encoder;
 };
