@@ -5,6 +5,7 @@
 #include "host/AttentionMonitor.hpp"
 #include "host/Clipboard.hpp"
 #include "host/HostServer.hpp"
+#include "host/HostControl.hpp"
 #include "host/InputInjector.hpp"
 #include "host/StreamPipeline.hpp"
 #include "host/WindowTracker.hpp"
@@ -33,6 +34,7 @@ struct Server {
     wintls::context tls{wintls::method::system_default};
     HostServerOptions options;
     std::weak_ptr<ControlSession> active;
+    std::uint64_t auth_generation{};
     // Windows currently requesting attention (network thread only).
     std::map<HWND, AttentionEvent> attention;
     // Reported top-level windows (network thread only).
@@ -41,9 +43,12 @@ struct Server {
     // Connected stream count and execution state are owned by the network thread.
     std::size_t connected_streams{};
     bool execution_state_active{};
+    InputElevation input_elevation{InputElevation::Starting};
 
     bool stream_connected();
     bool stream_disconnected();
+    void change_password(HostCommand& command);
+    void publish_status();
 };
 
 // One stream of a control session, from `start_stream` until it stops.
@@ -68,6 +73,8 @@ struct StreamEntry {
     bool input_error_sent{};
     // Unanswered set_stream_rate requests by pipeline serial (§5.14).
     std::vector<std::pair<std::uint64_t, RequestId>> rate_requests;
+    std::string local_statistics;
+    Clock::time_point stats_sampled_at{};
 
     // Releases held input, stops capture/encoding and closes the stream socket.
     void shut_down(websocket::close_reason reason);
@@ -99,6 +106,9 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
     void send_window_event(const WindowEvent& event);
 
     const std::string& remote() const { return remote_; }
+    HostStatus local_status() const;
+    void disconnect_stream(const std::string& id);
+    void upgrade_input(const std::shared_ptr<input::ElevatedInput>& helper);
 
 private:
     using Handler = void (ControlSession::*)(const json::object& message, const RequestId& id);
@@ -149,6 +159,7 @@ private:
     std::string authority_;
     std::string remote_;
     std::vector<std::byte> server_nonce_;
+    std::uint64_t auth_generation_{};
     std::deque<Outgoing> outbox_;
     std::map<std::string, std::shared_ptr<StreamEntry>> streams_;
     bool writing_{};

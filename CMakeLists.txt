@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 4.3)
 project(BeamIt)
+enable_language(RC)
 
 set(CMAKE_CXX_STANDARD 26)
 
@@ -94,6 +95,8 @@ set(BEAMIT_HOST_SOURCES
 
 add_executable(BeamIt
     src/main.cpp
+    src/host/TrayHost.cpp
+    src/host/TrayHost.rc
     src/ApplicationWindows.cpp
     src/capture/DxgiCapturer.cpp
     src/capture/WgcCapturer.cpp
@@ -108,7 +111,7 @@ target_link_libraries(BeamIt PRIVATE spdlog CLI11::CLI11 Boost::beast Boost::jso
 target_compile_definitions(BeamIt PUBLIC NOMINMAX _WIN32_WINNT=0x0A00)
 
 # Separate privilege boundary: no network, credentials, capture, clipboard or encoder dependencies.
-add_executable(BeamItInputHelper
+add_executable(BeamItInputHelper WIN32
     src/InputHelperMain.cpp
     src/host/InputInjector.cpp
     src/host/InputProtocol.cpp
@@ -118,6 +121,11 @@ target_include_directories(BeamItInputHelper PRIVATE src)
 target_compile_definitions(BeamItInputHelper PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
 target_link_libraries(BeamItInputHelper PRIVATE spdlog user32 dwmapi advapi32 shell32 ole32 bcrypt avrt winmm)
 add_dependencies(BeamIt BeamItInputHelper)
+set_property(TARGET BeamIt APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Install-BeamItCert.ps1")
+add_custom_command(TARGET BeamIt POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Install-BeamItCert.ps1" "$<TARGET_FILE_DIR:BeamIt>/Install-BeamItCert.ps1"
+)
 if(TARGET NVIDIA::NVENCHeaders)
     target_sources(BeamIt PRIVATE src/media/NvencVideoEncoder.cpp)
     target_link_libraries(BeamIt PRIVATE NVIDIA::NVENCHeaders)
@@ -148,6 +156,7 @@ if(BUILD_TESTING)
         tests/WindowTrackerTests.cpp
         tests/WindowIconTests.cpp
         tests/WssFieldsTests.cpp
+        tests/HostControlTests.cpp
         src/ApplicationWindows.cpp
         ${BEAMIT_HOST_SOURCES}
         src/capture/DxgiCapturer.cpp

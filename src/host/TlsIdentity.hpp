@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <string>
+#include <stdexcept>
 
 namespace beamit::host {
 
@@ -17,7 +18,12 @@ struct TlsIdentity {
 [[nodiscard]] TlsIdentity load_pem_identity(const std::filesystem::path& certificate,
                                             const std::filesystem::path& private_key);
 
-// Reuses or creates a persistent self-signed certificate in CurrentUser\My.
-[[nodiscard]] TlsIdentity self_signed_identity();
+class MissingTlsCertificate : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// Loads the persistent certificate installed by Install-BeamItCert.ps1 in CurrentUser\My.
+[[nodiscard]] TlsIdentity installed_identity();
 
 } // namespace beamit::host

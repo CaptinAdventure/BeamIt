@@ -153,6 +153,27 @@ bool Server::stream_disconnected() {
     return true;
 }
 
+void Server::change_password(HostCommand& command) {
+    options.auth_key = command.auth_key;
+    options.auth_salt = std::move(command.auth_salt);
+    ++auth_generation;
+    if (command.disconnect_client) {
+        if (auto session = active.lock()) {
+            session->close(websocket::close_code::policy_error, "connection password changed");
+        }
+    }
+    spdlog::info("Connection password changed locally");
+}
+
+void Server::publish_status() {
+    if (!options.control) return;
+    auto session = active.lock();
+    auto status = session ? session->local_status() : HostStatus{};
+    status.listening = true;
+    status.input_elevation = input_elevation;
+    options.control->publish(std::move(status));
+}
+
 void StreamEntry::shut_down(websocket::close_reason reason) {
     if (token_timer) token_timer->cancel();
     try {
@@ -168,7 +189,7 @@ void StreamEntry::shut_down(websocket::close_reason reason) {
 ControlSession::ControlSession(Server& host, std::shared_ptr<WebSocket> socket, std::string url_authority,
                                std::string peer)
     : server_(host), ws_(std::move(socket)), authority_(std::move(url_authority)), remote_(std::move(peer)),
-      server_nonce_(beamit::net::random_bytes(protocol::nonce_bytes)) {}
+      server_nonce_(beamit::net::random_bytes(protocol::nonce_bytes)), auth_generation_(host.auth_generation) {}
 
 // --- Outgoing messages ---------------------------------------------------------------------------------------------
 
@@ -204,6 +225,7 @@ void ControlSession::send_error(const RequestId& id, std::string_view code, std:
 void ControlSession::close(websocket::close_code code, std::string_view reason) {
     if (closing_) return;
     closing_ = true;
+    server_.publish_status();
     if (stats_timer_) stats_timer_->cancel();
     stop_all_streams(websocket::close_code::going_away);
     outbox_.emplace_back(websocket::close_reason{code, reason});
@@ -282,6 +304,7 @@ awaitable<void> ControlSession::run(std::shared_ptr<ControlSession> self) {
     self->closing_ = true;
     self->stop_all_streams(websocket::close_code::going_away);
     if (self->server_.active.lock() == self) self->server_.active.reset();
+    self->server_.publish_status();
     if (self->authenticated_) spdlog::info("Control client {} disconnected", self->remote_);
 }
 
@@ -351,6 +374,9 @@ void ControlSession::reject_unauthenticated(std::string_view code, std::string_v
 }
 
 void ControlSession::authenticate(const json::object& message) {
+    if (auth_generation_ != server_.auth_generation) {
+        return reject_unauthenticated("auth_failed", "password changed; reconnect to authenticate");
+    }
     const auto* version = message.if_contains("protocol");
     if (!version || !version->is_int64() || version->as_int64() != protocol::version) {
         send_error(std::nullopt, "protocol_version", "this host supports protocol version 1");
@@ -382,6 +408,7 @@ void ControlSession::authenticate(const json::object& message) {
                         "superseded by a newer session");
     }
     server_.active = shared_from_this();
+    server_.publish_status();
     ws_->read_message_max(protocol::max_authenticated_signaling_message);
     const auto server_proof = beamit::net::auth_proof(key, "server", server_nonce_, *client_nonce);
     send({{"type", "authenticated"}, {"server_proof", bytes_text(server_proof)},
@@ -535,6 +562,40 @@ void ControlSession::stop_stream(const json::object& message, const RequestId& i
     end_stream(find_stream(message), "requested", {}, id);
 }
 
+HostStatus ControlSession::local_status() const {
+    HostStatus status;
+    if (closing_ || !authenticated_) return status;
+    status.client = remote_;
+    for (const auto& [id, entry] : streams_) {
+        if (!entry->connected) continue;
+        const auto* title = entry->source.if_contains("title");
+        status.streams.push_back({id, title && title->is_string() ? std::string(title->as_string()) : "Desktop",
+                                  entry->local_statistics, entry->stats_sampled_at});
+    }
+    return status;
+}
+
+void ControlSession::disconnect_stream(const std::string& id) {
+    const auto found = streams_.find(id);
+    if (found == streams_.end()) return; // It may have ended while the tray menu was open.
+    const auto entry = found->second;
+    end_stream(entry, "requested", "Disconnected locally from the BeamIt tray");
+}
+
+void ControlSession::upgrade_input(const std::shared_ptr<input::ElevatedInput>& helper) {
+    std::vector<std::pair<std::shared_ptr<StreamEntry>, std::unique_ptr<input::StreamInput>>> replacements;
+    for (const auto& [id, entry] : streams_) {
+        replacements.emplace_back(entry, entry->input->with_elevated_input(helper));
+    }
+    // Prepare every helper stream before changing any active input route.
+    for (const auto& [entry, replacement] : replacements) entry->input->release_all();
+    for (auto& [entry, replacement] : replacements) {
+        entry->input = std::move(replacement);
+        entry->focus_error_sent = false;
+        entry->input_error_sent = false;
+    }
+}
+
 void ControlSession::request_key_frame(const json::object& message, const RequestId&) {
     find_stream(message)->pipeline->request_key_frame();
 }
@@ -564,6 +625,7 @@ void ControlSession::end_stream(const std::shared_ptr<StreamEntry>& entry, std::
     json::object stopped{{"type", "stream_stopped"}, {"stream_id", entry->id}, {"reason", reason}};
     if (!message.empty()) stopped["message"] = message;
     reply(id, std::move(stopped));
+    server_.publish_status();
     spdlog::info("Stream {} stopped: {}{}{}", entry->id, reason, message.empty() ? "" : " - ", message);
 }
 
@@ -610,6 +672,7 @@ void ControlSession::attach(const std::shared_ptr<StreamEntry>& entry, std::shar
         spdlog::warn("Could not prevent screensaver/display timeout for stream {}", entry->id);
     }
     entry->connected = true;
+    server_.publish_status();
     asio::co_spawn(stream_socket->ws->get_executor(), StreamSocket::read_loop(stream_socket), asio::detached);
     entry->pipeline->activate();
     spdlog::info("Stream {} connected", entry->id);

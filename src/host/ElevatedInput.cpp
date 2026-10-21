@@ -114,7 +114,7 @@ void finish(HANDLE pipe, OVERLAPPED& operation, DWORD timeout, DWORD expected, b
     if (pending && WaitForSingleObject(operation.hEvent, timeout) != WAIT_OBJECT_0) {
         CancelIoEx(pipe, &operation);
         GetOverlappedResult(pipe, &operation, &transferred, TRUE);
-        fail("IPC deadline exceeded; stopping host (no fallback)", ERROR_TIMEOUT);
+        fail("IPC deadline exceeded", ERROR_TIMEOUT);
     }
     if (!GetOverlappedResult(pipe, &operation, &transferred, FALSE))
         fail("invalid or disconnected pipe", GetLastError());
@@ -175,6 +175,7 @@ ElevatedInput::ElevatedInput() : state_(std::make_unique<State>()) {
 
     try {
         const auto helper = image_path(GetCurrentProcess()).parent_path() / L"BeamItInputHelper.exe";
+        if (!std::filesystem::is_regular_file(helper)) fail("BeamItInputHelper.exe was not found beside BeamIt.exe");
         const auto arguments = L"\"" + name + L"\" " + std::to_wstring(GetCurrentProcessId()) + L" " +
                                std::to_wstring(creation_time(GetCurrentProcess()));
         SHELLEXECUTEINFOW launch{sizeof(launch)};
@@ -185,8 +186,8 @@ ElevatedInput::ElevatedInput() : state_(std::make_unique<State>()) {
         launch.nShow = SW_HIDE;
         spdlog::info("Elevated input requested: approving UAC starts only BeamItInputHelper.exe");
         const ShellApartment apartment;
-        if (!ShellExecuteExW(&launch)) fail("UAC denied or helper launch failed; stopping host", GetLastError());
-        if (!launch.hProcess) fail("helper launch returned no process handle; stopping host");
+        if (!ShellExecuteExW(&launch)) fail("UAC denied or helper launch failed", GetLastError());
+        if (!launch.hProcess) fail("helper launch returned no process handle");
         state_->process = launch.hProcess;
         finish(state_->pipe, connection, 15000, 0, true);
         ULONG peer{};
@@ -228,7 +229,7 @@ bool ElevatedInput::healthy() const {
 
 ipc::Response ElevatedInput::transact(const ipc::Request& request) {
     try {
-        if (!healthy() || !ipc::valid(request)) fail("helper unavailable or invalid request; stopping host");
+        if (!healthy() || !ipc::valid(request)) fail("helper unavailable or invalid request");
         // One total 200 ms budget, rather than a separate timeout for each half of the exchange.
         const auto started = GetTickCount64();
         transfer(state_->pipe, const_cast<ipc::Request*>(&request), sizeof(request), true, ipc::request_timeout_ms);

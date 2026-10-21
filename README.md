@@ -166,7 +166,39 @@ The shared input texture permits simultaneous-access interop for D3D11, and conv
 
 ## Secure WebSocket host
 
+For double-click startup, run `.\scripts\Install-BeamItCert.ps1` once as the Windows user who will run BeamIt
+(no administrator rights required), then double-click `BeamIt.exe`. The default endpoint is `0.0.0.0:17389`.
+If no usable certificate is installed, a message box explains how to install it and the host exits without listening.
+Without `--password-file`, a cryptographically random **36-character** password is shown in the native
+**Change connection password** dialog before the listener opens. Copy it to the client, edit it or generate another;
+Cancel exits without starting the host. This password is memory-only and a new one is generated on each launch.
+
+Double-click launches run in the notification area instead of leaving a console open. The BeamIt tray menu offers
+**Exit**, **Change connection password...**, and a disconnect action for each connected stream, labeled with its
+window title (or Desktop) and a short stream ID. Stopping a stream releases held input and notifies its client via
+the existing `stream_stopped` message. Password changes ask whether to disconnect the current client and all its
+streams **only when a client is connected**; choosing No keeps that session authorized. Changes are never written
+back to a password file. Exit stops capture/encoding and releases held input through the normal host shutdown path.
+The tray icon is always present while serving, including when launched from a terminal.
+Terminal launches also retain console output and Ctrl+C operation.
+The build copies `Install-BeamItCert.ps1` beside `BeamIt.exe` for deployment.
+
+**Statistics...** opens a nonmodal, copyable statistics window without requiring a console. It shows the listen
+endpoint, TLS fingerprint, connected client, and per-stream codec/encoder, sampling, resolution, configured rate,
+captured/encoded/sent/key-frame counts, dropped frames, queue/recovery counts, measured throughput, encoder load,
+and average/maximum capture/encode/send/write/host latency. It reuses the existing 10-second `stream_stats` samples
+without resetting counters again or changing the wire cadence. The view refreshes every second and shows sample
+age, waiting-for-first-sample, and no-stream states; closing it leaves the host running.
+
+If input is not elevated, BeamIt logs a warning, requests a Windows tray warning balloon, and keeps a warning in
+the tray menu and statistics window: administrator windows may reject remote input. Choose **Elevate input...**
+to try the separate UAC-elevated helper, or start with `--elevate-input`; neither elevates the networking/capture host. Status reflects the
+helper when enabled, or the host's actual process integrity when input runs locally. An elevation-query failure is
+reported as unknown rather than claiming input is elevated. Windows notification settings may suppress balloons;
+the persistent tray-menu/statistics warning remains available.
+
 ```powershell
+.\scripts\Install-BeamItCert.ps1
 # Store a long random password in a file only you can read (never on the command line):
 Set-Content -NoNewline -Path $env:USERPROFILE\beamit.pw -Value '<long random password>'
 .\BeamIt.exe --port 17389 --password-file $env:USERPROFILE\beamit.pw
@@ -174,7 +206,7 @@ Set-Content -NoNewline -Path $env:USERPROFILE\beamit.pw -Value '<long random pas
 # Optional: --elevate-input (UAC for the separate input helper, never the host)
 ```
 
-`--port` and `--password-file` are required; there are no other modes. Everything about a stream is chosen by the client in `start_stream`: the source, the capture API for desktop sources (`"capture": "dxgi"` default or `"wgc"`; windows always use WGC), and codec, frame rate and bitrate (defaults H.264, 60 FPS, 48,000 kbps). The encoder backend is always automatic. Different instances must use distinct endpoints. If Windows Firewall blocks access, allow the executable/port only on the intended private LAN; BeamIt does not alter firewall rules.
+`--port` defaults to 17389; `--password-file` is optional. There are no other transport modes. Everything about a stream is chosen by the client in `start_stream`: the source, the capture API for desktop sources (`"capture": "dxgi"` default or `"wgc"`; windows always use WGC), and codec, frame rate and bitrate (defaults H.264, 60 FPS, 48,000 kbps). The encoder backend is always automatic. Different instances must use distinct endpoints. If Windows Firewall blocks access, allow the executable/port only on the intended private LAN; BeamIt does not alter firewall rules.
 
 Or use the launcher script, which prepares everything per instance and starts the host:
 
@@ -200,9 +232,30 @@ The wire protocol is specified in [`PROTOCOL.md`](PROTOCOL.md); clients are writ
 - Every top-level window is reported with `window_opened`/`window_changed`/`window_closed` (pid, image name, title, role, owner, rect, state; §5.12); see *Window events* below. `get_window_icon` returns a window's icon as a base64 PNG of at most 256×256 (§5.13); see *Window icons* below.
 - The host clipboard can be read (`get_clipboard`) and written (`set_clipboard`) as text, HTML and PNG, and changes are announced with `clipboard_changed` (§5.11); see *Clipboard* below.
 
-**Security.** TLS comes from Windows Schannel via [boost-wintls](https://github.com/laudrup/boost-wintls) (header-only, pinned SHA-256). Without `--tls-cert`/`--tls-key`, BeamIt creates (and reuses) a self-signed RSA-2048 certificate `CN=BeamIt host` in `CurrentUser\My`, valid for two years and regenerated when near expiry; its SHA-256 fingerprint is logged at startup. Browsers must accept it once by opening `https://host:port/`; native clients should pin the fingerprint, because password authentication is not bound to the TLS channel and an unpinned, accepted certificate allows an active relay. `--tls-key` must be an unencrypted RSA PKCS#8 PEM (`BEGIN PRIVATE KEY`).
+**Security.** TLS comes from Windows Schannel via [boost-wintls](https://github.com/laudrup/boost-wintls) (header-only, pinned SHA-256). Without `--tls-cert`/`--tls-key`, BeamIt loads the self-signed RSA-2048 certificate `CN=BeamIt host` installed in `CurrentUser\My` by `Install-BeamItCert.ps1`. The installer reuses a usable certificate or creates a two-year certificate with a non-exportable private key; rerun it when the certificate is within seven days of expiry. The host no longer silently creates or renews certificates. The installer prints its SHA-256 fingerprint, and console launches log it at startup. Browsers must accept it once by opening `https://host:port/`; native clients should pin the fingerprint, because password authentication is not bound to the TLS channel and an unpinned, accepted certificate allows an active relay. `--tls-key` must be an unencrypted RSA PKCS#8 PEM (`BEGIN PRIVATE KEY`).
 
 The password is read from `--password-file` (trailing CR/LF removed), turned into a key with PBKDF2-HMAC-SHA256 (600,000 iterations, random per-run salt, Windows CNG), then wiped; it is never logged or sent. Client and host prove knowledge of the key with HMAC-SHA256 over both random nonces (mutual authentication). A failed proof closes the socket after one second. Only one authenticated control session exists; a newer one supersedes it (close code 4001). Stream tokens are random, single-use and expire after 10 seconds. WebSocket upgrades with a foreign `Origin` are rejected.
+
+The optional native UI runs on a separate thread from WSS/capture/encoding; a locked local command queue and status
+snapshot are serviced every 100 ms on the network thread. Password derivation runs on the UI thread, not the
+latency-critical network thread. Rotation replaces the salt and verifier and invalidates outstanding authentication
+challenges; clients must reconnect to obtain a new `hello`. There is no new wire message or protocol version change.
+Native Win32 dialogs/notification-area APIs avoid a GUI framework dependency; console launches retain terminal
+logging alongside the tray controls. Automatic certificate generation and silently persisting
+password changes were rejected in favor of explicit installation and memory-only credentials.
+
+For regression checks, build `BeamIt`/`BeamItTests` with CLion's configured Windows CMake and run
+`[host-control],[protocol],[input]` in the `BeamItTests` configuration. For interactive checks, launch without
+arguments, cancel/accept the generated password dialog, connect a client and stream, disconnect it from the tray,
+then change the password with both Yes and No on the connected-client prompt. Confirm old-password attempts
+and pre-rotation challenges fail, preserved sessions still respond, and Exit releases streams and closes the port.
+Open Statistics with no client, then with a stream running for at least 10 seconds; verify samples update and
+closing/reopening the window does not interrupt streaming. Check the non-elevated warning, and use `--elevate-input`
+with local UAC approval to check the elevated status.
+Choose Elevate input while streaming and deny UAC: a failure message should appear without disconnecting the
+client or stopping video. Retry and approve UAC: the status should become elevated and existing streams should
+use the helper. A missing helper executable should also report failure without stopping the host.
+Use nonexistent explicit `--tls-cert`/`--tls-key` paths to check the certificate guidance without deleting certificates.
 
 Tested from a stdlib Python WSS client on the development machine: authentication (correct and wrong password), `list_windows`, Teams application and desktop streams (NVENC H.264 4:4:4; the payload decodes with ffprobe as High 4:4:4 Predictive), forced key frames, `stop_stream`, token reuse and expiry, foreign origin and session supersede. Protocol helpers (base64url, PBKDF2/HMAC vectors, authentication proofs, frame header, SPS/codec-string parsing) are covered by the `[protocol]` Catch2 tests.
 
@@ -259,7 +312,18 @@ Failed `SendInput` calls, including held-input cleanup, produce a `Remote contro
 
 #### Optional elevated input
 
-`--elevate-input` launches the adjacent **`BeamItInputHelper.exe`** with `runas` once at startup, before opening the listener. Approve UAC locally. Only the helper is elevated: TLS, authentication, networking, clipboard, capture and encoding remain in the original host process. Without the switch no helper or UAC prompt is used. Deploy both executables together in a trusted directory; do not approve an untrusted/replaced helper. All instance password holders can then control administrator windows on the normal interactive desktop, not just the selected application's privilege level. There is no service, secure-desktop access or UAC bypass.
+`--elevate-input` launches the adjacent **`BeamItInputHelper.exe`** with `runas` once at startup, before opening the listener. Approve UAC locally. Only the helper is elevated: TLS, authentication, networking, clipboard, capture and encoding remain in the original host process. Without the switch no helper or UAC prompt is used unless the operator chooses **Elevate input...** from the tray. Deploy both executables together in a trusted directory; do not approve an untrusted/replaced helper. All instance password holders can then control administrator windows on the normal interactive desktop, not just the selected application's privilege level. There is no service, secure-desktop access or UAC bypass.
+
+The tray action launches/verifies the helper on a worker thread so UAC does not block WSS or video delivery.
+The helper uses the Windows GUI subsystem so it never allocates a console, including when launched through UAC.
+Duplicate attempts are disabled while it is pending; approve or dismiss any outstanding UAC prompt before
+exiting. After verification, the network thread prepares an input route for every current stream, releases held
+keys/buttons, preserves each stream's mouse mode and switches all routes to the helper. Capture/encoding and
+stream IDs are unchanged; new streams also use the helper. Cancellation, launch/verification failures or a
+failure preparing the new routes leave the host running with the previous input handler and report the error
+in a local message box and log. This graceful optional activation differs from explicit `--elevate-input`, which
+still fails startup if it cannot establish the helper. Once installed, helper failure still stops the host
+(no silent fallback), preserving held-input cleanup and the existing fail-closed policy.
 
 The policy is **fail closed, stop the host**: a denied/cancelled UAC prompt, missing/invalid helper, wrong peer/session, failed IPC, a hung input operation, or unexpected helper exit is fatal. There is no normal-input fallback, reconnect or second UAC prompt. Successful RPCs use one local round trip; each has a total 200 ms I/O deadline (not a latency guarantee), and helper-process health is checked every 50 ms while serving. Startup connection establishment allows 15 seconds after UAC returns. Normal Ctrl+C shutdown closes the helper channel without reporting a helper crash.
 

@@ -96,14 +96,35 @@ macOS implementation was changed for the Windows work.
 
 - Portable `FrameProtocol.cpp` and its tests compiled and passed on macOS
   with Apple Clang 21, C++2c, strict warnings, AddressSanitizer and UBSan.
+- On Windows 11, CLion's IDE-managed CMake 4.3.1, Visual Studio 2022
+  Professional 17.14.42/MSVC 19.44, SDK 10.0.28000.0 targeting 10.0.26100,
+  and the Windows App Runtime 1.7 were found.
+- The Windows core and frame protocol tests build and pass in Debug and
+  Release. MSVC's C++26 preview mode is selected with `/std:c++latest`;
+  CMake 4.3.1 rejected `CXX_STANDARD 26` for the installed v143 compiler.
+- NuGet packages restored from nuget.org when `RestoreSources` was supplied
+  for that build; the Windows user's NuGet configuration had no sources.
+- The Debug WinUI executable compiled, linked, and launched. The user reports
+  passing surface, menus/fullscreen, tray, and popup checks. The fixed-size
+  blue popup appears over the main window's buttons.
+- Decoder `--list` found the Microsoft H.264 software MFT and no HEVC
+  candidates. No local Annex B fixtures were found, so no decode was tested.
 - Project/manifest XML parsed; referenced source files existed.
 - New files were checked for whitespace/newline issues; `git diff --check`
   passed for tracked changes.
 
 ### What has NOT been checked or implemented
 
-- No Windows restore, compile, link, app launch, GPU probe or interactive test.
-- NuGet package/toolset/bootstrap/API compatibility remains unverified.
+- The full build script still fails after Debug app compile/link because
+  Visual Studio's `AppxPackage` PRI task assembly
+  `Microsoft.Build.Packaging.Pri.Tasks.dll` is missing. The UWP support
+  component alone did not add it; the WinUI workload/C++ UWP tools are the
+  pending environment prerequisite.
+- Release WinUI compile/link and the complete Debug/Release script runs have
+  not passed. No decoder fixtures were available for positive or negative
+  Media Foundation decode checks.
+- GPU output mode, unsupported profiles, App SDK runtime behavior beyond
+  launch, and Teams streaming remain unverified.
 - The diagnostic does not constitute the production decoder.
 - The blue surfaces do not render remote content.
 - The popup is a fixed-size local prototype, not remote geometry coordination.
@@ -413,7 +434,7 @@ Recreate session-local tasks if necessary; markdown is the portable source.
 
 | ID | Status at handoff | Prerequisites |
 |---|---|---|
-| `win-scaffold` | Blocked on deferred Windows validation | None |
+| `win-scaffold` | In progress; blocked on missing Visual Studio PRI tooling | None |
 | `win-session` | Pending | `win-scaffold` |
 | `win-shell` | Pending | `win-session` |
 | `win-media` | Pending | `win-session` and scaffold media gate |
@@ -423,11 +444,16 @@ Recreate session-local tasks if necessary; markdown is the portable source.
 | `win-options` | Pending | `win-popups`, `win-utilities` |
 | `win-validation` | Pending | `win-options` |
 
-On the target, change `win-scaffold` to in progress once access is established.
-Record actual commands/results and narrowly scoped unresolved failures in this
-file or the active session artifact. Do not mark the client complete until
-native Windows builds, automated checks, and required interactive/hardware
-outcomes are verified. List unverified Teams/GPU cases explicitly.
+Keep `win-scaffold` active until both configurations complete the full build,
+tests, and required interactive/media gates. The approved next step is to add
+the Visual Studio Universal workload and C++ UWP support from an elevated
+native Windows PowerShell session; the WSL-instigated installer did not apply
+the workload. Then rerun `scripts/Build-WindowsClient.ps1` in Debug and
+Release, supplying `RestoreSources=https://api.nuget.org/v3/index.json` for
+the restore if the machine still has no configured NuGet source. Do not mark
+the client complete until native Windows builds, automated checks, and
+required interactive/hardware outcomes are verified. List unverified
+Teams/GPU cases explicitly.
 
 Do not commit unless requested, do not revert existing work, and do not
 reintroduce removed recorder/plaintext transports or host CLI modes.

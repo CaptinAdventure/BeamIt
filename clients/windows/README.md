@@ -57,9 +57,10 @@ remote geometry/DPI mapping.
 ## Windows prerequisites
 
 - Windows 11 x64.
-- Visual Studio 2022 with the v143 C++ desktop toolset, WinUI/C++ development
-  components, and Windows SDK `10.0.26100.0`. Use a toolset with the required
-  C++26 preview support.
+- Visual Studio 2022 with the v143 C++ desktop toolset, the WinUI application
+  development workload (`Microsoft.VisualStudio.Workload.Universal`), C++
+  UWP tools (`Microsoft.VisualStudio.ComponentGroup.UWP.VC`), and Windows SDK
+  `10.0.26100.0`. Use a toolset with the required C++26 preview support.
 - An IDE-managed CMake 4.3 or newer. The build script requires its explicit
   executable path; it does not pick an arbitrary `cmake` from `PATH`.
 - The x64 Windows App Runtime for Windows App SDK 1.7.
@@ -67,10 +68,12 @@ remote geometry/DPI mapping.
   `Microsoft.WindowsAppSDK` to `1.7.250606001` and
   `Microsoft.Windows.CppWinRT` to `2.0.240111.5`.
 
-The selected NuGet/toolset combination still needs its first Windows restore
-and build. No package installation or Windows build was attempted on macOS.
-The packaged/MSIX deployment path and ARM64 are not part of this scaffold.
-Run unelevated; the application manifest requests `asInvoker`.
+NuGet restore and Debug compilation/linking have been exercised on Windows.
+The full MSBuild target remains unverified until the Visual Studio
+`AppxPackage` PRI tasks are available; install the WinUI/UWP components above.
+If no NuGet feeds are configured, provide nuget.org as `RestoreSources` for
+the build. The packaged/MSIX deployment path and ARM64 are not part of this
+scaffold. Run unelevated; the application manifest requests `asInvoker`.
 
 ## Build
 

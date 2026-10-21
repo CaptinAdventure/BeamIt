@@ -298,6 +298,12 @@ StreamInput::StreamInput(HWND window, std::shared_ptr<ElevatedInput> elevated)
     if (window_ != nullptr) GetWindowThreadProcessId(window_, &process_id_);
 }
 
+std::unique_ptr<StreamInput> StreamInput::with_elevated_input(std::shared_ptr<ElevatedInput> helper) const {
+    auto result = std::make_unique<StreamInput>(window_, std::move(helper));
+    result->mouse_mode = mouse_mode;
+    return result;
+}
+
 StreamInput::~StreamInput() {
     if (elevated_) elevated_->destroy(remote_stream_);
     else release_all();

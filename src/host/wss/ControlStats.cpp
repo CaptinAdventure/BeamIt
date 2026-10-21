@@ -1,7 +1,9 @@
 // Periodic `stream_stats` reports (PROTOCOL.md §5.15).
 #include "host/wss/ControlSession.hpp"
+#include "media/BitstreamInfo.hpp"
 
 #include <cmath>
+#include <spdlog/fmt/fmt.h>
 
 namespace beamit::host::wss {
 namespace {
@@ -20,6 +22,12 @@ json::value duration_json(const DurationStats& stats) {
 std::uint64_t kbps(std::uint64_t bytes, Clock::duration elapsed) {
     const auto seconds = std::chrono::duration<double>(elapsed).count();
     return seconds > 0 ? static_cast<std::uint64_t>(std::llround(static_cast<double>(bytes) * 8 / 1000 / seconds)) : 0;
+}
+
+std::string duration_text(const DurationStats& stats) {
+    if (!stats.count) return "n/a";
+    return fmt::format("{:.3f} / {:.3f}", milliseconds(stats.total / static_cast<Clock::duration::rep>(stats.count)),
+                       milliseconds(stats.max));
 }
 
 } // namespace
@@ -47,6 +55,29 @@ void ControlSession::send_stream_stats() {
         const auto pipeline = stream->pipeline->take_stats();
         const auto network = stream->socket ? stream->socket->take_stats() : NetworkStats{};
         const auto elapsed_s = std::chrono::duration<double>(pipeline.elapsed).count();
+        stream->local_statistics = fmt::format(
+            "{} - {} {}-bit {} via {}\r\n"
+            "{}x{} at {} FPS; target {} kbps, peak {} kbps; generation {}\r\n"
+            "Sample interval: {:.1f} s\r\n"
+            "Frames: captured {}, encoded {}, sent {}, key frames {}\r\n"
+            "Dropped: encoder {}, network {}; recoveries {}; queued {}\r\n"
+            "Throughput: encoded {} kbps, sent {} kbps; encoder load {:.1f}%\r\n"
+            "Timing (average / maximum, ms):\r\n"
+            "  Capture: {}    Encode: {}\r\n"
+            "  Send: {}    Write: {}    Host latency: {}",
+            stream->video.codec == media::VideoCodec::H264 ? "H.264" : "HEVC",
+            media::chroma_format_name(stream->video.chroma_format_idc), stream->video.bit_depth,
+            media::rate_control_name(stream->video.rate_control), stream->video.encoder,
+            stream->video.width, stream->video.height, stream->video.frame_rate,
+            stream->video.bitrate_kbps, stream->video.max_bitrate_kbps, stream->video.generation,
+            elapsed_s, pipeline.frames_captured, pipeline.frames_encoded, network.frames_sent, pipeline.key_frames,
+            pipeline.frames_skipped, network.frames_dropped, network.recoveries,
+            stream->socket ? stream->socket->queued() : 0,
+            kbps(pipeline.encoded_bytes, pipeline.elapsed), kbps(network.bytes_sent, pipeline.elapsed),
+            elapsed_s > 0 ? std::chrono::duration<double>(pipeline.busy).count() / elapsed_s * 100.0 : 0.0,
+            duration_text(pipeline.capture), duration_text(pipeline.encode), duration_text(network.send),
+            duration_text(network.write), duration_text(network.host_latency));
+        stream->stats_sampled_at = now;
         streams.push_back(json::object{
             {"stream_id", id},
             {"connected", static_cast<bool>(stream->socket)},
@@ -81,6 +112,7 @@ void ControlSession::send_stream_stats() {
           {"host_time_us", protocol::host_time_us(now)},
           {"interval_ms", milliseconds(now - std::exchange(stats_since_, now))},
           {"streams", std::move(streams)}});
+    server_.publish_status();
 }
 
 } // namespace beamit::host::wss

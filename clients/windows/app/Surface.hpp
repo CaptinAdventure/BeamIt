@@ -3,7 +3,12 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_3.h>
+#ifdef GetCurrentTime
+#undef GetCurrentTime
+#endif
 #include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
 
 namespace beamit::client {

@@ -14,6 +14,7 @@
 namespace beamit::host {
 
 namespace input { class ElevatedInput; }
+class HostControl;
 enum class CaptureBackend { Wgc, Dxgi };
 
 struct HostServerOptions {
@@ -29,11 +30,12 @@ struct HostServerOptions {
     std::uint32_t bitrate_kbps{48000};
     bool elevate_input{};
     std::shared_ptr<input::ElevatedInput> elevated_input;
+    std::shared_ptr<HostControl> control;
     std::function<std::unique_ptr<capture::Capturer>(CaptureBackend)> make_capturer;
     std::function<std::unique_ptr<media::Encoder>(media::VideoCodec)> make_encoder;
 };
 
-// Serves PROTOCOL.md on one TLS port until Ctrl+C.
+// Serves PROTOCOL.md on one TLS port until Ctrl+C or a local Exit command.
 void run_host_server(HostServerOptions options);
 
 } // namespace beamit::host

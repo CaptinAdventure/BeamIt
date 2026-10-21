@@ -6,7 +6,6 @@
 #include <wincrypt.h>
 
 #include <spdlog/fmt/fmt.h>
-#include <spdlog/spdlog.h>
 
 #include <array>
 #include <fstream>
@@ -18,8 +17,6 @@ namespace beamit::host {
 namespace {
 
 constexpr wchar_t friendly_name[] = L"BeamIt self-signed TLS";
-// wintls only accepts CryptoAPI private keys, so the key lives in a legacy RSA/AES CSP container.
-constexpr wchar_t key_container[] = L"BeamIt-TLS-SelfSigned";
 constexpr char imported_key_container[] = "BeamIt-TLS-Imported";
 
 [[noreturn]] void fail(const char* operation) {
@@ -62,6 +59,7 @@ bool usable(const CERT_CONTEXT* certificate) {
     FILETIME soon{};
     ULARGE_INTEGER now{};
     GetSystemTimeAsFileTime(&soon);
+    if (CompareFileTime(&certificate->pCertInfo->NotBefore, &soon) > 0) return false;
     now.LowPart = soon.dwLowDateTime;
     now.HighPart = soon.dwHighDateTime;
     now.QuadPart += 7ULL * 24 * 3600 * 10'000'000;
@@ -77,100 +75,6 @@ bool usable(const CERT_CONTEXT* certificate) {
     }
     if (free_key) CryptReleaseContext(key, 0);
     return true;
-}
-
-std::vector<BYTE> encode(LPCSTR type, const void* value) {
-    DWORD size = 0;
-    if (!CryptEncodeObjectEx(X509_ASN_ENCODING, type, value, 0, nullptr, nullptr, &size)) fail("CryptEncodeObjectEx");
-    std::vector<BYTE> bytes(size);
-    if (!CryptEncodeObjectEx(X509_ASN_ENCODING, type, value, 0, nullptr, bytes.data(), &size)) {
-        fail("CryptEncodeObjectEx");
-    }
-    bytes.resize(size);
-    return bytes;
-}
-
-wintls::cert_context_ptr create_self_signed(HCERTSTORE store) {
-    HCRYPTPROV provider{};
-    CryptAcquireContextW(&provider, key_container, MS_ENH_RSA_AES_PROV_W, PROV_RSA_AES, CRYPT_DELETEKEYSET);
-    if (!CryptAcquireContextW(&provider, key_container, MS_ENH_RSA_AES_PROV_W, PROV_RSA_AES, CRYPT_NEWKEYSET)) {
-        fail("Create TLS key container");
-    }
-    HCRYPTKEY key{};
-    const bool generated = CryptGenKey(provider, AT_KEYEXCHANGE, (2048U << 16), &key);
-    if (key) CryptDestroyKey(key);
-    if (!generated) {
-        CryptReleaseContext(provider, 0);
-        fail("Generate RSA-2048 TLS key");
-    }
-
-    wchar_t host[256]{};
-    DWORD host_size = static_cast<DWORD>(std::size(host));
-    if (!GetComputerNameExW(ComputerNameDnsHostname, host, &host_size)) host[0] = L'\0';
-    std::vector<CERT_ALT_NAME_ENTRY> names;
-    const auto add_name = [&](wchar_t* dns_name) {
-        CERT_ALT_NAME_ENTRY entry{};
-        entry.dwAltNameChoice = CERT_ALT_NAME_DNS_NAME;
-        entry.pwszDNSName = dns_name;
-        names.push_back(entry);
-    };
-    add_name(const_cast<wchar_t*>(L"localhost"));
-    if (host[0] != L'\0') add_name(host);
-    CERT_ALT_NAME_INFO alt_names{static_cast<DWORD>(names.size()), names.data()};
-    auto alt_names_encoded = encode(X509_ALTERNATE_NAME, &alt_names);
-    LPSTR usages[] = {const_cast<LPSTR>(szOID_PKIX_KP_SERVER_AUTH)};
-    CERT_ENHKEY_USAGE usage{1, usages};
-    auto usage_encoded = encode(X509_ENHANCED_KEY_USAGE, &usage);
-    std::array<CERT_EXTENSION, 2> extension_list{{
-        {const_cast<LPSTR>(szOID_SUBJECT_ALT_NAME2), FALSE,
-         {static_cast<DWORD>(alt_names_encoded.size()), alt_names_encoded.data()}},
-        {const_cast<LPSTR>(szOID_ENHANCED_KEY_USAGE), FALSE,
-         {static_cast<DWORD>(usage_encoded.size()), usage_encoded.data()}},
-    }};
-    CERT_EXTENSIONS extensions{static_cast<DWORD>(extension_list.size()), extension_list.data()};
-
-    BYTE subject_bytes[256]{};
-    DWORD subject_size = sizeof(subject_bytes);
-    if (!CertStrToNameW(X509_ASN_ENCODING, L"CN=BeamIt host", CERT_X500_NAME_STR, nullptr, subject_bytes,
-                        &subject_size, nullptr)) {
-        CryptReleaseContext(provider, 0);
-        fail("Encode certificate subject");
-    }
-    CERT_NAME_BLOB subject{subject_size, subject_bytes};
-    CRYPT_KEY_PROV_INFO key_info{const_cast<wchar_t*>(key_container), const_cast<wchar_t*>(MS_ENH_RSA_AES_PROV_W),
-                                 PROV_RSA_AES, 0, 0, nullptr, AT_KEYEXCHANGE};
-    CRYPT_ALGORITHM_IDENTIFIER signature{const_cast<LPSTR>(szOID_RSA_SHA256RSA), {}};
-    SYSTEMTIME start{};
-    SYSTEMTIME end{};
-    GetSystemTime(&start);
-    FILETIME start_file{};
-    SystemTimeToFileTime(&start, &start_file);
-    ULARGE_INTEGER time{};
-    time.LowPart = start_file.dwLowDateTime;
-    time.HighPart = start_file.dwHighDateTime;
-    time.QuadPart -= 3600ULL * 10'000'000;
-    start_file.dwLowDateTime = time.LowPart;
-    start_file.dwHighDateTime = time.HighPart;
-    FileTimeToSystemTime(&start_file, &start);
-    time.QuadPart += 2ULL * 365 * 24 * 3600 * 10'000'000;
-    FILETIME end_file{time.LowPart, time.HighPart};
-    FileTimeToSystemTime(&end_file, &end);
-
-    const CERT_CONTEXT* created = CertCreateSelfSignCertificate(provider, &subject, 0, &key_info, &signature,
-                                                                &start, &end, &extensions);
-    CryptReleaseContext(provider, 0);
-    if (!created) fail("CertCreateSelfSignCertificate");
-    wintls::cert_context_ptr certificate{created};
-    CRYPT_DATA_BLOB name{static_cast<DWORD>(sizeof(friendly_name)),
-                         reinterpret_cast<BYTE*>(const_cast<wchar_t*>(friendly_name))};
-    if (!CertSetCertificateContextProperty(certificate.get(), CERT_FRIENDLY_NAME_PROP_ID, 0, &name)) {
-        fail("Set certificate friendly name");
-    }
-    const CERT_CONTEXT* stored{};
-    if (!CertAddCertificateContextToStore(store, certificate.get(), CERT_STORE_ADD_REPLACE_EXISTING, &stored)) {
-        fail("Store self-signed certificate");
-    }
-    return wintls::cert_context_ptr{stored};
 }
 
 } // namespace
@@ -191,7 +95,7 @@ TlsIdentity load_pem_identity(const std::filesystem::path& certificate_path,
     return identity;
 }
 
-TlsIdentity self_signed_identity() {
+TlsIdentity installed_identity() {
     auto store = open_user_store();
     const CERT_CONTEXT* candidate = nullptr;
     while ((candidate = CertEnumCertificatesInStore(store.get(), candidate)) != nullptr) {
@@ -209,16 +113,8 @@ TlsIdentity self_signed_identity() {
             identity.certificate = std::move(certificate);
             return identity;
         }
-        // Expired or keyless; remove it and create a new one below.
-        const CERT_CONTEXT* stale = CertDuplicateCertificateContext(candidate);
-        CertDeleteCertificateFromStore(stale);
     }
-    spdlog::info("Creating a new self-signed TLS certificate (CN=BeamIt host, RSA-2048, 2 years)");
-    auto certificate = create_self_signed(store.get());
-    TlsIdentity identity{.sha256_fingerprint = fingerprint(certificate.get()),
-                         .description = "new persistent self-signed certificate (CurrentUser\\My)"};
-    identity.certificate = std::move(certificate);
-    return identity;
+    throw MissingTlsCertificate("No usable BeamIt TLS certificate was found in CurrentUser\\My.");
 }
 
 } // namespace beamit::host

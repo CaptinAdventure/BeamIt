@@ -56,6 +56,11 @@ client                                   host
 * The host is protected by one shared password. The password itself never
   crosses the wire (see §4). Authentication is required before any other
   signaling command is accepted.
+  Local password rotation changes the salt/verifier and invalidates pending
+  authentication challenges (reconnect for a new `hello`). The operator may
+  keep an already-authenticated session authorized or disconnect it with
+  close code `1008`. A local per-stream disconnect uses `stream_stopped`
+  with reason `requested`; no new client-side command is required.
 * Only one authenticated signaling session exists at a time. A newer
   successful authentication **supersedes** the older one: all of the older
   session's streams are stopped and its socket is closed with code `4001`.

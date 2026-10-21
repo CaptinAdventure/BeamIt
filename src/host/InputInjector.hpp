@@ -122,6 +122,7 @@ public:
     // Releases every key and button this stream holds down.
     void release_all();
     [[nodiscard]] ModifierState modifiers() const;
+    [[nodiscard]] std::unique_ptr<StreamInput> with_elevated_input(std::shared_ptr<ElevatedInput> helper) const;
     // Helper watchdog only: revoke further injections and release held state, even during a hung focus call.
     void cancel();
 

@@ -5,6 +5,7 @@
 #include <microsoft.ui.xaml.window.h>
 #include <shellapi.h>
 #include <winrt/Microsoft.UI.Windowing.h>
+#include <winrt/Microsoft.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Microsoft.UI.Xaml.Input.h>
 #include <winrt/Windows.System.h>
 #include <algorithm>
