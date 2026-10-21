@@ -1,18 +1,10 @@
 import Foundation
 
-struct BeamItWindow: Decodable, Hashable, Identifiable {
-    let hwnd: String
-    let pid: Int
-    let title: String
-    let primary: Bool
-
-    var id: String { hwnd }
-}
-
 struct BeamItApplication: Identifiable {
     let pid: Int
     let title: String
-    let windows: [BeamItWindow]
+    let imageName: String
+    let windows: [BeamItHostWindow]
 
     var id: Int { pid }
 }

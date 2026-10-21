@@ -7,12 +7,11 @@ struct ContentView: View {
     @State private var certificateFingerprint = UserDefaults.standard.string(forKey: "lastSuccessfulCertificateFingerprint") ?? ""
     @State private var trustAnyCertificate = UserDefaults.standard.bool(forKey: "lastSuccessfulTrustAnyCertificate")
     @State private var connection: BeamItConnection?
-    @State private var applications: [BeamItApplication] = []
+    @AppStorage("applicationConnectMode") private var applicationMode = BeamItApplicationMode.allWindows
     @State private var selectedSource: BeamItSource?
     @State private var isConnecting = false
-    @State private var isStartingStream = false
     @State private var connectionError: String?
-    @State private var streamWindows: [String: BeamItStreamWindowController] = [:]
+    private var streams: BeamItStreamManager { BeamItStreamManager.shared }
     @State private var applicationSearch = ""
 
     private var canConnect: Bool {
@@ -29,6 +28,10 @@ struct ContentView: View {
         guard !trustAnyCertificate else { return true }
         let fingerprint = certificateFingerprint.filter { $0 != ":" && !$0.isWhitespace }
         return fingerprint.count == 64 && fingerprint.allSatisfy(\.isHexDigit)
+    }
+
+    private var applications: [BeamItApplication] {
+        connection?.hostWindows.applications ?? []
     }
 
     var body: some View {
@@ -181,7 +184,7 @@ struct ContentView: View {
                     .buttonStyle(.bordered)
             }
 
-            if streamWindows.values.contains(where: { $0.sourceKind == "application" }) {
+            if streams.windows.values.contains(where: { $0.sourceKind == "application" }) {
                 Menu("Add another stream") {
                     ForEach(applications) { application in
                         Button(application.title) {
@@ -192,7 +195,7 @@ struct ContentView: View {
                         Text("No applications available")
                     }
                 }
-                .disabled(isStartingStream)
+                .disabled(streams.isStarting)
             }
 
             if let connectionError {
@@ -202,20 +205,20 @@ struct ContentView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if isStartingStream {
+            if streams.isStarting {
                 Label("Starting stream…", systemImage: "arrow.triangle.2.circlepath")
                     .font(.callout)
                     .foregroundStyle(.secondary)
-            } else if !streamWindows.isEmpty {
+            } else if !streams.windows.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     Label(
-                        "\(streamWindows.count) active stream\(streamWindows.count == 1 ? "" : "s") · ⌘W closes the focused stream",
+                        "\(streams.windows.count) active stream\(streams.windows.count == 1 ? "" : "s") · ⌘W closes the focused stream",
                         systemImage: "dot.radiowaves.left.and.right"
                     )
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                    ForEach(streamWindows.keys.sorted(), id: \.self) { streamID in
-                        if let window = streamWindows[streamID] {
+                    ForEach(streams.windows.keys.sorted(), id: \.self) { streamID in
+                        if let window = streams.windows[streamID] {
                             HStack {
                                 Text(window.title)
                                     .lineLimit(1)
@@ -264,6 +267,16 @@ struct ContentView: View {
                         .foregroundStyle(.tertiary)
                 }
 
+                Picker("Connect", selection: $applicationMode) {
+                    ForEach(BeamItApplicationMode.allCases, id: \.self) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .help(applicationMode == .allWindows
+                      ? "Each main, dialog and tool window of the application gets its own window, including windows opened later."
+                      : "Only the main window is connected; use Stream > Connect Window to add others.")
+
                 if !applications.isEmpty {
                     HStack(spacing: 6) {
                         Image(systemName: "magnifyingglass")
@@ -295,7 +308,7 @@ struct ContentView: View {
                     ContentUnavailableView(
                         "No applications found",
                         systemImage: "macwindow",
-                        description: Text("The host did not report any capturable application windows.")
+                        description: Text("The host has not reported any application windows.")
                     )
                     .frame(height: 150)
                 } else if filteredApplications.isEmpty {
@@ -405,39 +418,29 @@ struct ContentView: View {
                 newConnection.clipboardSync.onError = { message in
                     connectionError = "Clipboard sync: \(message)"
                 }
-                let windows = try await newConnection.listWindows()
-                newConnection.onStreamStopped = { streamID, reason in
-                    DispatchQueue.main.async {
-                        streamWindows.removeValue(forKey: streamID)?.closeAfterHostStop()
-                        if let reason, reason != "requested" {
-                            connectionError = "Stream stopped: \(reason)."
-                        }
-                        if streamWindows.isEmpty {
-                            selectedSource = nil
-                            BeamItMainWindow.show()
-                        }
-                    }
-                }
                 newConnection.onDisconnect = { [weak newConnection] error in
                     DispatchQueue.main.async {
                         newConnection?.disconnect()
-                        for window in streamWindows.values {
-                            window.closeAfterHostStop()
-                        }
-                        streamWindows.removeAll()
+                        streams.reset()
                         connection = nil
-                        applications = []
                         selectedSource = nil
                         connectionError = error.localizedDescription
                         BeamItMainWindow.show()
                     }
                 }
+                streams.onError = { message in
+                    connectionError = message
+                }
+                streams.onAllClosed = {
+                    selectedSource = nil
+                    BeamItMainWindow.show()
+                }
+                streams.attach(newConnection)
                 connection = newConnection
                 pendingConnection = nil
                 UserDefaults.standard.set(address.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "lastSuccessfulServerURL")
                 UserDefaults.standard.set(fingerprint, forKey: "lastSuccessfulCertificateFingerprint")
                 UserDefaults.standard.set(trustsAnyCertificate, forKey: "lastSuccessfulTrustAnyCertificate")
-                applications = Self.applications(from: windows)
                 selectedSource = nil
                 password = ""
             } catch {
@@ -449,13 +452,9 @@ struct ContentView: View {
     }
 
     private func disconnect() {
-        for window in streamWindows.values {
-            window.closeAfterHostStop()
-        }
-        streamWindows.removeAll()
+        streams.reset()
         connection?.disconnect()
         connection = nil
-        applications = []
         applicationSearch = ""
         selectedSource = nil
         connectionError = nil
@@ -463,34 +462,9 @@ struct ContentView: View {
     }
 
     private func startStream(_ source: BeamItSource) {
-        guard let connection, !isStartingStream else { return }
-        isStartingStream = true
+        guard connection != nil else { return }
         connectionError = nil
-        Task {
-            do {
-                let stream = try await connection.startStream(source: source)
-                let window = BeamItStreamWindowController(stream: stream)
-                window.onError = { message in
-                    connectionError = message
-                }
-                window.onClose = { [weak window] in
-                    guard let window else { return }
-                    DispatchQueue.main.async {
-                        streamWindows.removeValue(forKey: window.stream.offer.streamID)
-                        if streamWindows.isEmpty {
-                            selectedSource = nil
-                            BeamItMainWindow.show()
-                        }
-                    }
-                }
-                streamWindows[stream.offer.streamID] = window
-                window.show()
-                BeamItMainWindow.hide()
-            } catch {
-                connectionError = error.localizedDescription
-            }
-            isStartingStream = false
-        }
+        streams.startFromPicker(source, mode: applicationMode)
     }
 
     private var searchTerms: [String] {
@@ -502,22 +476,27 @@ struct ContentView: View {
         let terms = searchTerms
         guard !terms.isEmpty else { return applications }
         return applications.filter { application in
-            let haystack = ([application.title, String(application.pid)] + application.windows.map(\.title))
+            let haystack = ([application.title, application.imageName, String(application.pid)]
+                            + application.windows.compactMap(\.title))
                 .joined(separator: "\n")
             return terms.allSatisfy { haystack.localizedStandardContains($0) }
         }
     }
 
     private func applicationSubtitle(_ application: BeamItApplication) -> String {
-        let summary = "\(application.windows.count) window\(application.windows.count == 1 ? "" : "s") · PID \(application.pid)"
+        let summary = [
+            application.imageName.isEmpty ? nil : application.imageName,
+            "\(application.windows.count) window\(application.windows.count == 1 ? "" : "s")",
+            "PID \(application.pid)",
+        ].compactMap(\.self).joined(separator: " · ")
         let terms = searchTerms
         guard !terms.isEmpty,
               !terms.allSatisfy({ application.title.localizedStandardContains($0) }),
-              let match = application.windows.first(where: { window in
-                  terms.contains { window.title.localizedStandardContains($0) }
+              let match = application.windows.compactMap(\.title).first(where: { title in
+                  terms.contains { title.localizedStandardContains($0) }
               })
         else { return summary }
-        return "\(summary) · “\(match.title)”"
+        return "\(summary) · “\(match)”"
     }
 
     private func selectedTitle(for source: BeamItSource) -> String {
@@ -526,19 +505,6 @@ struct ContentView: View {
             return app.title
         }
         return source.title
-    }
-
-    private static func applications(from windows: [BeamItWindow]) -> [BeamItApplication] {
-        Dictionary(grouping: windows, by: \.pid)
-            .map { pid, appWindows in
-                let sortedWindows = appWindows.sorted {
-                    if $0.primary != $1.primary { return $0.primary && !$1.primary }
-                    return $0.title.localizedStandardCompare($1.title) == .orderedAscending
-                }
-                let title = sortedWindows.first(where: { !$0.title.isEmpty })?.title ?? "Application"
-                return BeamItApplication(pid: pid, title: title, windows: sortedWindows)
-            }
-            .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
     }
 }
 

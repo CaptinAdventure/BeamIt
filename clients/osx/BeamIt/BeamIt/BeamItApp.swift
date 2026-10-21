@@ -19,6 +19,18 @@ struct BeamItApp: App {
                 Button("Add New Stream") {
                     BeamItMainWindow.show()
                 }
+                Menu("Connect Window") {
+                    let candidates = BeamItStreamManager.shared.connectableWindows
+                    ForEach(candidates, id: \.hwnd) { window in
+                        Button(window.menuTitle) {
+                            BeamItStreamManager.shared.connectWindow(window.hwnd)
+                        }
+                    }
+                    if candidates.isEmpty {
+                        Text("No Other Windows")
+                    }
+                }
+                .disabled(BeamItScalingMenu.shared.controller.map { $0.sourceKind == "desktop" } ?? true)
                 Button("Capture Mouse") {
                     BeamItStreamWindowController.captureMouseForActiveStream()
                 }

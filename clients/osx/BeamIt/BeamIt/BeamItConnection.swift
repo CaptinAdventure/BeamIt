@@ -24,6 +24,7 @@ final class BeamItConnection {
     private var isAuthenticated = false
     lazy var clipboardSync = BeamItClipboardSync(connection: self)
     lazy var popups = BeamItPopups(connection: self)
+    let hostWindows = BeamItHostWindowList()
     var onStreamStopped: ((String, String?) -> Void)?
     var onDisconnect: ((Error) -> Void)?
 
@@ -70,15 +71,6 @@ final class BeamItConnection {
             connection.disconnect()
             throw error
         }
-    }
-
-    func listWindows() async throws -> [BeamItWindow] {
-        let response = try await request(type: "list_windows", fields: [:], expectedType: "windows")
-        guard let windows = response["windows"] as? [[String: Any]] else {
-            throw ConnectionError.invalidMessage
-        }
-        let data = try JSONSerialization.data(withJSONObject: windows)
-        return try JSONDecoder().decode([BeamItWindow].self, from: data)
     }
 
     func startStream(source: BeamItSource) async throws -> BeamItVideoStream {
@@ -328,6 +320,7 @@ final class BeamItConnection {
                         let data = try JSONSerialization.data(withJSONObject: object)
                         let window = try JSONDecoder().decode(BeamItHostWindow.self, from: data)
                         popups.update(window, closed: type == "window_closed")
+                        hostWindows.update(window, closed: type == "window_closed")
                         continue
                     }
                     if message["type"] as? String == "clipboard_changed" {

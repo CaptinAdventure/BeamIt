@@ -1,21 +1,5 @@
 import AppKit
 
-struct BeamItHostWindow: Decodable {
-    let hwnd: String
-    let pid: Int
-    let role: String
-    let owner: String?
-    let rect: Rect
-    let state: String
-
-    struct Rect: Decodable {
-        let x: Double
-        let y: Double
-        let width: Double
-        let height: Double
-    }
-}
-
 final class BeamItPopups {
     private struct Parent {
         weak var controller: BeamItStreamWindowController?

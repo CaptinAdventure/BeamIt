@@ -258,12 +258,17 @@ final class BeamItStreamWindowController: NSWindowController, NSWindowDelegate {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func show() {
+    /// `activate: false` orders the window front without taking keyboard focus.
+    func show(activate: Bool = true) {
         if isPopup {
             window?.orderFront(nil)
         } else {
-            showWindow(nil)
-            window?.makeKeyAndOrderFront(nil)
+            if activate {
+                showWindow(nil)
+                window?.makeKeyAndOrderFront(nil)
+            } else {
+                window?.orderFront(nil)
+            }
             stream.popupCoordinator?.register(self)
             updateDockAttention()
         }
