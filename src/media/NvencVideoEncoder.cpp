@@ -198,7 +198,7 @@ struct NvencVideoEncoder::Impl {
                    "query ultra-low-latency preset")) return false;
         config = preset.presetCfg;
         config.profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID;
-        config.gopLength = 60;
+        config.gopLength = key_frame_interval(options.frame_rate);
         config.frameIntervalP = 1;
         config.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
         config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
@@ -263,8 +263,8 @@ struct NvencVideoEncoder::Impl {
         if (!check(api.nvEncRegisterAsyncEvent(session, &event), "register completion event")) return false;
         event_registered = true;
         spdlog::info("NVENC D3D11: H.264 High 4:4:4 Predictive, 8-bit 4:4:4; GPU BGRA input; VBR {} kbps target, "
-                     "{} kbps peak, one-frame VBV, GOP 60 I/P, no B-frames/lookahead", options.target_bitrate_kbps,
-                     peak_bitrate_kbps(options));
+                     "{} kbps peak, one-frame VBV, GOP {} I/P (10 s), no B-frames/lookahead",
+                     options.target_bitrate_kbps, peak_bitrate_kbps(options), config.gopLength);
         return true;
     }
 

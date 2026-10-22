@@ -183,14 +183,18 @@ TEST_CASE("automatic encoder validates configuration and requires an initial ima
 
 TEST_CASE("low-delay sequence resets at IDRs and alternates reference surfaces", "[encoder]") {
     using namespace beamit::media::detail;
-    for (std::uint64_t frame = 0; frame < 1000; ++frame) {
-        const auto order = picture_order(frame);
-        REQUIRE(order.index == frame % 60);
-        REQUIRE(order.idr == (frame % 60 == 0));
-        REQUIRE(order.output_slot != order.reference_slot);
-        REQUIRE(order.index * 2 < (1U << (order_bits_minus4 + 4)));
-        if (!order.idr) {
-            REQUIRE(order.reference_slot == picture_order(frame - 1).output_slot);
+    for (const unsigned fps : {1u, 30u, 60u, 240u}) {
+        const auto length = beamit::media::key_frame_interval(fps);
+        REQUIRE(length == fps * 10);
+        for (std::uint64_t frame = 0; frame < length * 3; ++frame) {
+            const auto order = picture_order(frame, length);
+            REQUIRE(order.index == frame % length);
+            REQUIRE(order.idr == (frame % length == 0));
+            REQUIRE(order.output_slot != order.reference_slot);
+            REQUIRE(order.index * 2 < (1U << (order_bits_minus4 + 4)));
+            if (!order.idr) {
+                REQUIRE(order.reference_slot == picture_order(frame - 1, length).output_slot);
+            }
         }
     }
 }

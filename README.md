@@ -121,11 +121,29 @@ On the development T1000, default H.264 selects NVENC and produces `yuv444p`; HE
 
 The NVENC session uses `NV_ENC_DEVICE_TYPE_DIRECTX` on the capture texture's D3D11 device. Each fresh frame is copied on the GPU to one reusable encoder-owned BGRA texture, registered as NVENC's word-ordered ARGB format (BGRA bytes). NVENC performs RGB-to-YUV conversion for 4:4:4 encoding; no CPU pixel readback, CUDA toolkit, manual planar packing, or packed AYUV intermediate is required. The copy is deliberately encoder-side: it preserves the last image for DXGI idle-frame repeats without accessing a released duplication surface. Capture remains copy-free for DXGI. Capture must already be on an NVENC-capable NVIDIA device; cross-GPU transfer is not implemented.
 
-The P1 ultra-low-latency preset favors throughput over compression efficiency. Encoding uses VBR (average target, peak 2× by default or the client's `max_bitrate_kbps`) with a one-frame VBV at the average target, a 60-picture I/P GOP, one reference frame, no B-frames, no lookahead, no temporal AQ, and no multipass. Async Windows completion events bound submission to one outstanding picture; output is Annex B with AUD and repeated SPS/PPS on IDRs. The complete captured-frame lease is retained through completion, with a D3D11 copy fence also protecting shutdown/error cleanup. Reconfiguration rebuilds the session for resized windows; the next picture is an IDR.
+The P1 ultra-low-latency preset favors throughput over compression efficiency. Encoding uses VBR (average target, peak 2× by default or the client's `max_bitrate_kbps`) with a one-frame VBV at the average target, a ten-second I/P GOP, one reference frame, no B-frames, no lookahead, no temporal AQ, and no multipass. Async Windows completion events bound submission to one outstanding picture; output is Annex B with AUD and repeated SPS/PPS on IDRs. The complete captured-frame lease is retained through completion, with a D3D11 copy fence also protecting shutdown/error cleanup. Reconfiguration rebuilds the session for resized windows; the next picture is an IDR.
 
 Both WGC and DXGI 1080p60 recordings made with the former recorder on the T1000 decoded as `High 4:4:4 Predictive`, `yuv444p`, with 5 I-frames and 295 P-frames per five-second recording and no B-frames. This does not prove one-frame end-to-end latency or hardware decoding on macOS: High444 support must be checked on the intended client, and software decoding can increase latency. HDR and HEVC NVENC encoding are not implemented.
 
 The SDK integration described below must be enabled. Driver-independent lifecycle/configuration tests run with the normal test suite; run the hidden `[.nvenc-hardware]` Catch2 tag through CLion's `BeamItTests` configuration for D3D11 submission/repeat, backpressure, lease release, in-flight shutdown and session-recreation checks on an NVIDIA GPU.
+
+**GOP quality-pulsing diagnostic.** The hidden `[.nvenc-quality]` test uses synthetic desktop-like pixels
+(not screen capture) and production NVENC settings: 1920x1080 H.264 4:4:4, P1 ultra-low-latency,
+48,000/96,000 kbps average/peak, one-frame VBV and a ten-second GOP. Set `BEAMIT_NVENC_DIAGNOSTIC_DIR` to an
+existing empty directory, then run that test in CLion. It writes a reference PPM, Annex B streams and per-picture
+CSV sizes/timings through two full GOPs and the following IDR at both 60 and 30 FPS. Nothing is sent over the network.
+
+With the former 60-picture GOP on the development T1000, FFmpeg-decoded RGB PSNR against the static reference dropped from **35.29 to 21.20 dB**
+at picture 60 and **35.41 to 21.20 dB** at picture 120 at 60 FPS; reconstruction mean-square error increased
+about **26x** at those periodic IDRs. Their sizes were about 90 KB. At 30 FPS the corresponding drops were
+**35.46 to 26.53 dB** and **35.47 to 26.45 dB**, with roughly 176 KB IDRs and about **8x** error increases.
+P-pictures progressively repaired the static image within each GOP. This reproduces a one-second/two-second
+quality pulse entirely inside the encoder, without capture, transport or a native client. The one-frame VBV
+policy is the leading constraint (100 KB at 60 FPS, 200 KB at 30 FPS), but this measurement does not isolate
+VBV from the preset's other rate-control choices. No encoder/GOP/buffer policy was changed by this diagnostic.
+These are synthetic-content measurements, not a universal desktop quality score or an end-to-end latency result.
+With the new ten-second GOP, the same diagnostic passed on the T1000 and both streams decoded with FFmpeg:
+IDRs were at pictures 0/600/1200 at 60 FPS and 0/300/600 at 30 FPS.
 
 ### Automatic chroma sampling
 
@@ -158,11 +176,76 @@ Generated HEVC VPS/SPS profile constraints, chroma format, bit depth and croppin
 
 Packets contain an Annex B access unit delimiter and encoded slice, with codec parameter sets (H.264 SPS/PPS or HEVC VPS/SPS/PPS) on IDRs. Parameter sets match the negotiated level and HEVC coding-unit/transform settings, including resolution cropping, nominal frame-rate timing and zero picture reordering. HEVC configuration queries select supported 64x64 or 32x32 coding units and transform depths, honoring required asymmetric motion partition without switching codecs. The output packet also carries codec, capture timestamp and an accurate IDR key-frame flag. Hardware availability is adapter/driver-specific; unsupported configurations fail with an HRESULT. Production network framing and remote-window association are not implemented.
 
-Both codecs use **low-delay I/P encoding without B-frames**: an IDR starts each fixed 60-frame GOP, followed by 59 P-frames, each referencing only the immediately preceding reconstructed picture. At 60 FPS an IDR occurs every second; at 30 FPS, every two seconds. Two GPU reconstruction slots alternate between previous-reference read and current-output write, using a texture array when required by the driver. Capability checks request one DPB reference. Frame numbers/POCs reset at each IDR; initial configuration and resize start a fresh IDR with parameter sets. There is still only one submitted picture in flight, with decode order equal to presentation order and no encoder lookahead enabled.
+Both codecs use **low-delay I/P encoding without B-frames**: an IDR starts each ten-second GOP, followed by P-frames referencing only the immediately preceding reconstructed picture. GOP length is `frame_rate * 10`: 600 pictures at 60 FPS or 300 at 30 FPS. This reduces periodic quality-pulsing frequency without changing bitrate, VBV or preset; it does not eliminate coarse IDRs. Initial configuration, resize, explicit keyframe requests and network recovery still produce immediate IDRs. If frame-rate ticks are missed, the periodic interval can exceed ten wall-clock seconds. Two GPU reconstruction slots alternate between previous-reference read and current-output write, using a texture array when required by the driver. Capability checks request one DPB reference. Frame numbers/POCs reset at each IDR; D3D12 SPS and sequence configuration use 13-bit ordering fields to cover ten seconds at up to 240 FPS without wraparound. There is still only one submitted picture in flight, with decode order equal to presentation order and no encoder lookahead enabled.
 
-This replaces the bandwidth-heavy all-IDR test path so static areas and terminal glyphs can be predicted rather than recompressed independently every frame. Unlike B-frame GOPs, it does not require future pictures or presentation reordering. An IDR every 60 frames bounds random-access recovery without making GOP tuning another CLI setting yet. CBR bitrate selection is unchanged. On a 4:2:0 fallback, colored/subpixel text still loses chroma detail regardless of bitrate; higher sampling is not a lossless desktop codec or a one-frame end-to-end latency guarantee.
+This replaces the bandwidth-heavy all-IDR test path so static areas and terminal glyphs can be predicted rather than recompressed independently every frame. Unlike B-frame GOPs, it does not require future pictures or presentation reordering.  CBR bitrate selection is unchanged. On a 4:2:0 fallback, colored/subpixel text still loses chroma detail regardless of bitrate; higher sampling is not a lossless desktop codec or a one-frame end-to-end latency guarantee.
 
 The shared input texture permits simultaneous-access interop for D3D11, and conversion commands are flushed before signaling work to D3D12. Video resource transitions stay on the encode queue; buffers cross to the graphics readback queue in `COMMON` state. This avoids using video-only resource states on a graphics command list.
+
+## Audio codec and transport
+
+The host supports one authenticated, bidirectional Opus audio WebSocket per
+session, separate from all video streams. That connection multiplexes up to
+eight independent outgoing application capture tracks, or one exclusive
+desktop capture track, alongside a single incoming microphone route.
+Capture tracks never create additional virtual microphones. See
+`PROTOCOL.md` §5.16 for the JSON exchange and version-2 audio envelope
+(`track_id` occupies the formerly reserved header field; video stays unchanged).
+Defaults are named constants in
+`include/beamit/media/OpusAudio.hpp`: 48 kHz, stereo, 10 ms, VOIP, FEC off.
+Frame size (480 samples/channel), PCM storage size, timestamps and the
+advertised JSON duration are derived from sample rate and packet duration.
+Clients must parse the offer rather than assume those defaults.
+
+**This step is codec/transport only.** WASAPI capture/playback, microphone
+redirection into Teams and client audio integration are not implemented.
+The production host has no synthetic audio source and sends nothing until
+PCM is supplied. Device routing, feedback avoidance and playback buffering
+remain for the next step.
+
+Clients first use `start_audio` and open the offered socket. Then
+`start_audio_track` explicitly selects `source.kind = application` with a PID
+(include its process tree), or `source.kind = desktop` (exclude BeamIt's process
+tree across playback devices). The response gives that track's ID and Opus
+configuration. `stop_audio_track` removes only that outgoing track; video
+and the incoming microphone are unaffected. Desktop/application overlap and
+duplicate application PIDs are rejected to avoid double playback; clients
+must also avoid overlapping parent/child application trees. These source
+descriptors prepare for WASAPI; they do not start real device capture yet.
+
+For host integration, retain `HostServerOptions::audio` before passing the
+options to `run_host_server`. Its thread-safe `AudioEndpoint::tracks()` reports
+active track IDs, sources and configuration. `submit_pcm(track_id, samples)`
+accepts exactly one packet of normalized, interleaved float PCM for a host
+capture track, returning
+`Accepted`, `NotConnected` or `QueueFull`; `receive_pcm` returns decoded
+`AudioPcmPacket`s from the single microphone route, with sequence/sample
+timestamp/discontinuity metadata. Submitting host PCM to that incoming
+microphone ID throws instead of mixing directions.
+Format errors throw explicitly. Device callbacks should not call these
+locking/allocating APIs directly; bridge through a suitable device-side
+buffer when WASAPI is added. Session teardown clears pending PCM and detaches
+the endpoint. Each track has its own codec state and dedicated MMCSS worker;
+bounded per-track queues and round-robin socket writes prevent a busy source
+from monopolizing the pending output. Queues drop stale output with
+discontinuity reporting, rather than growing. Track IDs are scoped to their
+audio connection; discard stale device routes when it ends.
+
+The reference project's codec ownership and duration-validation ideas
+informed this implementation. Its multi-party room/mixer,
+RTP/RTCP, adaptive jitter buffer, packet-local resampler and cloud dependencies
+are intentionally not imported: BeamIt needs a small LAN-only pipeline.
+The existing Schannel/authenticated WSS transport is retained.
+
+libopus 1.5.2 is built as a dependency through CPM; its upstream license is
+copied alongside `BeamIt.exe` as `Opus-LICENSE.txt` and must accompany binary
+redistribution. Run `BeamItTests "[audio]"` for codec/framing/PCM tests.
+The hidden `BeamItTests "[.audio-wss]"` test uses the locally installed
+BeamIt certificate (`Install-BeamItCert.ps1`), an ephemeral loopback port,
+and synthetic test-only PCM to exercise authentication, token handling,
+multi-track routing, capture selection/lifecycle and the single incoming
+microphone without WASAPI. Configure/build with CLion's managed
+Windows CMake toolchain as for the other host tests.
 
 ## Secure WebSocket host
 

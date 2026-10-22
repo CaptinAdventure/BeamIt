@@ -1,6 +1,7 @@
 #pragma once
 
 #include "host/wss/Fields.hpp"
+#include "host/wss/AudioSocket.hpp"
 #include "host/wss/StreamSocket.hpp"
 #include "host/AttentionMonitor.hpp"
 #include "host/Clipboard.hpp"
@@ -80,6 +81,18 @@ struct StreamEntry {
     void shut_down(websocket::close_reason reason);
 };
 
+struct AudioEntry {
+    std::string id;
+    std::string token;
+    bool token_used{};
+    Clock::time_point token_expiry{};
+    std::unique_ptr<asio::steady_timer> token_timer;
+    media::AudioConfiguration configuration;
+    std::shared_ptr<AudioSocket> socket;
+    std::map<std::uint32_t, AudioTrack> capture_tracks;
+    std::uint32_t next_track_id{net::protocol::microphone_track_id + 1};
+};
+
 // The JSON signaling socket (PROTOCOL.md §3-5). Everything runs on the network thread unless noted.
 // Implementation: ControlSession.cpp (lifecycle, authentication, streams), ControlInput.cpp (§5.9),
 // ControlDesktop.cpp (windows, icons, clipboard, attention) and ControlStats.cpp (§5.15).
@@ -99,6 +112,9 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
     std::shared_ptr<StreamEntry> claim(std::string_view stream_id, std::string_view token);
     [[nodiscard]] bool has_stream(const std::string& stream_id) const { return streams_.contains(stream_id); }
     void attach(const std::shared_ptr<StreamEntry>& entry, std::shared_ptr<WebSocket> socket);
+    std::shared_ptr<AudioEntry> claim_audio(std::string_view audio_id, std::string_view token);
+    [[nodiscard]] bool has_audio(const std::shared_ptr<AudioEntry>& entry) const;
+    void attach_audio(const std::shared_ptr<AudioEntry>& entry, std::shared_ptr<WebSocket> socket);
 
     // Host events.
     void on_attention(const AttentionEvent& event);
@@ -137,6 +153,12 @@ private:
                     const RequestId& id = std::nullopt);
     void release_stream_execution_state(StreamEntry& entry);
     void stop_all_streams(websocket::close_code code);
+    void start_audio(const json::object& message, const RequestId& id);
+    void stop_audio(const json::object& message, const RequestId& id);
+    void start_audio_track(const json::object& message, const RequestId& id);
+    void stop_audio_track(const json::object& message, const RequestId& id);
+    std::shared_ptr<AudioEntry> find_audio(const json::object& message);
+    void end_audio(std::string_view reason, std::string_view message = {}, const RequestId& id = std::nullopt);
 
     // Input (ControlInput.cpp).
     static input::MouseMode mouse_mode_field(const json::value& value);
@@ -162,6 +184,7 @@ private:
     std::uint64_t auth_generation_{};
     std::deque<Outgoing> outbox_;
     std::map<std::string, std::shared_ptr<StreamEntry>> streams_;
+    std::shared_ptr<AudioEntry> audio_;
     bool writing_{};
     bool closing_{};
     bool authenticated_{};

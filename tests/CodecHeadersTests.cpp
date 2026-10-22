@@ -161,9 +161,9 @@ TEST_CASE("H.264 parameter sets describe Main profile, crop and frame rate", "[e
     REQUIRE(sps.bits(8) == 0);
     REQUIRE(sps.bits(8) == 40);
     REQUIRE(sps.ue() == 0); // SPS id
-    REQUIRE(sps.ue() == 4); // eight-bit frame_num
+    REQUIRE(sps.ue() == 9); // thirteen-bit frame_num
     REQUIRE(sps.ue() == 0); // POC type
-    REQUIRE(sps.ue() == 4); // eight-bit POC
+    REQUIRE(sps.ue() == 9); // thirteen-bit POC
     REQUIRE(sps.ue() == 1); // max_num_ref_frames
     REQUIRE(sps.bits(1) == 0); // gaps
     REQUIRE(sps.ue() == 119);
@@ -264,7 +264,7 @@ TEST_CASE("HEVC parameter sets describe matching VPS, SPS and PPS", "[encoder][b
     for (int i = 0; i < 2; ++i) {
         REQUIRE(sps.ue() == 0);
     }
-    REQUIRE(sps.ue() == 4); // eight-bit POC
+    REQUIRE(sps.ue() == 9); // thirteen-bit POC
     REQUIRE(sps.bits(1) == 0);
     REQUIRE(sps.ue() == 1); // current plus reference picture
     REQUIRE(sps.ue() == 0);

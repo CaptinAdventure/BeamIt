@@ -114,6 +114,28 @@ awaitable<void> upgrade(Server& server, std::shared_ptr<WebSocket> ws, http::req
         co_await ControlSession::run(std::make_shared<ControlSession>(server, ws, authority, remote));
         co_return;
     }
+    constexpr std::string_view audio_prefix = "/audio/";
+    const auto audio_query = target.find("?token=");
+    if (target.starts_with(audio_prefix) && audio_query != std::string::npos) {
+        const auto audio_id = std::string_view(target).substr(audio_prefix.size(), audio_query - audio_prefix.size());
+        const auto token = std::string_view(target).substr(audio_query + 7);
+        auto session = server.active.lock();
+        auto entry = session ? session->claim_audio(audio_id, token) : nullptr;
+        if (!entry) {
+            spdlog::warn("Rejected audio socket from {}: invalid, used or expired token", remote);
+            co_await write_status(*ws, request, http::status::forbidden);
+            co_return;
+        }
+        configure_websocket(*ws, protocol::max_audio_message);
+        ws->binary(true);
+        co_await ws->async_accept(request, use_awaitable);
+        if (!session->has_audio(entry)) {
+            co_await ws->async_close({websocket::close_code::normal, "audio stopped"}, use_awaitable);
+            co_return;
+        }
+        session->attach_audio(entry, ws);
+        co_return;
+    }
     constexpr std::string_view prefix = "/streams/";
     const auto query = target.find("?token=");
     if (target.starts_with(prefix) && query != std::string::npos) {

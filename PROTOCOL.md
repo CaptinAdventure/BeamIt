@@ -13,6 +13,7 @@ A BeamIt host serves one TLS port. Everything on that port is HTTPS / WSS:
 | `GET /`                             | HTTPS                   | Test web client page                            |
 | `GET /control`                      | WebSocket (text, JSON)  | The single **signaling** ("master") socket      |
 | `GET /streams/{stream_id}?token=…`  | WebSocket (binary)      | One **stream** socket per video stream          |
+| `GET /audio/{audio_id}?token=…`     | WebSocket (binary)      | One full-duplex **audio** socket per host instance |
 
 Plaintext HTTP and `ws://` are not served. Any other path returns `404`.
 
@@ -67,6 +68,7 @@ client                                   host
   (This keeps page reloads working.)
 * Stream sockets are authorized by a single-use, unguessable token that is
   bound to the signaling session that requested the stream (§6).
+  The audio socket uses the same authorization model (§5.16).
 * If a browser `Origin` header is present on any WebSocket upgrade, its
   `host:port` must equal the request `Host` header, otherwise the upgrade is
   rejected with `403`. Non-browser clients may omit `Origin`.
@@ -106,6 +108,7 @@ produce an `error` with code `unknown_type` but do not close the socket.
 | `limit_reached`      | Too many concurrent streams                                     | no            |
 | `capture_failed`     | Capture could not start for the requested source                | no            |
 | `encoder_failed`     | No encoder could be configured                                  | no            |
+| `audio_failed`       | Host PCM audio endpoint is unavailable                          | no            |
 | `not_ready`          | Input sent before the stream socket opened                      | no            |
 | `focus_failed`       | Target window could not be brought to the foreground (§5.9)     | no            |
 | `input_failed`       | The OS rejected injected input (§5.9)                           | no            |
@@ -294,7 +297,7 @@ omit this additive field; clients must not assume a measured DPI in that case.
   "bitrate_kbps": 20000,
   "max_bitrate_kbps": 40000,
   "rate_control": "vbr",
-  "key_frame_interval": 60,
+  "key_frame_interval": 600,
   "b_frames": 0,
   "encoder": "NVENC D3D11 H.264 4:4:4"
 }
@@ -312,6 +315,11 @@ omit this additive field; clients must not assume a measured DPI in that case.
   peak (after defaulting and clamping, §5.3). `rate_control` is `"vbr"`, or
   `"cbr"` when the encoder had to fall back; with CBR the peak is not used.
 * `encoder` is informative only.
+* `key_frame_interval` is the periodic IDR interval in pictures: ten seconds
+  at the configured frame rate (600 at 60 FPS, 300 at 30 FPS). Startup,
+  reconfiguration, explicit requests and network recovery can produce
+  earlier keyframes. This is not a guaranteed wall-clock deadline when
+  capture/encoding misses frame-rate ticks.
 * Pictures are output in decode order equal to display order (I/P only, no
   B-frames), each packet decodes to exactly one picture.
 
@@ -972,6 +980,267 @@ microseconds apart, so `frames_sent` may differ from `frames_encoded` by one.
   the network is the bottleneck.
 * **Raise** cautiously when all of these are low for several reports.
 
+### 5.16 Two-way audio (codec/transport only)
+
+Audio is independent of video: at most one full-duplex audio socket exists
+per authenticated signaling session. That socket multiplexes multiple
+host-to-client capture tracks and exactly one client-to-host microphone
+route. Capture tracks have independent codecs, queues, counters and
+lifetimes; they do not create virtual microphones. The host
+currently provides PCM submit/receive APIs only; it does **not** capture
+Windows playback, render incoming audio, or expose a microphone to Teams.
+No synthetic source runs in the production host. Without a PCM producer the
+host sends no audio packets; incoming PCM can be consumed by future device I/O.
+
+#### 5.16.1 Start and stop
+
+Client -> host, on `/control`:
+
+```json
+{ "type": "start_audio", "id": 20 }
+```
+
+Host -> client, on `/control`:
+
+```json
+{
+  "type": "audio_offer",
+  "id": 20,
+  "audio_id": "fP8Yq4mA2sL9",
+  "url": "wss://host:17389/audio/fP8Yq4mA2sL9?token=...",
+  "token_expires_in_ms": 10000,
+  "audio_version": 2,
+  "hostToClient": {
+    "tracks": []
+  },
+  "clientToHost": {
+    "track_id": 1,
+    "source": { "kind": "microphone" },
+    "codec": "opus",
+    "opusAudioConfiguration": {
+      "sampleRate": 48000,
+      "channels": 2,
+      "frameSize": 480,
+      "packetDuration": "PT0.01S",
+      "useFec": false,
+      "application": "VOIP"
+    }
+  }
+}
+```
+
+Clients **must parse and use the advertised JSON parameters** for each
+track, not assume or hard-code the track ID, sample rate, channel count, frame
+size, packet duration, FEC setting or Opus application mode. Unsupported
+configurations must be rejected locally rather than played with incorrect
+timing. The values above are defaults, not fixed protocol requirements.
+`frameSize` is samples **per channel**; `frameSize * channels` is the number
+of interleaved PCM values. `packetDuration` is an ISO 8601 duration and equals
+`frameSize / sampleRate` seconds. All tracks currently use identical
+host-selected defaults; clients must nevertheless configure separate
+decoders from each track's metadata. `start_audio` does not negotiate
+overrides. Clients must check `audio_version` before using the audio socket.
+
+The offer starts with no outgoing capture tracks; it establishes only the
+single incoming microphone route. This route lasts for the audio connection,
+independent of which video streams or outgoing audio tracks are stopped.
+The host currently decodes microphone PCM only; selecting/feeding an actual
+virtual-microphone device remains future work.
+
+The URL token is 32 random bytes, base64url, single-use, and valid for ten
+seconds while the issuing authenticated session remains open. Invalid,
+expired, stopped or reused tokens return HTTP `403` before upgrade. A
+foreign browser Origin is also rejected. The upgrade must complete before
+token expiry. A second `start_audio` returns `limit_reached`, including
+while an offer is pending. Audio does not consume one of the eight video
+stream slots. No packets are sent before the socket opens.
+
+Client -> host, on `/control`:
+
+```json
+{ "type": "stop_audio", "id": 21, "audio_id": "fP8Yq4mA2sL9" }
+```
+
+Host -> client, on `/control`:
+
+```json
+{ "type": "audio_stopped", "id": 21, "audio_id": "fP8Yq4mA2sL9", "reason": "requested" }
+```
+
+Missing/invalid `audio_id` produces `invalid_request`; an unknown ID
+produces `not_found`. `audio_stopped` is also sent unsolicited when audio
+ends, with reason `token_expired`, `disconnected`, `invalid_packet`,
+`overloaded` or `codec_failed`. An explanatory `message` may be included.
+The audio socket closes; video/control remain usable. Ending, revoking or
+superseding the signaling session also stops audio (`session_ended`);
+delivery of that notification during signaling teardown is not guaranteed.
+If the host PCM endpoint is unavailable, `start_audio` returns `audio_failed`.
+
+#### Capture track selection
+
+After opening the audio socket, explicitly select a capture source on
+`/control` (not on the audio socket):
+
+```json
+{
+  "type": "start_audio_track",
+  "id": 22,
+  "audio_id": "fP8Yq4mA2sL9",
+  "source": { "kind": "application", "pid": 4242 }
+}
+```
+
+Host reply:
+
+```json
+{
+  "type": "audio_track_started",
+  "id": 22,
+  "audio_id": "fP8Yq4mA2sL9",
+  "track": {
+    "track_id": 2,
+    "source": { "kind": "application", "pid": 4242, "include_process_tree": true },
+    "codec": "opus",
+    "opusAudioConfiguration": {
+      "sampleRate": 48000,
+      "channels": 2,
+      "frameSize": 480,
+      "packetDuration": "PT0.01S",
+      "useFec": false,
+      "application": "VOIP"
+    }
+  }
+}
+```
+
+An application source describes include-process-tree loopback. Desktop
+selection instead uses `"source": { "kind": "desktop" }`; its reply contains
+`"source": { "kind": "desktop", "exclude_host_process_tree": true }`. This
+describes cross-output-device process-loopback capture excluding BeamIt's
+own process tree, not a selected output-device mix. These are routing
+descriptors for future WASAPI integration, not a claim that audio is
+already being captured. Application PIDs must be positive 32-bit integers;
+the codec/transport layer does not verify liveness or process ancestry.
+BeamIt's own PID is rejected.
+
+At most eight outgoing capture tracks are allowed. Desktop capture is
+exclusive: stop all application tracks before starting desktop, and stop
+desktop before selecting applications. Combining desktop and application
+tracks, starting a duplicate application PID or selecting desktop twice
+returns `invalid_request` rather than double-playing the same audio.
+Different application PIDs can still have overlapping process trees; the
+client must avoid selecting an application and its child as separate
+tracks. There is no implicit capture switching or association with video
+`stream_id`; stopping a video stream changes neither audio tracks nor the
+microphone.
+
+Track IDs are positive 32-bit integers scoped to the audio connection.
+The microphone ID is reported in `clientToHost`; capture IDs are allocated
+by the host and are not reused during that connection. A capture track's
+configuration is sent in `audio_track_started`. Because control and audio
+use separate sockets, packets can arrive before that reply; clients must
+discard packets for unknown/stopped tracks, never guess their configuration.
+Each outgoing track requires its own Opus decoder.
+
+Stop one outgoing track without closing the socket or microphone:
+
+```json
+{ "type": "stop_audio_track", "id": 23, "audio_id": "fP8Yq4mA2sL9", "track_id": 2 }
+```
+
+```json
+{ "type": "audio_track_stopped", "id": 23, "audio_id": "fP8Yq4mA2sL9", "track_id": 2, "reason": "requested" }
+```
+
+Pending packets for that track are cleared. A socket write already in
+progress may still complete; clients discard it after the track stops.
+Unknown capture IDs return `not_found`; stopping the microphone via
+`stop_audio_track` returns `invalid_request` (use `stop_audio` to end its
+route). Starting tracks before the audio upgrade completes returns
+`not_ready`. Track-limit exhaustion returns `limit_reached`.
+`stop_audio`, disconnection, session supersession and password revocation
+tear down all outgoing tracks and the microphone together.
+
+```text
+client                                     host
+  |--- start_audio -------------------------->| /control (authenticated)
+  |<-------------------------- audio_offer ---|
+  |=== WSS /audio/{audio_id}?token=... =======>|
+  |--- start_audio_track (application A) ----->| /control
+  |<------------------- audio_track_started --| track 2 + config
+  |--- start_audio_track (application B) ----->| /control
+  |<------------------- audio_track_started --| track 3 + config
+  |<====== Opus track 2 / Opus track 3 ========| independent host PCM -> encode
+  |========== Opus microphone track 1 =======>| decode -> one host microphone route
+  |--- stop_audio_track (2) ----------------->| /control
+  |<------------------- audio_track_stopped --| track 3 + microphone continue
+  |--- stop_audio --------------------------->| /control
+  |<------------------------ audio_stopped ---|
+  |<============= socket closes =============|
+```
+
+#### 5.16.2 Binary audio packet
+
+Each binary WebSocket message contains one raw Opus packet (no Ogg/RTP or
+base64), preceded by this 32-byte header. Integers are **big-endian**.
+The audio envelope version is `2`, independent of the video envelope.
+Version 1 audio packets are rejected; offset 12 is no longer reserved.
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 1 | `version` | `2` |
+| 1 | 1 | `message_type` | `2` = Opus audio |
+| 2 | 2 | `header_length` | `32` for this version |
+| 4 | 4 | `flags` | bit 1 discontinuity; other bits ignored |
+| 8 | 4 | `frame_size` | Samples per channel; must equal the track's offered `frameSize` |
+| 12 | 4 | `track_id` | Nonzero track ID from signaling metadata |
+| 16 | 8 | `sequence` | Produced packet counter starting at zero, independent per track |
+| 24 | 8 | `sample_timestamp` | `sequence * frameSize`, in `sampleRate` ticks; not host clock microseconds |
+| 32 | 1..1275 | payload | One Opus packet, declaring exactly the offered packet duration |
+
+Counters start at zero for each newly created track. Sequence numbers must
+increase strictly; duplicates/reversals are invalid. Mark the first packet
+and the first packet after a gap with discontinuity (bit 1). A receiver
+may see a first sequence greater than zero if initial packets were dropped;
+it must still be marked discontinuous. On discontinuity, reset decoder
+history. Mono-coded Opus packets may decode to negotiated stereo PCM;
+`channels` specifies the PCM interface, not a requirement to force stereo
+coding during silence/mono content.
+
+The host accepts binary messages only, up to 1,307 bytes including header.
+Invalid headers, mismatched Opus duration, malformed payloads and overload
+end audio explicitly rather than guessing a format or buffering indefinitely.
+No application JSON is sent on this socket.
+The client may send only on its offered microphone track. Packets addressed
+to host capture tracks or unknown IDs terminate audio with `invalid_packet`.
+
+#### 5.16.3 Latency and scope
+
+The default 10 ms packet duration and 48 kHz sample rate are named constants;
+PCM counts, timestamps and JSON duration/frame size are derived from them.
+Opus uses VOIP mode, FEC disabled, DTX disabled and complexity 5. These are
+codec/transport settings, not a claim of 10 ms end-to-end latency.
+
+Codec work runs on dedicated MMCSS audio workers (one per track), not the
+WSS thread. Socket writes use round-robin scheduling between nonempty
+outgoing track queues. Each track's PCM/encoded queue and socket output
+queue is limited to three packets (30 ms at defaults);
+these are per-queue bounds, not a total latency guarantee or a prebuffering
+target. A full PCM submit queue returns `QueueFull`. Full encoded output,
+socket output and decoded PCM queues discard their oldest waiting packet,
+log the drop and mark the next retained packet discontinuous. An in-progress
+socket write retains its packet until completion. A full incoming decode
+queue stops audio with `overloaded`. No jitter buffer, concealment scheduler,
+clock-drift correction, device conversion or A/V synchronization is implemented
+yet; those belong to the device/playback step. WSS retains TCP head-of-line
+blocking even though audio is isolated from video on a separate connection.
+
+This is an additive protocol-1 extension: existing control/video messages and
+binary video framing are unchanged. Older hosts answer `unknown_type` to
+`start_audio`; older clients need not request audio. The experimental
+single-track audio envelope version 1 and its offer shape are superseded
+by audio version 2; clients must not interpret version 2 packets as version 1.
+
 ## 6. Stream sockets
 
 * URL: `wss://{host}/streams/{stream_id}?token={token}`; `token` is 32
@@ -1040,8 +1309,9 @@ if unsupported, restart the stream with `"codec": "h265"`.
 | `1001` | Host shutting down                                        |
 | `1002` | Unsupported protocol version                              |
 | `1003` | Unexpected message type (binary on control, data on stream) |
+| `1007` | Invalid audio header or unexpected text on an audio socket |
 | `1008` | Authentication failure or policy violation                |
-| `1009` | Signaling message too large                               |
+| `1009` | Signaling or audio message too large                      |
 | `1011` | Internal host error                                       |
 | `4001` | Signaling session superseded by a newer login             |
 
@@ -1050,4 +1320,3 @@ if unsupported, restart the stream with `"codec": "h265"`.
 These are not implemented in version 1; the names are reserved:
 
 * Touch and pen input, clipboard file transfer.
-* Audio: `message_type` `2` on a dedicated audio stream socket.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "host/TlsIdentity.hpp"
+#include "host/AudioEndpoint.hpp"
 #include "beamit/capture/Capturer.hpp"
 #include "beamit/media/Encoder.hpp"
 #include "net/Crypto.hpp"
@@ -31,6 +32,8 @@ struct HostServerOptions {
     bool elevate_input{};
     std::shared_ptr<input::ElevatedInput> elevated_input;
     std::shared_ptr<HostControl> control;
+    // Device I/O is intentionally separate; callers can supply/consume packet-sized float PCM here.
+    std::shared_ptr<AudioEndpoint> audio{std::make_shared<AudioEndpoint>()};
     std::function<std::unique_ptr<capture::Capturer>(CaptureBackend)> make_capturer;
     std::function<std::unique_ptr<media::Encoder>(media::VideoCodec)> make_encoder;
 };

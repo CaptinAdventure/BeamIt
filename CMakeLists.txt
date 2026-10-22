@@ -44,6 +44,18 @@ CPMAddPackage(
 )
 
 CPMAddPackage(
+    NAME opus
+    GIT_TAG v1.5.2
+    GITHUB_REPOSITORY xiph/opus
+    OPTIONS
+        "BUILD_TESTING OFF"
+        "OPUS_BUILD_TESTING OFF"
+        "OPUS_BUILD_PROGRAMS OFF"
+        "OPUS_INSTALL_PKG_CONFIG_MODULE OFF"
+        "OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF"
+)
+
+CPMAddPackage(
     NAME Boost
     VERSION 1.90.0
     URL https://github.com/boostorg/boost/releases/download/boost-1.90.0/boost-1.90.0-cmake.tar.xz
@@ -72,6 +84,10 @@ target_include_directories(beamit_wintls SYSTEM INTERFACE "${wintls_SOURCE_DIR}/
 target_link_libraries(beamit_wintls INTERFACE Boost::beast crypt32 secur32 bcrypt)
 
 set(BEAMIT_HOST_SOURCES
+    src/media/OpusAudio.cpp
+    src/host/AudioEndpoint.cpp
+    src/host/wss/AudioSocket.cpp
+    src/host/wss/ControlAudio.cpp
     src/host/AttentionMonitor.cpp
     src/host/Clipboard.cpp
     src/host/HostServer.cpp
@@ -106,7 +122,7 @@ add_executable(BeamIt
     ${BEAMIT_HOST_SOURCES}
 )
 target_include_directories(BeamIt PRIVATE include src "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(BeamIt PRIVATE spdlog CLI11::CLI11 Boost::beast Boost::json beamit_wintls
+target_link_libraries(BeamIt PRIVATE opus spdlog CLI11::CLI11 Boost::beast Boost::json beamit_wintls
     d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs shell32 avrt winmm advapi32)
 target_compile_definitions(BeamIt PUBLIC NOMINMAX _WIN32_WINNT=0x0A00)
 
@@ -125,6 +141,8 @@ set_property(TARGET BeamIt APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_
 add_custom_command(TARGET BeamIt POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Install-BeamItCert.ps1" "$<TARGET_FILE_DIR:BeamIt>/Install-BeamItCert.ps1"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${opus_SOURCE_DIR}/COPYING" "$<TARGET_FILE_DIR:BeamIt>/Opus-LICENSE.txt"
 )
 if(TARGET NVIDIA::NVENCHeaders)
     target_sources(BeamIt PRIVATE src/media/NvencVideoEncoder.cpp)
@@ -145,6 +163,8 @@ if(BUILD_TESTING)
     )
 
     add_executable(BeamItTests
+        tests/AudioTests.cpp
+        tests/AudioWssTests.cpp
         tests/CaptureTypesTests.cpp
         tests/CodecHeadersTests.cpp
         tests/BeastTests.cpp
@@ -168,7 +188,7 @@ if(BUILD_TESTING)
     target_include_directories(BeamItTests PRIVATE include src "${CMAKE_CURRENT_BINARY_DIR}/generated")
     add_dependencies(BeamItTests BeamItInputHelper)
     target_compile_definitions(BeamItTests PRIVATE BEAMIT_USE_CATCH2=1 NOMINMAX _WIN32_WINNT=0x0A00)
-    target_link_libraries(BeamItTests PRIVATE Catch2::Catch2WithMain spdlog Boost::beast Boost::json beamit_wintls
+    target_link_libraries(BeamItTests PRIVATE opus Catch2::Catch2WithMain spdlog Boost::beast Boost::json beamit_wintls
         d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs shell32 avrt winmm advapi32)
     if(TARGET NVIDIA::NVENCHeaders)
         target_sources(BeamItTests PRIVATE tests/NvencVideoEncoderTests.cpp src/media/NvencVideoEncoder.cpp)

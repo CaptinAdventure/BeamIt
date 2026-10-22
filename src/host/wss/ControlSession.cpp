@@ -30,7 +30,7 @@ json::object video_json(const VideoParameters& video) {
         {"bitrate_kbps", video.bitrate_kbps},
         {"max_bitrate_kbps", video.max_bitrate_kbps},
         {"rate_control", media::rate_control_name(video.rate_control)},
-        {"key_frame_interval", 60},
+        {"key_frame_interval", media::key_frame_interval(video.frame_rate)},
         {"b_frames", 0},
         {"encoder", video.encoder},
     };
@@ -340,6 +340,10 @@ void ControlSession::handle(const std::string& text) {
         {"get_clipboard", &ControlSession::get_clipboard},
         {"set_clipboard", &ControlSession::set_clipboard},
         {"start_stream", &ControlSession::start_stream},
+        {"start_audio", &ControlSession::start_audio},
+        {"stop_audio", &ControlSession::stop_audio},
+        {"start_audio_track", &ControlSession::start_audio_track},
+        {"stop_audio_track", &ControlSession::stop_audio_track},
         {"stop_stream", &ControlSession::stop_stream},
         {"request_key_frame", &ControlSession::request_key_frame},
         {"set_stream_rate", &ControlSession::set_stream_rate},
@@ -638,6 +642,7 @@ void ControlSession::release_stream_execution_state(StreamEntry& entry) {
 }
 
 void ControlSession::stop_all_streams(websocket::close_code code) {
+    end_audio("session_ended");
     for (auto& [id, entry] : std::exchange(streams_, {})) {
         release_stream_execution_state(*entry);
         entry->shut_down({code, "signaling session ended"});

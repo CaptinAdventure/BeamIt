@@ -207,8 +207,9 @@ struct D3D12VideoEncoder::Impl {
     void apply_key_frame_request() noexcept {
         if (!key_frame_requested) return;
         key_frame_requested = false;
-        if (frame_number % detail::gop_length != 0) {
-            frame_number = (frame_number / detail::gop_length + 1) * detail::gop_length;
+        const auto gop_length = key_frame_interval(options.frame_rate);
+        if (frame_number % gop_length != 0) {
+            frame_number = (frame_number / gop_length + 1) * gop_length;
         }
     }
 
@@ -346,7 +347,7 @@ EncoderSubmitResult D3D12VideoEncoder::try_submit(const CapturedFrame& frame) {
     impl_->pending = true;
     impl_->readback_queued = false;
     impl_->pending_timestamp = frame.captured_at;
-    impl_->pending_key_frame = detail::picture_order(impl_->frame_number).idr;
+    impl_->pending_key_frame = detail::picture_order(impl_->frame_number, key_frame_interval(impl_->options.frame_rate)).idr;
     ++impl_->frame_number;
     impl_->error = S_OK;
     return EncoderSubmitResult::Accepted;
@@ -371,7 +372,7 @@ EncoderSubmitResult D3D12VideoEncoder::try_repeat_frame() {
     }
     impl_->pending = true;
     impl_->readback_queued = false;
-    impl_->pending_key_frame = detail::picture_order(impl_->frame_number).idr;
+    impl_->pending_key_frame = detail::picture_order(impl_->frame_number, key_frame_interval(impl_->options.frame_rate)).idr;
     ++impl_->frame_number;
     return EncoderSubmitResult::Accepted;
 }
@@ -741,14 +742,14 @@ HRESULT D3D12VideoEncoder::Impl::initialize_format(ID3D11Texture2D* capture_text
     }
 
     D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264 h264_gop{
-        .GOPLength = detail::gop_length,
+        .GOPLength = key_frame_interval(options.frame_rate),
         .PPicturePeriod = 1,
         .pic_order_cnt_type = 0,
         .log2_max_frame_num_minus4 = detail::order_bits_minus4,
         .log2_max_pic_order_cnt_lsb_minus4 = detail::order_bits_minus4,
     };
     D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC hevc_gop{
-        .GOPLength = detail::gop_length,
+        .GOPLength = key_frame_interval(options.frame_rate),
         .PPicturePeriod = 1,
         .log2_max_pic_order_cnt_lsb_minus4 = detail::order_bits_minus4,
     };
@@ -1225,7 +1226,8 @@ HRESULT D3D12VideoEncoder::Impl::convert(const CapturedFrame& frame) {
 }
 
 HRESULT D3D12VideoEncoder::Impl::encode() {
-    const auto order = detail::picture_order(frame_number);
+    const auto gop_length = key_frame_interval(options.frame_rate);
+    const auto order = detail::picture_order(frame_number, gop_length);
     HRESULT result = encode_queue->Wait(shared_fence.Get(), shared_fence_value);
     if (FAILED(result)) {
         return result;
@@ -1297,7 +1299,7 @@ HRESULT D3D12VideoEncoder::Impl::encode() {
     if (options.codec == VideoCodec::H264) {
         h264_picture.FrameType = order.idr ? D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_IDR_FRAME
                                          : D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_P_FRAME;
-        h264_picture.idr_pic_id = static_cast<UINT>((frame_number / detail::gop_length) & 0xffffU);
+        h264_picture.idr_pic_id = static_cast<UINT>((frame_number / gop_length) & 0xffffU);
         h264_picture.PictureOrderCountNumber = order.index * 2;
         h264_picture.FrameDecodingOrderNumber = order.index;
         if (!order.idr) {
@@ -1332,14 +1334,14 @@ HRESULT D3D12VideoEncoder::Impl::encode() {
         sequence.Flags |= D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_FLAG_RATE_CONTROL_CHANGE;
     }
     D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264 h264_gop{
-        .GOPLength = detail::gop_length,
+        .GOPLength = gop_length,
         .PPicturePeriod = 1,
         .pic_order_cnt_type = 0,
         .log2_max_frame_num_minus4 = detail::order_bits_minus4,
         .log2_max_pic_order_cnt_lsb_minus4 = detail::order_bits_minus4,
     };
     D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC hevc_gop{
-        .GOPLength = detail::gop_length,
+        .GOPLength = gop_length,
         .PPicturePeriod = 1,
         .log2_max_pic_order_cnt_lsb_minus4 = detail::order_bits_minus4,
     };

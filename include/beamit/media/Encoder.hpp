@@ -21,6 +21,11 @@ struct EncoderOptions {
 
 inline constexpr std::uint32_t default_peak_factor = 2;
 inline constexpr std::uint32_t max_bitrate_limit_kbps = 4'000'000;
+inline constexpr std::uint32_t key_frame_interval_seconds = 10;
+
+[[nodiscard]] constexpr std::uint32_t key_frame_interval(std::uint32_t frame_rate) noexcept {
+    return frame_rate * key_frame_interval_seconds;
+}
 
 [[nodiscard]] constexpr std::uint32_t peak_bitrate_kbps(std::uint32_t target_kbps, std::uint32_t max_kbps) noexcept {
     const auto peak = max_kbps ? std::uint64_t{max_kbps} : std::uint64_t{target_kbps} * default_peak_factor;
