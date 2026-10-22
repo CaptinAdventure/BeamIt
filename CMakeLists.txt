@@ -84,6 +84,8 @@ target_include_directories(beamit_wintls SYSTEM INTERFACE "${wintls_SOURCE_DIR}/
 target_link_libraries(beamit_wintls INTERFACE Boost::beast crypt32 secur32 bcrypt)
 
 set(BEAMIT_HOST_SOURCES
+    src/host/AudioCapture.cpp
+    src/host/WasapiAudioCapture.cpp
     src/media/OpusAudio.cpp
     src/host/AudioEndpoint.cpp
     src/host/wss/AudioSocket.cpp
@@ -123,7 +125,7 @@ add_executable(BeamIt
 )
 target_include_directories(BeamIt PRIVATE include src "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(BeamIt PRIVATE opus spdlog CLI11::CLI11 Boost::beast Boost::json beamit_wintls
-    d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs shell32 avrt winmm advapi32)
+    d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs shell32 avrt winmm advapi32 mmdevapi)
 target_compile_definitions(BeamIt PUBLIC NOMINMAX _WIN32_WINNT=0x0A00)
 
 # Separate privilege boundary: no network, credentials, capture, clipboard or encoder dependencies.
@@ -151,6 +153,9 @@ if(TARGET NVIDIA::NVENCHeaders)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(BeamItAudioTestSource WIN32 tests/AudioTestSource.cpp)
+    target_compile_definitions(BeamItAudioTestSource PRIVATE NOMINMAX _WIN32_WINNT=0x0A00)
+    target_link_libraries(BeamItAudioTestSource PRIVATE ole32 mmdevapi shell32)
     CPMAddPackage(
         NAME Catch2
         GIT_TAG v3.7.1
@@ -163,6 +168,7 @@ if(BUILD_TESTING)
     )
 
     add_executable(BeamItTests
+        tests/AudioCaptureTests.cpp
         tests/AudioTests.cpp
         tests/AudioWssTests.cpp
         tests/CaptureTypesTests.cpp
@@ -187,9 +193,10 @@ if(BUILD_TESTING)
     )
     target_include_directories(BeamItTests PRIVATE include src "${CMAKE_CURRENT_BINARY_DIR}/generated")
     add_dependencies(BeamItTests BeamItInputHelper)
+    add_dependencies(BeamItTests BeamItAudioTestSource)
     target_compile_definitions(BeamItTests PRIVATE BEAMIT_USE_CATCH2=1 NOMINMAX _WIN32_WINNT=0x0A00)
     target_link_libraries(BeamItTests PRIVATE opus Catch2::Catch2WithMain spdlog Boost::beast Boost::json beamit_wintls
-        d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs shell32 avrt winmm advapi32)
+        d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs shell32 avrt winmm advapi32 mmdevapi)
     if(TARGET NVIDIA::NVENCHeaders)
         target_sources(BeamItTests PRIVATE tests/NvencVideoEncoderTests.cpp src/media/NvencVideoEncoder.cpp)
         target_link_libraries(BeamItTests PRIVATE NVIDIA::NVENCHeaders)

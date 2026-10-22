@@ -90,6 +90,12 @@ struct AudioEntry {
     media::AudioConfiguration configuration;
     std::shared_ptr<AudioSocket> socket;
     std::map<std::uint32_t, AudioTrack> capture_tracks;
+    struct CaptureState {
+        std::unique_ptr<AudioCapture> capture;
+        RequestId request_id;
+        bool ready{};
+    };
+    std::map<std::uint32_t, CaptureState> captures;
     std::uint32_t next_track_id{net::protocol::microphone_track_id + 1};
 };
 
@@ -157,6 +163,8 @@ private:
     void stop_audio(const json::object& message, const RequestId& id);
     void start_audio_track(const json::object& message, const RequestId& id);
     void stop_audio_track(const json::object& message, const RequestId& id);
+    void end_audio_track(const std::shared_ptr<AudioEntry>& entry, std::uint32_t track_id,
+                         std::string_view reason, std::string_view message = {}, const RequestId& id = std::nullopt);
     std::shared_ptr<AudioEntry> find_audio(const json::object& message);
     void end_audio(std::string_view reason, std::string_view message = {}, const RequestId& id = std::nullopt);
 

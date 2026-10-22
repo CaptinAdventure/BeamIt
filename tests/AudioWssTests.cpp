@@ -2,6 +2,7 @@
 #include "host/wss/HttpFrontend.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
 #include <set>
 
 using namespace beamit;
@@ -10,6 +11,13 @@ using namespace beamit::host::wss;
 using namespace std::chrono_literals;
 
 namespace {
+
+class TestAudioCapture final : public AudioCapture {
+public:
+    void stop() noexcept override {}
+};
+
+std::map<std::uint32_t, AudioCaptureCallbacks> capture_callbacks;
 
 awaitable<std::shared_ptr<WebSocket>> connect_tls(Server& server, wintls::context& tls, unsigned short port) {
     auto socket = std::make_shared<WebSocket>(server.io, tls);
@@ -155,6 +163,44 @@ awaitable<void> exercise_audio(Server& server, unsigned short port) {
         received_tracks.insert(packet.track_id);
     }
     CHECK(received_tracks == std::set<std::uint32_t>{track_a, track_b});
+    co_await send_json(*control, {{"type", "start_audio_track"}, {"id", 77}, {"audio_id", audio_id},
+        {"source", json::object{{"kind", "application"}, {"pid", 7777}}}});
+    const auto initialization_failure = co_await read_json(*control);
+    CHECK(initialization_failure.at("type") == "audio_track_stopped");
+    CHECK(initialization_failure.at("id") == 77);
+    CHECK(initialization_failure.at("reason") == "capture_failed");
+    CHECK(server.options.audio->connected());
+
+    // Stop while activation is pending; a late readiness callback cannot resurrect the removed track.
+    co_await send_json(*control, {{"type", "start_audio_track"}, {"id", 78}, {"audio_id", audio_id},
+        {"source", json::object{{"kind", "application"}, {"pid", 8888}}}});
+    co_await send_json(*control, {{"type", "ping"}});
+    CHECK((co_await read_json(*control)).at("type") == "pong");
+    const auto routes = server.options.audio->tracks();
+    const auto pending = std::ranges::find_if(routes, [](const auto& track) { return track.pid == 8888; });
+    REQUIRE(pending != routes.end());
+    co_await send_json(*control, {{"type", "stop_audio_track"}, {"id", 79}, {"audio_id", audio_id},
+        {"track_id", pending->id}});
+    const auto cancelled_start = co_await read_json(*control);
+    const auto cancelled_stop = co_await read_json(*control);
+    CHECK(cancelled_start.at("id") == 78);
+    CHECK(cancelled_stop.at("id") == 79);
+    capture_callbacks.at(pending->id).started();
+    co_await send_json(*control, {{"type", "ping"}});
+    CHECK((co_await read_json(*control)).at("type") == "pong");
+    // A capture error removes only that track, while another encoder and the microphone remain active.
+    co_await send_json(*control, {{"type", "start_audio_track"}, {"audio_id", audio_id},
+        {"source", json::object{{"kind", "application"}, {"pid", 6789}}}});
+    track_reply = co_await read_json(*control);
+    const auto failing_track =
+        static_cast<std::uint32_t>(track_reply.at("track").as_object().at("track_id").as_int64());
+    capture_callbacks.at(failing_track).failed("Simulated WASAPI device failure");
+    const auto failed_track = co_await read_json(*control);
+    CHECK(failed_track.at("type") == "audio_track_stopped");
+    CHECK(failed_track.at("track_id") == failing_track);
+    CHECK(failed_track.at("reason") == "capture_failed");
+    CHECK(server.options.audio->connected());
+    CHECK(server.options.audio->submit_pcm(failing_track, pcm) == AudioSubmitResult::NotConnected);
     audio->binary(true);
     const auto incoming = net::protocol::encode_audio_packet(
         {.discontinuity = true, .payload = client_codec.encode(pcm)}, configuration);
@@ -287,6 +333,13 @@ TEST_CASE("Audio WSS authenticates and exchanges Opus in both directions", "[.au
     }
     options.auth_salt = net::random_bytes(16);
     options.auth_iterations = 1;
+    capture_callbacks.clear();
+    options.make_audio_capture = [](AudioTrack track, std::shared_ptr<AudioEndpoint>, AudioCaptureCallbacks callbacks) {
+        capture_callbacks[track.id] = callbacks;
+        if (track.pid == 7777) callbacks.failed("Simulated activation failure");
+        else if (track.pid != 8888) callbacks.started();
+        return std::make_unique<TestAudioCapture>();
+    };
     Server server(std::move(options));
     server.tls.use_certificate(server.options.identity.certificate.get());
     tcp::acceptor acceptor(server.io, {asio::ip::address_v4::loopback(), 0});

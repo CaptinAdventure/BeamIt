@@ -35,7 +35,8 @@ struct AudioTrack {
 class AudioPipeline;
 class AudioEndpoint {
 public:
-    [[nodiscard]] AudioSubmitResult submit_pcm(std::uint32_t track_id, std::span<const float> samples);
+    [[nodiscard]] AudioSubmitResult submit_pcm(std::uint32_t track_id, std::span<const float> samples,
+                                             bool discontinuity = false);
     [[nodiscard]] std::optional<AudioPcmPacket> receive_pcm();
     [[nodiscard]] bool connected() const;
 
@@ -58,7 +59,7 @@ public:
     AudioPipeline(media::AudioConfiguration configuration, std::function<void()> notify_output);
     ~AudioPipeline();
     void stop();
-    [[nodiscard]] AudioSubmitResult submit_pcm(std::span<const float> samples);
+    [[nodiscard]] AudioSubmitResult submit_pcm(std::span<const float> samples, bool discontinuity = false);
     [[nodiscard]] bool submit_encoded(net::protocol::AudioPacket packet);
     [[nodiscard]] std::optional<net::protocol::AudioPacket> receive_encoded();
     [[nodiscard]] std::optional<AudioPcmPacket> receive_pcm();
@@ -72,7 +73,11 @@ private:
     std::function<void()> notify_output_;
     mutable std::mutex mutex_;
     std::condition_variable wake_;
-    std::deque<std::vector<float>> encode_queue_;
+    struct EncodeInput {
+        std::vector<float> samples;
+        bool discontinuity{};
+    };
+    std::deque<EncodeInput> encode_queue_;
     std::deque<net::protocol::AudioPacket> decode_queue_;
     std::deque<net::protocol::AudioPacket> encoded_;
     std::deque<AudioPcmPacket> decoded_;

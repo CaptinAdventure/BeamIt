@@ -980,17 +980,17 @@ microseconds apart, so `frames_sent` may differ from `frames_encoded` by one.
   the network is the bottleneck.
 * **Raise** cautiously when all of these are low for several reports.
 
-### 5.16 Two-way audio (codec/transport only)
+### 5.16 Two-way audio
 
 Audio is independent of video: at most one full-duplex audio socket exists
 per authenticated signaling session. That socket multiplexes multiple
 host-to-client capture tracks and exactly one client-to-host microphone
 route. Capture tracks have independent codecs, queues, counters and
-lifetimes; they do not create virtual microphones. The host
-currently provides PCM submit/receive APIs only; it does **not** capture
-Windows playback, render incoming audio, or expose a microphone to Teams.
-No synthetic source runs in the production host. Without a PCM producer the
-host sends no audio packets; incoming PCM can be consumed by future device I/O.
+lifetimes; they do not create virtual microphones. The host automatically
+captures Windows playback for each selected outgoing track using event-driven
+WASAPI process loopback. It does **not** render incoming audio or expose a
+microphone to Teams; incoming decoded PCM is available for future device I/O.
+No synthetic source runs in the production host.
 
 #### 5.16.1 Start and stop
 
@@ -1090,7 +1090,7 @@ After opening the audio socket, explicitly select a capture source on
 }
 ```
 
-Host reply:
+Host reply after WASAPI activation and capture start succeed:
 
 ```json
 {
@@ -1117,11 +1117,22 @@ An application source describes include-process-tree loopback. Desktop
 selection instead uses `"source": { "kind": "desktop" }`; its reply contains
 `"source": { "kind": "desktop", "exclude_host_process_tree": true }`. This
 describes cross-output-device process-loopback capture excluding BeamIt's
-own process tree, not a selected output-device mix. These are routing
-descriptors for future WASAPI integration, not a claim that audio is
-already being captured. Application PIDs must be positive 32-bit integers;
-the codec/transport layer does not verify liveness or process ancestry.
-BeamIt's own PID is rejected.
+own process tree, not a selected output-device mix. Application PIDs must be
+positive 32-bit integers identifying a live process that the host can open
+for limited query/synchronization access. BeamIt's own PID is rejected.
+Windows performs conversion/resampling to the advertised float PCM format;
+the host assembles capture chunks into the configured Opus packet duration.
+Silent capture buffers produce silence; capture discontinuities discard any
+partial packet and mark the next packet discontinuous. A full capture queue
+drops the new packet and marks the next accepted packet discontinuous.
+
+Capture activation runs off the signaling thread with a ten-second timeout.
+If startup fails, the reply is `audio_track_stopped` with the original request
+`id`, the allocated `track_id`, `reason: "capture_failed"` and an explanatory
+`message`, instead of `audio_track_started`. Runtime capture errors send the
+same notification without a request `id`. Only that track stops; other
+capture tracks, the incoming microphone route and video remain active.
+The host does not silently fall back to desktop capture on application failure.
 
 At most eight outgoing capture tracks are allowed. Desktop capture is
 exclusive: stop all application tracks before starting desktop, and stop
@@ -1160,6 +1171,12 @@ route). Starting tracks before the audio upgrade completes returns
 `not_ready`. Track-limit exhaustion returns `limit_reached`.
 `stop_audio`, disconnection, session supersession and password revocation
 tear down all outgoing tracks and the microphone together.
+Tracks count toward limits while capture activation is pending. A pending
+track can be canceled using `stop_audio_track`; both the original start
+request and the stop request receive `audio_track_stopped` replies with
+`reason: "requested"` and their respective request IDs. Whole-audio teardown
+instead sends `audio_stopped`, which also cancels any pending track starts;
+clients must not wait for separate start replies after that notification.
 
 ```text
 client                                     host
@@ -1170,7 +1187,7 @@ client                                     host
   |<------------------- audio_track_started --| track 2 + config
   |--- start_audio_track (application B) ----->| /control
   |<------------------- audio_track_started --| track 3 + config
-  |<====== Opus track 2 / Opus track 3 ========| independent host PCM -> encode
+  |<====== Opus track 2 / Opus track 3 ========| WASAPI per process tree -> encode
   |========== Opus microphone track 1 =======>| decode -> one host microphone route
   |--- stop_audio_track (2) ----------------->| /control
   |<------------------- audio_track_stopped --| track 3 + microphone continue

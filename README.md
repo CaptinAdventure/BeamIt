@@ -182,7 +182,7 @@ This replaces the bandwidth-heavy all-IDR test path so static areas and terminal
 
 The shared input texture permits simultaneous-access interop for D3D11, and conversion commands are flushed before signaling work to D3D12. Video resource transitions stay on the encode queue; buffers cross to the graphics readback queue in `COMMON` state. This avoids using video-only resource states on a graphics command list.
 
-## Audio codec and transport
+## Audio capture, codec and transport
 
 The host supports one authenticated, bidirectional Opus audio WebSocket per
 session, separate from all video streams. That connection multiplexes up to
@@ -197,34 +197,48 @@ Frame size (480 samples/channel), PCM storage size, timestamps and the
 advertised JSON duration are derived from sample rate and packet duration.
 Clients must parse the offer rather than assume those defaults.
 
-**This step is codec/transport only.** WASAPI capture/playback, microphone
-redirection into Teams and client audio integration are not implemented.
-The production host has no synthetic audio source and sends nothing until
-PCM is supplied. Device routing, feedback avoidance and playback buffering
-remain for the next step.
+Outgoing tracks automatically capture Windows playback using event-driven
+WASAPI process loopback. Incoming audio is decoded to PCM only: playback,
+virtual-microphone redirection into Teams and client audio integration are
+not implemented. The production host has no synthetic audio source.
 
 Clients first use `start_audio` and open the offered socket. Then
 `start_audio_track` explicitly selects `source.kind = application` with a PID
 (include its process tree), or `source.kind = desktop` (exclude BeamIt's process
 tree across playback devices). The response gives that track's ID and Opus
-configuration. `stop_audio_track` removes only that outgoing track; video
+configuration after capture actually starts. `stop_audio_track` removes only that outgoing track; video
 and the incoming microphone are unaffected. Desktop/application overlap and
 duplicate application PIDs are rejected to avoid double playback; clients
-must also avoid overlapping parent/child application trees. These source
-descriptors prepare for WASAPI; they do not start real device capture yet.
+must also avoid overlapping parent/child application trees. Application PIDs
+must identify a live, accessible process. Activation has a ten-second timeout;
+startup/runtime capture errors report `audio_track_stopped` with
+`reason: "capture_failed"` and a message, without ending other tracks or the
+microphone route.
+
+Each capture runs on its own MTA/MMCSS worker, separate from the network and
+codec workers. WASAPI supplies float PCM at the advertised sample rate and
+channel count; Windows performs format conversion/resampling. Arbitrary
+capture chunks and silence are assembled into packets derived from the
+configuration. Capture discontinuities discard partial packets; capture
+queue overflow drops a packet and marks the next accepted one discontinuous.
+Process loopback was chosen over a selected output-device mix to follow
+application trees across playback devices and exclude BeamIt's own playback
+from desktop capture. No packet-local resampler or wider desktop fallback is
+used when an application cannot be captured.
 
 For host integration, retain `HostServerOptions::audio` before passing the
 options to `run_host_server`. Its thread-safe `AudioEndpoint::tracks()` reports
-active track IDs, sources and configuration. `submit_pcm(track_id, samples)`
+active track IDs, sources and configuration. `submit_pcm(track_id, samples, discontinuity)`
 accepts exactly one packet of normalized, interleaved float PCM for a host
 capture track, returning
 `Accepted`, `NotConnected` or `QueueFull`; `receive_pcm` returns decoded
 `AudioPcmPacket`s from the single microphone route, with sequence/sample
 timestamp/discontinuity metadata. Submitting host PCM to that incoming
 microphone ID throws instead of mixing directions.
-Format errors throw explicitly. Device callbacks should not call these
-locking/allocating APIs directly; bridge through a suitable device-side
-buffer when WASAPI is added. Session teardown clears pending PCM and detaches
+Format errors throw explicitly. The WASAPI capture worker feeds this endpoint;
+do not also inject synthetic PCM into a live capture track. Real-time device
+callbacks should not call these locking/allocating APIs directly.
+Session teardown stops capture before clearing pending PCM and detaching
 the endpoint. Each track has its own codec state and dedicated MMCSS worker;
 bounded per-track queues and round-robin socket writes prevent a busy source
 from monopolizing the pending output. Queues drop stale output with
@@ -246,6 +260,10 @@ and synthetic test-only PCM to exercise authentication, token handling,
 multi-track routing, capture selection/lifecycle and the single incoming
 microphone without WASAPI. Configure/build with CLion's managed
 Windows CMake toolchain as for the other host tests.
+Run `BeamItTests "[.wasapi-hardware]"` separately on a Windows machine with an
+active playback device. It launches the test-only `BeamItAudioTestSource`
+helper with a brief quiet tone, verifies application capture through
+Opus encode/decode and verifies desktop capture excludes that child process.
 
 ## Secure WebSocket host
 

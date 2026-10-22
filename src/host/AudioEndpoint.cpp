@@ -10,7 +10,7 @@
 
 namespace beamit::host {
 
-AudioSubmitResult AudioEndpoint::submit_pcm(std::uint32_t track_id, std::span<const float> samples) {
+AudioSubmitResult AudioEndpoint::submit_pcm(std::uint32_t track_id, std::span<const float> samples, bool discontinuity) {
     std::lock_guard lock(mutex_);
     const auto found = tracks_.find(track_id);
     if (found == tracks_.end()) return AudioSubmitResult::NotConnected;
@@ -18,7 +18,7 @@ AudioSubmitResult AudioEndpoint::submit_pcm(std::uint32_t track_id, std::span<co
         throw std::invalid_argument("Cannot submit host PCM to the client microphone track");
     }
     const auto pipeline = found->second.pipeline.lock();
-    return pipeline ? pipeline->submit_pcm(samples) : AudioSubmitResult::NotConnected;
+    return pipeline ? pipeline->submit_pcm(samples, discontinuity) : AudioSubmitResult::NotConnected;
 }
 
 std::optional<AudioPcmPacket> AudioEndpoint::receive_pcm() {
@@ -88,7 +88,7 @@ bool AudioPipeline::running() const {
     return !stopping_;
 }
 
-AudioSubmitResult AudioPipeline::submit_pcm(std::span<const float> samples) {
+AudioSubmitResult AudioPipeline::submit_pcm(std::span<const float> samples, bool discontinuity) {
     if (samples.size() != configuration().sample_count() ||
         !std::ranges::all_of(samples, [](float value) { return std::isfinite(value) && std::abs(value) <= 1.0f; })) {
         throw std::invalid_argument("PCM submission must contain exactly one normalized audio packet");
@@ -96,7 +96,7 @@ AudioSubmitResult AudioPipeline::submit_pcm(std::span<const float> samples) {
     std::lock_guard lock(mutex_);
     if (stopping_) return AudioSubmitResult::NotConnected;
     if (encode_queue_.size() >= max_queued_audio_packets) return AudioSubmitResult::QueueFull;
-    encode_queue_.emplace_back(samples.begin(), samples.end());
+    encode_queue_.push_back({{samples.begin(), samples.end()}, discontinuity});
     wake_.notify_one();
     return AudioSubmitResult::Accepted;
 }
@@ -135,7 +135,7 @@ void AudioPipeline::run() {
         const MmcssTaskGuard mmcss(set_realtime_priority_with_handle());
         if (!mmcss.registered()) spdlog::warn("Audio MMCSS registration failed; using thread-priority fallback");
         while (true) {
-            std::vector<float> pcm;
+            EncodeInput pcm;
             std::optional<net::protocol::AudioPacket> incoming;
             {
                 std::unique_lock lock(mutex_);
@@ -150,10 +150,11 @@ void AudioPipeline::run() {
                     decode_queue_.pop_front();
                 }
             }
-            if (!pcm.empty()) {
+            if (!pcm.samples.empty()) {
                 net::protocol::AudioPacket packet{.sequence = sequence_,
-                    .sample_timestamp = sequence_ * configuration().frame_size(), .discontinuity = sequence_ == 0,
-                    .payload = codec_.encode(pcm)};
+                    .sample_timestamp = sequence_ * configuration().frame_size(),
+                    .discontinuity = sequence_ == 0 || pcm.discontinuity,
+                    .payload = codec_.encode(pcm.samples)};
                 ++sequence_;
                 bool notify{};
                 {
