@@ -202,6 +202,13 @@ WASAPI process loopback. Incoming audio is decoded to PCM only: playback,
 virtual-microphone redirection into Teams and client audio integration are
 not implemented. The production host has no synthetic audio source.
 
+The source-built **BeamIt Microphone** driver subproject is documented in
+[`drivers/BeamItMicrophone`](drivers/BeamItMicrophone/README.md). It now includes
+a capture-only PortCls/WaveRT endpoint, exclusive producer leases, bounded PCM
+buffering, an INF/catalog package and a local injection/deployment/test utility.
+There is no external virtual-cable dependency. The package remains unsigned;
+loaded-driver/Teams validation and host integration are still pending.
+
 Clients first use `start_audio` and open the offered socket. Then
 `start_audio_track` explicitly selects `source.kind = application` with a PID
 (include its process tree), or `source.kind = desktop` (exclude BeamIt's process
