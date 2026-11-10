@@ -43,6 +43,7 @@ final class BeamItFrameView: NSView {
     private var pendingPixelBuffer: CVPixelBuffer?
     private var presentationScheduled = false
     private var formatDescription: CMVideoFormatDescription?
+    private(set) var screenshotPixelBuffer: CVPixelBuffer?
 
     override var wantsUpdateLayer: Bool { true }
 
@@ -109,6 +110,7 @@ final class BeamItFrameView: NSView {
         let displayLayer = layer as? AVSampleBufferDisplayLayer
         displayLayer?.sampleBufferRenderer.enqueue(sampleBuffer)
         if displayLayer != nil {
+            screenshotPixelBuffer = pixelBuffer
             let now = ProcessInfo.processInfo.systemUptime
             diagnostics?.queued(milliseconds: (now - queuedSince) * 1000, captureUS: captureUS, now: now)
         }

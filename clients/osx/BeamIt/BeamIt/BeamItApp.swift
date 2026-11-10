@@ -50,6 +50,10 @@ struct BeamItApp: App {
                     set: { BeamItAntiIdle.shared.isEnabled = $0 }
                 ))
                 Divider()
+                Button("Save PNG Screenshot…") {
+                    BeamItScalingMenu.shared.controller?.saveScreenshot()
+                }
+                .disabled(BeamItScalingMenu.shared.controller == nil)
                 Button("Change Parameters…") {
                     BeamItStreamWindowController.changeActiveStreamParameters()
                 }

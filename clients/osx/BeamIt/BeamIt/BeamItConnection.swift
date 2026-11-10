@@ -19,6 +19,7 @@ final class BeamItConnection {
     private var clockTask: Task<Void, Never>?
     let clockEstimate = BeamItClockEstimate()
     private var streams: [String: BeamItVideoStream] = [:]
+    private(set) var audio: BeamItAudioSession?
     private var openingStreamAttention: [String: Set<String>] = [:]
     private var isDisconnected = false
     private var isAuthenticated = false
@@ -130,6 +131,128 @@ final class BeamItConnection {
         )
     }
 
+    func startAudio() async throws -> BeamItAudioSession {
+        guard audio == nil else {
+            throw ConnectionError.hostRejected("Audio is already active for this connection.")
+        }
+        let response = try await request(type: "start_audio", fields: [:], expectedType: "audio_offer")
+        let offer: BeamItAudioOffer
+        do {
+            let data = try JSONSerialization.data(withJSONObject: response)
+            offer = try JSONDecoder().decode(BeamItAudioOffer.self, from: data)
+            try offer.microphone.opus.validate()
+            guard let hostToClient = response["hostToClient"] as? [String: Any],
+                  let hostTracks = hostToClient["tracks"] as? [[String: Any]],
+                  hostTracks.isEmpty,
+                  offer.audioID.count >= 8, offer.tokenExpiresInMS > 0, offer.audioVersion == 2,
+                  offer.microphone.trackID > 0, offer.microphone.trackID <= Int(UInt32.max),
+                  offer.microphone.codec == "opus",
+                  offer.url.scheme?.lowercased() == "wss",
+                  offer.url.host?.lowercased() == controlURL.host?.lowercased(),
+                  offer.url.port == controlURL.port,
+                  offer.url.path == "/audio/\(offer.audioID)" else {
+                throw ConnectionError.invalidAudioOffer
+            }
+        } catch {
+            if let audioID = response["audio_id"] as? String {
+                _ = try? await request(
+                    type: "stop_audio",
+                    fields: ["audio_id": audioID],
+                    expectedType: "audio_stopped"
+                )
+            }
+            throw error
+        }
+
+        let audio = BeamItAudioSession(offer: offer, session: session)
+        self.audio = audio
+        audio.onEnded = { [weak self, weak audio] in
+            guard let self, self.audio === audio else { return }
+            self.audio = nil
+        }
+        do {
+            try await audio.open()
+            return audio
+        } catch {
+            self.audio = nil
+            audio.close()
+            _ = try? await request(
+                type: "stop_audio",
+                fields: ["audio_id": offer.audioID],
+                expectedType: "audio_stopped"
+            )
+            throw error
+        }
+    }
+
+    func startAudioTrack(source: BeamItAudioSource) async throws -> Int {
+        guard let audio else { throw ConnectionError.hostRejected("Enable audio before adding a capture source.") }
+        try audio.validateCaptureSource(source)
+        let response = try await request(
+            type: "start_audio_track",
+            fields: ["audio_id": audio.audioID, "source": source.fields],
+            expectedType: "audio_track_started"
+        )
+        let trackID = (response["track"] as? [String: Any])?["track_id"] as? Int
+        do {
+            guard response["audio_id"] as? String == audio.audioID,
+                  let trackObject = response["track"] as? [String: Any],
+                  let sourceObject = trackObject["source"] as? [String: Any],
+                  let kind = sourceObject["kind"] as? String,
+                  kind == (source == .desktop ? "desktop" : "application") else {
+                throw ConnectionError.invalidMessage
+            }
+            if let pid = source.pid,
+               (sourceObject["pid"] as? Int != pid || sourceObject["include_process_tree"] as? Bool != true) {
+                throw ConnectionError.invalidMessage
+            }
+            if source == .desktop, sourceObject["exclude_host_process_tree"] as? Bool != true {
+                throw ConnectionError.invalidMessage
+            }
+            let data = try JSONSerialization.data(withJSONObject: trackObject)
+            let track = try JSONDecoder().decode(BeamItAudioTrackConfiguration.self, from: data)
+            try audio.addCaptureTrack(track, source: source)
+            return track.trackID
+        } catch {
+            if let trackID, trackID != audio.microphoneConfiguration.trackID {
+                _ = try? await request(
+                    type: "stop_audio_track",
+                    fields: ["audio_id": audio.audioID, "track_id": trackID],
+                    expectedType: "audio_track_stopped"
+                )
+            }
+            throw error
+        }
+    }
+
+    func stopAudioTrack(_ trackID: Int) async throws {
+        guard let audio, audio.captureTracks[trackID] != nil else { return }
+        let response = try await request(
+            type: "stop_audio_track",
+            fields: ["audio_id": audio.audioID, "track_id": trackID],
+            expectedType: "audio_track_stopped"
+        )
+        guard response["audio_id"] as? String == audio.audioID,
+              response["track_id"] as? Int == trackID else {
+            throw ConnectionError.invalidMessage
+        }
+        audio.removeCaptureTrack(trackID)
+    }
+
+    func stopAudio() async throws {
+        guard let audio else { return }
+        let response = try await request(
+            type: "stop_audio",
+            fields: ["audio_id": audio.audioID],
+            expectedType: "audio_stopped"
+        )
+        guard response["audio_id"] as? String == audio.audioID else {
+            throw ConnectionError.invalidMessage
+        }
+        audio.close()
+        self.audio = nil
+    }
+
     func getClipboard() async throws -> [String: Any] {
         try await request(type: "get_clipboard", fields: ["formats": ["text", "html", "image"]], expectedType: "clipboard")
     }
@@ -213,6 +336,8 @@ final class BeamItConnection {
         clockTask = nil
         popups.stop()
         clipboardSync.stop()
+        audio?.close()
+        audio = nil
         receiveTask?.cancel()
         receiveTask = nil
         for stream in streams.values {
@@ -327,6 +452,23 @@ final class BeamItConnection {
                         clipboardSync.hostClipboardChanged(message)
                         continue
                     }
+                    if message["type"] as? String == "audio_stopped", message["id"] == nil {
+                        if let reason = message["reason"] as? String, reason != "requested" {
+                            audio?.onError?(message["message"] as? String ?? "Host audio stopped: \(reason).")
+                        }
+                        audio?.close()
+                        audio = nil
+                        continue
+                    }
+                    if message["type"] as? String == "audio_track_stopped", message["id"] == nil,
+                       let trackID = message["track_id"] as? Int {
+                        audio?.handleHostStopped(
+                            trackID: trackID,
+                            reason: message["reason"] as? String,
+                            message: message["message"] as? String
+                        )
+                        continue
+                    }
                     if message["type"] as? String == "stream_offer",
                        let streamID = message["stream_id"] as? String {
                         openingStreamAttention[streamID] = []
@@ -385,9 +527,18 @@ final class BeamItConnection {
                             message["message"] as? String ?? message["code"] as? String ?? "The host rejected the request."
                         ))
                     } else if message["type"] as? String != pending.expectedType {
-                        pending.continuation.resume(throwing: ConnectionError.unexpectedReply(
-                            message["type"] as? String ?? "unknown"
-                        ))
+                        if pending.expectedType == "audio_track_started",
+                           message["type"] as? String == "audio_track_stopped" {
+                            pending.continuation.resume(throwing: ConnectionError.hostRejected(
+                                message["message"] as? String
+                                    ?? message["reason"] as? String
+                                    ?? "The host could not start the audio capture track."
+                            ))
+                        } else {
+                            pending.continuation.resume(throwing: ConnectionError.unexpectedReply(
+                                message["type"] as? String ?? "unknown"
+                            ))
+                        }
                     } else {
                         if pending.expectedType == "pong", let sentAt = pending.sentAt,
                            let hostTime = message["host_time_us"] as? UInt64 {
@@ -548,6 +699,7 @@ final class BeamItConnection {
         case unexpectedReply(String)
         case invalidMessage
         case invalidStreamURL
+        case invalidAudioOffer
         case requestTimedOut
         case disconnected
 
@@ -573,6 +725,8 @@ final class BeamItConnection {
                 return "The host sent an invalid signaling message."
             case .invalidStreamURL:
                 return "The host returned a stream URL outside the authenticated WSS endpoint."
+            case .invalidAudioOffer:
+                return "The host returned an invalid or unsupported audio offer."
             case .requestTimedOut:
                 return "The host did not answer within 10 seconds."
             case .disconnected:

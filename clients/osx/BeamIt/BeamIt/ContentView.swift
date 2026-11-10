@@ -7,6 +7,8 @@ struct ContentView: View {
     @State private var certificateFingerprint = UserDefaults.standard.string(forKey: "lastSuccessfulCertificateFingerprint") ?? ""
     @State private var trustAnyCertificate = UserDefaults.standard.bool(forKey: "lastSuccessfulTrustAnyCertificate")
     @State private var connection: BeamItConnection?
+    @State private var audioSession: BeamItAudioSession?
+    @State private var isChangingAudio = false
     @AppStorage("applicationConnectMode") private var applicationMode = BeamItApplicationMode.allWindows
     @State private var selectedSource: BeamItSource?
     @State private var isConnecting = false
@@ -235,6 +237,8 @@ struct ContentView: View {
                 }
             }
 
+            audioSection
+
             VStack(alignment: .leading, spacing: 10) {
                 Text("DESKTOP")
                     .font(.caption.weight(.semibold))
@@ -351,6 +355,128 @@ struct ContentView: View {
         }
     }
 
+    private var audioSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("TWO-WAY AUDIO")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            Toggle(
+                "Enable audio and microphone",
+                isOn: Binding(
+                    get: { audioSession?.isActive == true },
+                    set: { enabled in
+                        guard !isChangingAudio else { return }
+                        Task { await setAudioEnabled(enabled) }
+                    }
+                )
+            )
+            .disabled(isChangingAudio)
+            .help("Opens an independent authenticated audio connection and requests microphone access.")
+
+            if isChangingAudio {
+                Label("Changing audio connection…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let audioSession, audioSession.isActive {
+                HStack {
+                    Button("Add Desktop Audio") { startAudioTrack(.desktop) }
+                        .disabled(isChangingAudio || !audioSession.captureTracks.isEmpty)
+                    Menu("Add Application Audio") {
+                        ForEach(applications) { application in
+                            Button("\(application.title) · \(application.pid)") {
+                                startAudioTrack(.application(pid: application.pid, title: application.title))
+                            }
+                            .disabled(audioSession.captureTracks.values.contains {
+                                $0.source.pid == application.pid
+                            })
+                        }
+                        if applications.isEmpty {
+                            Text("No applications available")
+                        }
+                    }
+                    .disabled(isChangingAudio || applications.isEmpty ||
+                              audioSession.captureTracks.values.contains { $0.source == .desktop })
+                }
+
+                if audioSession.captureTracks.isEmpty {
+                    Text("Microphone is connected. Add a host audio source to hear playback.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(audioSession.captureTracks.values.sorted { $0.id < $1.id }) { track in
+                        HStack {
+                            Label(track.title, systemImage: "speaker.wave.2")
+                                .lineLimit(1)
+                            Spacer()
+                            Button("Stop") { stopAudioTrack(track.id) }
+                                .buttonStyle(.borderless)
+                                .disabled(isChangingAudio)
+                        }
+                        .font(.caption)
+                    }
+                }
+            }
+
+            Text("Audio capture is independent of video. Desktop capture cannot be mixed with application tracks.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .background(.background.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func setAudioEnabled(_ enabled: Bool) async {
+        guard let connection else { return }
+        isChangingAudio = true
+        defer { isChangingAudio = false }
+        connectionError = nil
+        do {
+            if enabled {
+                let audio = try await connection.startAudio()
+                audio.onError = { message in connectionError = "Audio: \(message)" }
+                audioSession = audio
+            } else {
+                try await connection.stopAudio()
+                audioSession = nil
+            }
+        } catch {
+            audioSession = connection.audio
+            connectionError = "Audio: \(error.localizedDescription)"
+        }
+    }
+
+    private func startAudioTrack(_ source: BeamItAudioSource) {
+        guard let connection else { return }
+        isChangingAudio = true
+        connectionError = nil
+        Task {
+            defer { isChangingAudio = false }
+            do {
+                _ = try await connection.startAudioTrack(source: source)
+            } catch {
+                connectionError = "Audio: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func stopAudioTrack(_ trackID: Int) {
+        guard let connection else { return }
+        isChangingAudio = true
+        connectionError = nil
+        Task {
+            defer { isChangingAudio = false }
+            do {
+                try await connection.stopAudioTrack(trackID)
+            } catch {
+                connectionError = "Audio: \(error.localizedDescription)"
+            }
+        }
+    }
+
     private func sourceRow(title: String, subtitle: String, symbol: String, source: BeamItSource) -> some View {
         Button {
             selectedSource = source
@@ -422,6 +548,7 @@ struct ContentView: View {
                     DispatchQueue.main.async {
                         newConnection?.disconnect()
                         streams.reset()
+                        audioSession = nil
                         connection = nil
                         selectedSource = nil
                         connectionError = error.localizedDescription
@@ -453,6 +580,8 @@ struct ContentView: View {
 
     private func disconnect() {
         streams.reset()
+        audioSession?.close()
+        audioSession = nil
         connection?.disconnect()
         connection = nil
         applicationSearch = ""

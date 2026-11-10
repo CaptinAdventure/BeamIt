@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 final class BeamItStreamWindowController: NSWindowController, NSWindowDelegate {
     var infoWindow: NSWindow?
@@ -102,6 +103,35 @@ final class BeamItStreamWindowController: NSWindowController, NSWindowDelegate {
     func stopTypingText() {
         typingTask?.cancel()
         typingTask = nil
+    }
+
+    func saveScreenshot() {
+        guard let window, window.attachedSheet == nil, !isClosing else { return }
+        guard let pixelBuffer = frameView.screenshotPixelBuffer else {
+            let alert = NSAlert()
+            alert.messageText = "No video frame available"
+            alert.informativeText = "Wait for the stream to display a frame, then take a screenshot."
+            alert.beginSheetModal(for: window)
+            return
+        }
+        stopTypingText()
+        inputHandler.releaseMouseCapture()
+        inputHandler.releaseAll()
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = "BeamIt-\(Date.now.formatted(.iso8601).replacingOccurrences(of: ":", with: "-")).png"
+        panel.beginSheetModal(for: window) { response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                let data = try BeamItScreenshot.png(from: pixelBuffer)
+                try data.write(to: url, options: .atomic)
+            } catch {
+                NSLog("BeamIt screenshot failed: %@", error.localizedDescription)
+                let alert = NSAlert(error: error)
+                alert.beginSheetModal(for: window)
+            }
+        }
     }
 
     var title: String {
