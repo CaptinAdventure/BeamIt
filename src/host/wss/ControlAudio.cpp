@@ -34,12 +34,12 @@ void ControlSession::start_audio(const json::object&, const RequestId& id) {
     try {
         entry->microphone_output = std::make_shared<BeamItMicrophoneOutput>(
             entry->configuration,
-            [executor = ws_->get_executor(), weak = weak_from_this(), weak_entry = std::weak_ptr(entry)](
+            [executor = ws_->get_executor(), weak = weak_from_this(), weak_entry = std::weak_ptr(entry), id](
                 std::string message) {
-                asio::post(executor, [weak, weak_entry, message = std::move(message)] {
-                    if (const auto self = weak.lock(); self && self->audio_ == weak_entry.lock()) {
-                        self->end_audio("audio_failed", message);
-                    }
+                asio::post(executor, [weak, weak_entry, id, message = std::move(message)] {
+                    const auto self = weak.lock();
+                    const auto audio = weak_entry.lock();
+                    if (self && audio && self->audio_ == audio) self->microphone_unavailable(audio, id, message);
                 });
             },
             server_.options.make_microphone_device,
@@ -53,9 +53,24 @@ void ControlSession::start_audio(const json::object&, const RequestId& id) {
                 });
             });
     } catch (const std::exception& error) {
-        audio_.reset();
-        throw ProtocolError{"audio_failed", error.what()};
+        microphone_unavailable(entry, id, error.what());
     }
+}
+
+// Host-to-client playback must not depend on an optional microphone output (the BeamIt Microphone driver or a virtual cable): without one,
+// incoming microphone packets are decoded and discarded.
+void ControlSession::microphone_unavailable(const std::shared_ptr<AudioEntry>& entry, const RequestId& id,
+                                            std::string_view message) {
+    if (entry->microphone_error.empty()) {
+        entry->microphone_error = message.empty() ? "No microphone output is available" : message;
+        spdlog::warn("Microphone output unavailable; discarding client microphone audio: {}",
+                     entry->microphone_error);
+    }
+    if (entry->microphone_output) {
+        entry->microphone_output->stop();
+        entry->microphone_output.reset();
+    }
+    if (!entry->offered) offer_audio(entry, id);
 }
 
 void ControlSession::offer_audio(const std::shared_ptr<AudioEntry>& entry, const RequestId& id) {
@@ -69,7 +84,9 @@ void ControlSession::offer_audio(const std::shared_ptr<AudioEntry>& entry, const
         const auto audio = weak_entry.lock();
         if (!error && self && audio && self->audio_ == audio) self->end_audio("token_expired");
     });
-    const auto microphone = track_json({.id = protocol::microphone_track_id, .configuration = entry->configuration});
+    auto microphone = track_json({.id = protocol::microphone_track_id, .configuration = entry->configuration});
+    microphone["available"] = entry->microphone_error.empty();
+    if (!entry->microphone_error.empty()) microphone["message"] = entry->microphone_error;
     reply(id, {{"type", "audio_offer"}, {"audio_id", entry->id},
         {"url", fmt::format("wss://{}/audio/{}?token={}", authority_, entry->id, entry->token)},
         {"token_expires_in_ms", std::chrono::duration_cast<std::chrono::milliseconds>(protocol::token_lifetime).count()},

@@ -181,6 +181,15 @@ SetupAPI/newdev to install/update the package. On failed installation it tries
 to roll back a newly created node and reports rollback errors. It does not
 bypass signature enforcement or install a certificate.
 
+The host launcher can perform this step and check for the driver before every
+start: `Start-BeamItServer.ps1 -MicrophoneDriver <package>\BeamItMicrophone.inf`
+installs the driver (with a UAC prompt) when `\\.\BeamItMicCtl` cannot be
+opened, and `-RequireMicrophone` refuses to start the host without it.
+Where the unsigned driver cannot be loaded (for example with Secure Boot and
+HVCI), the host can use the signed third-party VB-Audio Virtual Cable instead:
+`--microphone-output auto` (the default) falls back to it when this driver is
+unavailable; see "Client microphone output" in the main README.
+
 Close all recording applications and producer handles before update/removal:
 
 ```powershell
@@ -221,8 +230,9 @@ seconds. The utility uses a high-resolution waitable timer with QPC deadlines
 and prints queue/overrun/underrun counters. It has no playback route. For
 remote microphone audio, keep the host recording stream active and select
 **BeamIt Microphone** in the application (for example, in a Teams call) before
-starting audio in the client. The host ends audio with an explicit failure if
-the driver is unavailable or cannot accept PCM; video remains unaffected.
+starting audio in the client. If the driver is unavailable or cannot accept
+PCM, the host logs it and discards microphone audio; host playback and video
+continue.
 
 Before calling this production-ready, complete Driver Verifier and applicable
 Windows audio HLK testing, competing-process/crash tests, long-run timing,

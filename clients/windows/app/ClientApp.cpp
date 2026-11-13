@@ -507,6 +507,13 @@ void ClientApp::start_audio() {
             }
 
             self->audio_id_ = offer->audio_id;
+            bool microphone_available = true;
+            if (const auto* to_host = reply->if_contains("clientToHost"); to_host && to_host->is_object()) {
+                if (const auto* available = to_host->as_object().if_contains("available");
+                    available && available->is_bool()) {
+                    microphone_available = available->as_bool();
+                }
+            }
             std::int64_t pid{};
             if (const auto selected = self->audio_source_box_.SelectedItem()) {
                 pid = winrt::unbox_value<std::int64_t>(selected.as<controls::ComboBoxItem>().Tag());
@@ -537,7 +544,7 @@ void ClientApp::start_audio() {
                 });
             };
             self->session_->open_audio(*offer, std::move(callbacks),
-                [weak, audio, audio_id = offer->audio_id, source = std::move(source)](
+                [weak, audio, audio_id = offer->audio_id, source = std::move(source), microphone_available](
                     std::expected<void, SessionError> opened) mutable {
                     const auto app = weak.lock();
                     if (!app || !app->session_ || app->audio_client_ != audio) return;
@@ -554,7 +561,7 @@ void ClientApp::start_audio() {
                     app->audio_status_.Text(L"Starting host audio track…");
                     app->session_->request("start_audio_track",
                         {{"audio_id", audio_id}, {"source", std::move(source)}}, "audio_track_started",
-                        [weak, audio](std::expected<json::object, SessionError> started) {
+                        [weak, audio, microphone_available](std::expected<json::object, SessionError> started) {
                             const auto owner = weak.lock();
                             if (!owner || !owner->session_ || owner->audio_client_ != audio) return;
                             if (!started) {
@@ -577,7 +584,9 @@ void ClientApp::start_audio() {
                                 owner->audio_failed(error.what());
                                 return;
                             }
-                            owner->audio_status_.Text(L"Microphone and desktop audio active");
+                            owner->audio_status_.Text(microphone_available
+                                ? L"Microphone and host audio active"
+                                : L"Host audio active (no microphone output on the host)");
                         });
                 });
             self->update_connect_state();

@@ -229,16 +229,53 @@ Clients must parse the offer rather than assume those defaults.
 
 Outgoing tracks automatically capture Windows playback using event-driven
 WASAPI process loopback. Incoming microphone audio is decoded to PCM and sent
-to the BeamIt Microphone recording device for applications such as Teams; it
-is never rendered to a speaker or redirected to a physical microphone. The
+to the host's microphone output for applications such as Teams: the BeamIt
+Microphone recording device, or VB-Audio Virtual Cable when the driver is not
+available (see [Client microphone output](#client-microphone-output)). It is
+never rendered to a real speaker or redirected to a physical microphone. The
 macOS client plays host tracks locally and sends its microphone through this
 host route. The production host has no synthetic audio source.
+
+### Client microphone output
+
+`BeamIt.exe --microphone-output <value>` (launcher: `-MicrophoneOutput <value>`)
+chooses where client microphone audio goes:
+
+| Value | Output |
+| --- | --- |
+| `auto` (default) | BeamIt Microphone driver; if it is unavailable or busy when audio starts, VB-Audio Virtual Cable |
+| `beamit` | BeamIt Microphone driver only |
+| `vb-cable` | VB-Audio Virtual Cable only |
+| any other text | the active playback device with that friendly name (case-insensitive), else the single one containing it |
+
+VB-Audio Virtual Cable is a free (donationware) third-party driver that is
+already signed, so it works with Secure Boot/HVCI where the unsigned BeamIt
+driver cannot be loaded. BeamIt does not bundle it; install it yourself from
+<https://vb-audio.com/Cable/>. The host plays microphone PCM into the cable's
+playback side ("CABLE Input (VB-Audio Virtual Cable)"; the 16-channel
+"CABLE In 16ch" endpoint is ignored) through shared-mode, event-free WASAPI
+with automatic format conversion; select **CABLE Output** as the microphone in
+Teams. Keep your real speakers or headphones as the default Windows playback
+device: if CABLE Input is the default, host sounds also enter the cable and the
+host logs an echo warning. Setting the cable to 48 kHz in the Sound control
+panel avoids resampling. Compared with the BeamIt driver, the cable adds about
+10–30 ms (a 20 ms cushion plus the audio engine period); writes never block and
+packets are dropped once more than 60 ms is queued, bounding latency. The
+selected device is opened when the client starts audio, so a missing device is
+reported as `clientToHost.available: false` like a missing driver.
+
+The cable was chosen over capturing a real microphone or adding a host-side
+mixer because it needs no driver development, is signed and widely used with
+Teams. The BeamIt driver remains the default when installed because it avoids
+the shared audio engine's extra buffering and an extra visible device pair.
+`[.microphone-render]` (hidden) plays silence into a real device; set
+`BEAMIT_TEST_MIC_OUTPUT=vb-cable` or a device name to choose it.
 
 The source-built **BeamIt Microphone** driver subproject is documented in
 [`drivers/BeamItMicrophone`](drivers/BeamItMicrophone/README.md). It now includes
 a capture-only PortCls/WaveRT endpoint, exclusive producer leases, bounded PCM
 buffering, an INF/catalog package and a local injection/deployment/test utility.
-There is no external virtual-cable dependency. The host bridge is implemented,
+The driver itself has no external virtual-cable dependency (VB-Audio Virtual Cable is an optional alternative output). The host bridge is implemented,
 but the driver package remains unsigned and loaded-driver/Teams validation is
 still pending. A recording application must have an active stream on
 **BeamIt Microphone** to receive injected audio.
@@ -274,14 +311,19 @@ accepts exactly one packet of normalized, interleaved float PCM for a host
 capture track, returning
 `Accepted`, `NotConnected` or `QueueFull`; `receive_pcm` returns decoded
 `AudioPcmPacket`s from the single microphone route, with sequence/sample
-timestamp/discontinuity metadata. The host sends that route to
-`\\.\BeamItMicCtl` on a dedicated output worker: the installed BeamIt
-Microphone driver must be available and its exclusive producer lease idle.
+timestamp/discontinuity metadata. The host sends that route to the
+microphone output selected by `HostServerOptions::make_microphone_device`
+(`microphone_device_factory()` maps `--microphone-output`) on a dedicated
+output worker. The BeamIt driver backend writes to
+`\\.\BeamItMicCtl` when the installed BeamIt
+Microphone driver is available and its exclusive producer lease idle.
 Packets must be 48 kHz stereo, 10 ms PCM; float samples are clipped and
 converted to signed PCM16, preserving sequence, sample timestamp and
 discontinuity. The three-packet user-mode queue drops stale packets and marks
-the next retained packet discontinuous. A missing or busy device reports
-`audio_failed` and ends only audio; video is unaffected. No physical
+the next retained packet discontinuous. The output is optional: a missing or
+busy device is reported as `clientToHost.available: false` in the offer (and a
+later output failure is logged), the host discards microphone PCM, and
+host-to-client playback and video continue. No physical
 microphone or speaker fallback is used. The lease is explicitly released when
 the audio socket ends, with handle cleanup as a final safeguard. Submitting
 host PCM to that incoming microphone ID throws instead of mixing directions.
@@ -365,7 +407,11 @@ Or use the launcher script, which prepares everything per instance and starts th
 .\scripts\Start-BeamItServer.ps1                       # instance "default", port 17389, all interfaces
 .\scripts\Start-BeamItServer.ps1 -Instance teams -Port 17390 -Bind 192.168.1.10
 .\scripts\Start-BeamItServer.ps1 -Instance admin-apps -Port 17391 --elevate-input
+.\scripts\Start-BeamItServer.ps1 -MicrophoneDriver C:\Package\BeamItMicrophone.inf -RequireMicrophone
+.\scripts\Start-BeamItServer.ps1 -MicrophoneOutput vb-cable -RequireMicrophone
 ```
+
+Before starting the host, the script checks that client microphone audio has an output, matching `-MicrophoneOutput` (default `auto`, passed to the host as `--microphone-output`; see [Client microphone output](#client-microphone-output)). For `auto`/`beamit` it checks that the BeamIt Microphone driver's `\\.\BeamItMicCtl` control device can be opened, with the same access the host uses (opening does not take the producer lease); `auto` then accepts VB-Audio Virtual Cable. For `vb-cable` or a device name it looks up the active playback devices in the Windows MMDevices registry, which uses the same friendly names as WASAPI. By default it only warns if no output is found, because host audio still plays and only client microphone audio is discarded. `-MicrophoneDriver <signed BeamItMicrophone.inf>` (only for `auto`/`beamit`) installs a missing driver first: it shows a UAC prompt and runs `BeamItMicProducer.exe --install`, which it looks for next to the package, next to the script or in the driver build output, then checks again. `-RequireMicrophone` refuses to start the host while no output is available. The package must already be signed and acceptable to the machine's signing policy; the script never enables test signing or installs certificates (see [`drivers/BeamItMicrophone/README.md`](drivers/BeamItMicrophone/README.md)).
 
 It keeps files in `%LOCALAPPDATA%\BeamIt\<Instance>` (or `-DataDirectory`). If missing, it creates `password.txt` (32 random bytes, base64url) and a self-signed RSA-2048 `cert.pem`/`key.pem` (PKCS#8) with the host name, `localhost` and local IPs as subject alternative names, valid for two years and regenerated within 30 days of expiry. The directory, password and key are restricted to the current user. The password is not printed; copy it from the file. The script prints the server URL for each local IPv4 address and the certificate SHA-256 fingerprint for client pinning, then runs `BeamIt.exe` next to the script (release package) or else the newest `cmake-build-*\[<config>\]BeamIt.exe` (or `-Executable`). Remaining arguments are passed to BeamIt. Using per-instance PEM files instead of the built-in `CurrentUser\My` certificate gives each instance its own pinnable identity. Works with Windows PowerShell 5.1 and PowerShell 7; ACLs are set by SID through .NET, avoiding `Set-Acl` name lookups that fail on machines with a broken domain trust.
 

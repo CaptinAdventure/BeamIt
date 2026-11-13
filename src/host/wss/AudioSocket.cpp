@@ -26,9 +26,6 @@ void AudioSocket::start() {
 
 void AudioSocket::add_track(const AudioTrack& track) {
     if (closing_ || tracks_.contains(track.id)) throw std::logic_error("Audio track is closed or already exists");
-    if (track.kind == AudioTrack::Kind::Microphone) {
-        if (!microphone_output_) throw std::logic_error("Audio socket has no acquired microphone output");
-    }
     auto pipeline = std::make_shared<AudioPipeline>(track.configuration,
         [executor = ws_->get_executor(), weak = weak_from_this()] {
             asio::post(executor, [weak] {
@@ -46,7 +43,7 @@ void AudioSocket::add_track(const AudioTrack& track) {
         endpoint_->attach(track, pipeline);
     } catch (...) {
         tracks_.erase(track.id);
-        if (track.kind == AudioTrack::Kind::Microphone) {
+        if (track.kind == AudioTrack::Kind::Microphone && microphone_output_) {
             microphone_output_->stop();
             microphone_output_.reset();
         }
@@ -89,7 +86,12 @@ void AudioSocket::fail(std::string reason, std::string message) {
 void AudioSocket::output_ready() {
     if (closing_) return;
     if (microphone_output_) {
-        if (auto error = microphone_output_->error(); !error.empty()) return fail("audio_failed", std::move(error));
+        if (auto error = microphone_output_->error(); !error.empty()) {
+            // Playback tracks keep running; later microphone packets are decoded and discarded.
+            spdlog::warn("Microphone output failed; discarding client microphone audio: {}", error);
+            microphone_output_->stop();
+            microphone_output_.reset();
+        }
     }
     for (auto& [id, track] : tracks_) {
         if (auto error = track.pipeline->error(); !error.empty()) return fail("codec_failed", std::move(error));
