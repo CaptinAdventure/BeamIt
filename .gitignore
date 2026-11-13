@@ -133,3 +133,4 @@ reference
 /dist/
 /clients/osx/BeamIt/build/
 **/.DS_Store
+**/xcuserdata
