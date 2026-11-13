@@ -108,6 +108,9 @@ BeamIt host (Windows 11 x64)
 3. If Windows Firewall asks, allow access on Private networks only.
 
 More instances: Start-BeamIt.cmd -Instance teams -Port 17390
+Microphone driver: the console warns if the BeamIt Microphone driver is missing (client microphone audio is
+then discarded). Install it on start with Start-BeamIt.cmd -MicrophoneDriver <signed BeamItMicrophone.inf>;
+add -RequireMicrophone to refuse to start without it.
 Elevated input for administrator windows: Start-BeamIt.cmd --elevate-input (or tray menu > Elevate input...)
 Stop: tray icon > Exit, or Ctrl+C in the console.
 '@

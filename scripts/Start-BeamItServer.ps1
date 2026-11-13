@@ -12,8 +12,15 @@
 
 .EXAMPLE
     .\scripts\Start-BeamItServer.ps1
+    Before starting, the script checks that the BeamIt Microphone driver (\\.\BeamItMicCtl) can be opened. Without it
+    host audio still plays, but client microphone audio is discarded. With -MicrophoneDriver, a missing driver is
+    installed from that signed package (UAC prompt, BeamItMicProducer.exe --install). -RequireMicrophone refuses to
+    start the host while the driver is unavailable.
+
 .EXAMPLE
     .\scripts\Start-BeamItServer.ps1 -Instance teams -Port 17390 -Bind 192.168.1.10
+.EXAMPLE
+    .\scripts\Start-BeamItServer.ps1 -MicrophoneDriver C:\Package\BeamItMicrophone.inf -RequireMicrophone
 #>
 [CmdletBinding()]
 param(
@@ -26,6 +33,10 @@ param(
     [string] $Executable,
     # Instance directory; defaults to %LOCALAPPDATA%\BeamIt\<Instance>.
     [string] $DataDirectory,
+    # Signed BeamItMicrophone.inf to install (elevated) when the BeamIt Microphone driver is unavailable.
+    [string] $MicrophoneDriver,
+    # Do not start the host unless the BeamIt Microphone driver is available.
+    [switch] $RequireMicrophone,
     # Extra BeamIt arguments, passed through unchanged.
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $BeamItArguments = @()
@@ -109,7 +120,67 @@ function New-ServerCertificate([string] $CertPath, [string] $KeyPath) {
     }
 }
 
+# Opens the driver's control device exactly like the host does (opening does not take the producer lease).
+# Returns $null when available, otherwise a reason.
+function Test-BeamItMicrophone {
+    if (-not ('BeamIt.MicrophoneProbe' -as [type])) {
+        Add-Type -Namespace BeamIt -Name MicrophoneProbe -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share,
+    System.IntPtr security, uint disposition, uint flags, System.IntPtr template);
+public static int Open() {
+    using (var handle = CreateFileW(@"\\.\BeamItMicCtl", 0xC0000000u, 3u, System.IntPtr.Zero, 3u, 0x80u, System.IntPtr.Zero)) {
+        return handle.IsInvalid ? Marshal.GetLastWin32Error() : 0;
+    }
+}
+'@
+    }
+    $errorCode = [BeamIt.MicrophoneProbe]::Open()
+    if ($errorCode -eq 0) { return $null }
+    if ($errorCode -in 2, 3) {
+        $device = Get-PnpDevice -ErrorAction SilentlyContinue |
+            Where-Object { $_.HardwareID -contains 'Root\BeamItMicrophone' } | Select-Object -First 1
+        if ($device) { return "the BeamIt Microphone device exists but is not working (status $($device.Status), problem $($device.Problem)); a reboot may be required" }
+        return 'the BeamIt Microphone driver is not installed'
+    }
+    "\\.\BeamItMicCtl cannot be opened ($((New-Object System.ComponentModel.Win32Exception($errorCode)).Message))"
+}
+
+function Install-BeamItMicrophone([string] $Inf) {
+    if (-not (Test-Path -LiteralPath $Inf -PathType Leaf)) { throw "Microphone driver package not found: $Inf" }
+    $Inf = (Resolve-Path -LiteralPath $Inf).Path
+    $packageDirectory = Split-Path -Parent $Inf
+    # Build layout: bin\x64\Release\BeamItMicProducer.exe next to the BeamItMicDriver\ package directory.
+    $producer = @((Join-Path $packageDirectory 'BeamItMicProducer.exe'),
+                  (Join-Path (Split-Path -Parent $packageDirectory) 'BeamItMicProducer.exe'),
+                  (Join-Path $PSScriptRoot 'BeamItMicProducer.exe'),
+                  (Join-Path $repository 'drivers\BeamItMicrophone\bin\x64\Release\BeamItMicProducer.exe')) |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $producer) { throw 'BeamItMicProducer.exe not found next to the driver package, this script or the driver build output.' }
+    $quote = { param($text) "'" + ($text -replace "'", "''") + "'" }
+    $command = "& $(& $quote $producer) --install $(& $quote $Inf); " +
+               "if (`$LASTEXITCODE) { Read-Host 'Installation failed. Press Enter to close' }; exit `$LASTEXITCODE"
+    Write-Host "Installing the BeamIt Microphone driver from $Inf (administrator approval required)..."
+    $process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $command)
+    if ($process.ExitCode -ne 0) { throw "BeamIt Microphone driver installation failed (exit code $($process.ExitCode))." }
+}
+
 $repository = Split-Path -Parent $PSScriptRoot
+$microphoneProblem = Test-BeamItMicrophone
+if ($microphoneProblem -and $MicrophoneDriver) {
+    Write-Warning "BeamIt Microphone unavailable: $microphoneProblem."
+    Install-BeamItMicrophone $MicrophoneDriver
+    $microphoneProblem = Test-BeamItMicrophone
+}
+if (-not $microphoneProblem) {
+    Write-Host 'BeamIt Microphone driver is available; client microphone audio will be delivered.'
+} elseif ($RequireMicrophone) {
+    throw "BeamIt Microphone unavailable: $microphoneProblem. Install the signed driver package (see drivers\BeamItMicrophone\README.md), pass -MicrophoneDriver <BeamItMicrophone.inf>, or omit -RequireMicrophone."
+} else {
+    Write-Warning "BeamIt Microphone unavailable: $microphoneProblem. Host audio will play, but client microphone audio is discarded. Pass -MicrophoneDriver <BeamItMicrophone.inf> to install it or -RequireMicrophone to refuse to start."
+}
+
 if (-not $Executable) {
     # Release package: BeamIt.exe sits next to this script. Repository: newest build in any configuration.
     $local = Join-Path $PSScriptRoot 'BeamIt.exe'
