@@ -151,6 +151,8 @@ constexpr RateControlCandidate rate_control_candidates[]{
 
 struct D3D12VideoEncoder::Impl {
     EncoderOptions options{};
+    unsigned minimum_chroma_idc{1};
+    unsigned maximum_chroma_idc{3};
     detail::EncodeFormat format{detail::default_encode_format};
     UINT format_planes{2};
     const char* initialization_stage{"device initialization"};
@@ -274,7 +276,11 @@ struct D3D12VideoEncoder::Impl {
     HRESULT queue_readback();
 };
 
-D3D12VideoEncoder::D3D12VideoEncoder() : impl_(std::make_unique<Impl>()) {}
+D3D12VideoEncoder::D3D12VideoEncoder(unsigned minimum_chroma_idc, unsigned maximum_chroma_idc)
+    : impl_(std::make_unique<Impl>()) {
+    impl_->minimum_chroma_idc = minimum_chroma_idc;
+    impl_->maximum_chroma_idc = maximum_chroma_idc;
+}
 
 D3D12VideoEncoder::~D3D12VideoEncoder() {
     stop();
@@ -517,6 +523,7 @@ HRESULT D3D12VideoEncoder::Impl::initialize(ID3D11Texture2D* capture_texture) {
     for (const auto& candidate : detail::hevc_formats) {
         // The D3D12 H.264 API exposes no 4:4:4/4:2:2 profiles; never change the requested codec.
         if (options.codec == VideoCodec::H264 && candidate.texture != DXGI_FORMAT_NV12) continue;
+        if (candidate.chroma_idc < minimum_chroma_idc || candidate.chroma_idc > maximum_chroma_idc) continue;
         format = candidate;
         initialization_stage = "device initialization";
         HRESULT result = initialize_format(capture_texture);

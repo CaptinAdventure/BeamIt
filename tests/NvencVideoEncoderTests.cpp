@@ -1,7 +1,9 @@
 #include "beamit/media/NvencVideoEncoder.hpp"
 #include "beamit/media/AutoVideoEncoder.hpp"
+#include "media/BitstreamInfo.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <dxgi1_2.h>
 
 #include <limits>
@@ -25,11 +27,14 @@ TEST_CASE("NVENC validates configuration without loading a driver", "[encoder][n
     REQUIRE(encoder.last_error() == E_INVALIDARG);
     EncoderOptions options{64, 64, 60, 12000, VideoCodec::H264};
     auto invalid = options;
-    invalid.codec = VideoCodec::H265;
+    invalid.codec = static_cast<VideoCodec>(42);
     REQUIRE_FALSE(encoder.configure(invalid));
     invalid = options;
     invalid.target_bitrate_kbps = std::numeric_limits<std::uint32_t>::max();
     REQUIRE_FALSE(encoder.configure(invalid));
+    invalid = options;
+    invalid.codec = VideoCodec::H265;
+    REQUIRE(encoder.configure(invalid));
     REQUIRE(encoder.configure(options));
     REQUIRE(encoder.last_error() == S_OK);
     REQUIRE(encoder.start());
@@ -80,23 +85,28 @@ TEST_CASE("NVENC D3D11 submits repeats and retains borrowed surfaces", "[.nvenc-
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     REQUIRE(SUCCEEDED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
         D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, nullptr)));
+    // NVENC HEVC rejects very small frames (64x64 is below its minimum).
+    constexpr unsigned size = 256;
     D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = desc.Height = 64;
+    desc.Width = desc.Height = size;
     desc.MipLevels = desc.ArraySize = 1;
     desc.SampleDesc.Count = 1;
     desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    std::vector<std::uint32_t> pixels(64 * 64, 0xff20a0f0);
-    D3D11_SUBRESOURCE_DATA data{pixels.data(), 64 * 4, 0};
+    std::vector<std::uint32_t> pixels(size * size, 0xff20a0f0);
+    D3D11_SUBRESOURCE_DATA data{pixels.data(), size * 4, 0};
     CapturedFrame frame;
     REQUIRE(SUCCEEDED(device->CreateTexture2D(&desc, &data, &frame.texture)));
     frame.captured_at = std::chrono::steady_clock::now();
     frame.lifetime = std::make_shared<int>(1);
     const std::weak_ptr<void> lease = frame.lifetime;
+    const auto codec = GENERATE(VideoCodec::H264, VideoCodec::H265);
+    CAPTURE(codec == VideoCodec::H264 ? "H.264" : "HEVC");
     std::unique_ptr<Encoder> selected;
     SECTION("explicit NVENC") { selected = std::make_unique<NvencVideoEncoder>(); }
-    SECTION("automatic H.264 selects NVENC 4:4:4") { selected = std::make_unique<AutoVideoEncoder>(); }
+    // Assumes the development GPU, where D3D12 rejects HEVC 4:4:4, so automatic HEVC also selects NVENC.
+    SECTION("automatic selects NVENC 4:4:4") { selected = std::make_unique<AutoVideoEncoder>(); }
     auto& encoder = *selected;
-    REQUIRE(encoder.configure({64, 64, 60, 12000, VideoCodec::H264}));
+    REQUIRE(encoder.configure({size, size, 60, 12000, codec}));
     REQUIRE(encoder.start());
     REQUIRE(encoder.try_submit(frame) == EncoderSubmitResult::Accepted);
     REQUIRE(encoder.backend_name() == L"NVENC DirectX 11");
@@ -113,11 +123,17 @@ TEST_CASE("NVENC D3D11 submits repeats and retains borrowed surfaces", "[.nvenc-
         }
         REQUIRE(packet.has_value());
         REQUIRE_FALSE(packet->data.empty());
-        REQUIRE(packet->codec == VideoCodec::H264);
+        REQUIRE(packet->codec == codec);
         REQUIRE(packet->captured_at == frame.captured_at);
         return *packet;
     };
-    REQUIRE(receive().key_frame);
+    const auto key = receive();
+    REQUIRE(key.key_frame);
+    const auto info = parse_bitstream_info(key.data, codec);
+    REQUIRE(info);
+    REQUIRE(info->chroma_format_idc == 3);
+    REQUIRE(info->bit_depth_luma == 8);
+    REQUIRE(info->codec_string.starts_with(codec == VideoCodec::H264 ? "avc1.F4" : "hvc1.4."));
     REQUIRE(lease.expired());
     REQUIRE(encoder.try_repeat_frame() == EncoderSubmitResult::Accepted);
     REQUIRE_FALSE(receive().key_frame);
@@ -125,7 +141,7 @@ TEST_CASE("NVENC D3D11 submits repeats and retains borrowed surfaces", "[.nvenc-
     encoder.stop();
     REQUIRE_FALSE(encoder.is_running());
     REQUIRE(SUCCEEDED(encoder.last_error()));
-    REQUIRE(encoder.configure({64, 64, 60, 12000, VideoCodec::H264}));
+    REQUIRE(encoder.configure({size, size, 60, 12000, codec}));
     REQUIRE(encoder.start());
     REQUIRE(encoder.try_submit(frame) == EncoderSubmitResult::Accepted);
     REQUIRE(receive().key_frame);
@@ -245,14 +261,17 @@ TEST_CASE("NVENC synthetic desktop GOP quality diagnostic", "[.nvenc-quality]") 
         CapturedFrame frame;
         REQUIRE(SUCCEEDED(device->CreateTexture2D(&desc, &data, &frame.texture)));
 
+        for (const auto codec : {VideoCodec::H264, VideoCodec::H265})
         for (const unsigned fps : {60u, 30u}) {
             const auto gop_length = key_frame_interval(fps);
             const auto frames = gop_length * 2 + 1;
             NvencVideoEncoder encoder;
-            REQUIRE(encoder.configure({width, height, fps, 48000, VideoCodec::H264, 96000}));
+            REQUIRE(encoder.configure({width, height, fps, 48000, codec, 96000}));
             REQUIRE(encoder.start());
-            const auto name = "nvenc-" + std::to_string(fps);
-            std::ofstream bitstream(output / (name + ".h264"), std::ios::binary);
+            const auto name = std::string(codec == VideoCodec::H264 ? "nvenc-h264-" : "nvenc-h265-") +
+                              std::to_string(fps);
+            std::ofstream bitstream(output / (name + (codec == VideoCodec::H264 ? ".h264" : ".h265")),
+                                    std::ios::binary);
             std::ofstream metrics(output / (name + ".csv"));
             REQUIRE(bitstream.is_open());
             REQUIRE(metrics.is_open());
