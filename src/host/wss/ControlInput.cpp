@@ -3,7 +3,69 @@
 
 #include <spdlog/fmt/fmt.h>
 
+#include <algorithm>
+#include <array>
+#include <utility>
+
 namespace beamit::host::wss {
+namespace {
+
+constexpr auto cursor_poll_interval = std::chrono::milliseconds(16);
+
+// Standard system cursors are shared USER objects, so handles loaded here equal those applications show. Other
+// (custom) cursors are reported as "default". IDs are the IDC_* resource numbers.
+std::string_view current_cursor_shape() {
+    static const auto shapes = [] {
+        const std::array<std::pair<WORD, std::string_view>, 14> names{{
+            {32512, "default"},     {32513, "text"},        {32649, "pointer"},     {32514, "wait"},
+            {32650, "progress"},    {32515, "crosshair"},   {32648, "not-allowed"}, {32646, "move"},
+            {32645, "ns-resize"},   {32644, "ew-resize"},   {32642, "nwse-resize"}, {32643, "nesw-resize"},
+            {32651, "help"},        {32516, "default"},
+        }};
+        std::array<std::pair<HCURSOR, std::string_view>, names.size()> result{};
+        for (std::size_t index = 0; index < names.size(); ++index) {
+            result[index] = {LoadCursorW(nullptr, MAKEINTRESOURCEW(names[index].first)), names[index].second};
+        }
+        return result;
+    }();
+    CURSORINFO info{.cbSize = sizeof(CURSORINFO)};
+    if (!GetCursorInfo(&info)) return "default";
+    if (!(info.flags & CURSOR_SHOWING) || !info.hCursor) return "none";
+    for (const auto& [handle, name] : shapes) {
+        if (handle == info.hCursor) return name;
+    }
+    return "default";
+}
+
+} // namespace
+
+void ControlSession::schedule_cursor() {
+    poll_cursor();
+    if (cursor_polling_ || closing_) return;
+    if (!cursor_timer_) cursor_timer_ = std::make_unique<asio::steady_timer>(ws_->get_executor());
+    cursor_polling_ = true;
+    cursor_timer_->expires_after(cursor_poll_interval);
+    cursor_timer_->async_wait([weak = weak_from_this()](beast::error_code error) {
+        auto self = weak.lock();
+        if (!self) return;
+        self->cursor_polling_ = false;
+        if (error || self->closing_) return;
+        if (std::ranges::any_of(self->streams_, [](const auto& item) { return item.second->mirror_cursor; })) {
+            self->schedule_cursor();
+        }
+    });
+}
+
+void ControlSession::poll_cursor() {
+    std::string_view shape;
+    for (const auto& [id, entry] : streams_) {
+        if (!entry->mirror_cursor || !entry->ready) continue;
+        if (shape.empty()) shape = current_cursor_shape();
+        if (entry->cursor_shape == shape) continue;
+        entry->cursor_shape = shape;
+        send({{"type", "cursor"}, {"stream_id", entry->id}, {"shape", shape}});
+    }
+}
 
 input::MouseMode ControlSession::mouse_mode_field(const json::value& value) {
     const auto mode = value.is_string() ? input::parse_mouse_mode(value.as_string()) : std::nullopt;

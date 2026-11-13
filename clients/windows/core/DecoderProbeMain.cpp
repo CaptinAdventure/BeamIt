@@ -1,6 +1,7 @@
 #include "DecoderProbe.hpp"
 
 #include <windows.h>
+#include <objbase.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>

@@ -29,21 +29,24 @@ void run_host_server(HostServerOptions options) {
                      "displays", GetLastError());
     }
     Server server(std::move(options));
-    if (server.options.elevated_input) {
-        server.input_elevation = InputElevation::Elevated;
-    } else {
+    const auto detect_process_elevation = [&server] {
         const auto integrity = input::process_integrity(GetCurrentProcessId());
         if (integrity.error) {
             server.input_elevation = InputElevation::Unknown;
             spdlog::warn("Cannot determine input handler elevation (error {})", integrity.error);
-        } else {
-            server.input_elevation = integrity.level >= SECURITY_MANDATORY_HIGH_RID
-                ? InputElevation::Elevated : InputElevation::NotElevated;
-            if (server.input_elevation == InputElevation::NotElevated) {
-                spdlog::warn("Input handler is not elevated; administrator windows may reject remote input. "
-                             "Restart BeamIt with --elevate-input to use the separate UAC-elevated helper.");
-            }
+            return;
         }
+        server.input_elevation = integrity.level >= SECURITY_MANDATORY_HIGH_RID
+            ? InputElevation::Elevated : InputElevation::NotElevated;
+        if (server.input_elevation == InputElevation::NotElevated) {
+            spdlog::warn("Input handler is not elevated; administrator windows may reject remote input. "
+                         "Restart BeamIt with --elevate-input to use the separate UAC-elevated helper.");
+        }
+    };
+    if (server.options.elevated_input) {
+        server.input_elevation = InputElevation::Elevated;
+    } else {
+        detect_process_elevation();
     }
     server.tls.use_certificate(server.options.identity.certificate.get());
     const tcp::endpoint endpoint{asio::ip::make_address(server.options.bind_address), server.options.port};
@@ -92,7 +95,6 @@ void run_host_server(HostServerOptions options) {
 
     asio::signal_set signals(server.io, SIGINT, SIGTERM);
     asio::steady_timer control_timer(server.io);
-    bool helper_failed{};
     const auto stop = [&] {
         spdlog::info("Shutting down");
         beast::error_code ignored;
@@ -155,10 +157,19 @@ void run_host_server(HostServerOptions options) {
         helper_monitor.async_wait([&](beast::error_code error) {
             if (error) return;
             if (server.options.elevated_input && !server.options.elevated_input->healthy()) {
-                helper_failed = true;
-                spdlog::critical("Elevated input helper stopped or IPC failed; stopping host (no fallback)");
-                stop();
-                return;
+                // Fall back to normal input rather than disconnecting the client; the helper channel is already
+                // closed, so it cannot inject anything further.
+                spdlog::error("Elevated input helper stopped or IPC failed; reverting to normal (non-elevated) "
+                              "input. Administrator windows may now reject remote input.");
+                if (auto session = server.active.lock()) session->downgrade_input();
+                server.options.elevated_input.reset();
+                detect_process_elevation();
+                server.publish_status();
+                if (server.options.control) {
+                    server.options.control->notify({false, "The elevated input helper stopped responding, so "
+                        "BeamIt switched back to normal input. Streams stay connected, but administrator windows "
+                        "may reject remote input.\n\nChoose Elevate input from the tray to try again."});
+                }
             }
             check_helper();
         });
@@ -171,7 +182,6 @@ void run_host_server(HostServerOptions options) {
     const MmcssTaskGuard mmcss(set_realtime_priority_with_handle());
     if (!mmcss.registered()) spdlog::warn("MMCSS registration failed; using a time-critical thread priority");
     server.io.run();
-    if (helper_failed) throw std::runtime_error("Elevated input helper failed; host stopped");
 }
 
 } // namespace beamit::host

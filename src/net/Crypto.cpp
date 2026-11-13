@@ -3,9 +3,8 @@
 #include <windows.h>
 #include <bcrypt.h>
 
-#include <spdlog/fmt/fmt.h>
-
 #include <algorithm>
+#include <format>
 #include <limits>
 #include <stdexcept>
 
@@ -14,7 +13,7 @@ namespace {
 
 void check(NTSTATUS status, const char* operation) {
     if (!BCRYPT_SUCCESS(status)) {
-        throw std::runtime_error(fmt::format("{} failed (NTSTATUS 0x{:08X})", operation,
+        throw std::runtime_error(std::format("{} failed (NTSTATUS 0x{:08X})", operation,
                                              static_cast<std::uint32_t>(status)));
     }
 }
@@ -151,7 +150,7 @@ bool constant_time_equal(std::span<const std::byte> left, std::span<const std::b
 
 Sha256 auth_proof(std::span<const std::byte> key, std::string_view role,
                   std::span<const std::byte> server_nonce, std::span<const std::byte> client_nonce) {
-    const std::string label = fmt::format("BeamIt v1 {}", role);
+    const std::string label = std::format("BeamIt v1 {}", role);
     std::vector<std::byte> message;
     message.reserve(label.size() + 1 + server_nonce.size() + client_nonce.size());
     for (const char character : label) message.push_back(static_cast<std::byte>(character));

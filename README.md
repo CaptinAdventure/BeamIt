@@ -15,10 +15,40 @@ The project is intentionally close to the problem space of RDP and Sunshine, but
 - **Remote client:** custom seamless-remoting client; no Moonlight compatibility requirement
 - **Network:** strictly LAN-only; Internet connectivity will never be a requirement
 
+## Release packages (quick start)
+
+Build everything once on the development PC (Visual Studio Build Tools 2026 with the C++ desktop and WinUI
+components; the NVIDIA SDK zip in `vendor\` for NVENC 4:4:4, or pass `-NoNvenc`):
+
+```powershell
+.\scripts\Build-Release.ps1               # host + Windows client, Release, with tests
+.\scripts\Build-Release.ps1 -SkipClient   # host only
+```
+
+It builds into `cmake-build-release\` and `clients\windows\build\`, runs the `[protocol],[host-control]` host tests
+and the client tests, and writes Git-ignored, self-contained packages to `dist\`:
+
+| Package | Copy to | Contains / needs |
+| --- | --- | --- |
+| `dist\BeamIt-Host.zip` | Windows 11 host, any folder | `BeamIt.exe`, `BeamItInputHelper.exe`, `Start-BeamIt.cmd`, launcher scripts, licenses. Static C++ runtime: nothing to install. |
+| `dist\BeamIt-Client-Windows.zip` | Windows 11 clients, any folder | `BeamIt.Client.exe` with a self-contained Windows App SDK and app-local Visual C++ runtime. Needs only the Store **HEVC Video Extensions**. |
+| `dist/BeamIt-macOS.zip` | Macs | Built on a Mac with `sh scripts/build-macos-release.sh` (ad-hoc signed; pass a team ID to sign for distribution). |
+
+On the host, unzip and double-click `Start-BeamIt.cmd` (not as administrator). It creates the per-instance password
+and certificate in `%LOCALAPPDATA%\BeamIt\default\` on first start and prints the server URL(s) and certificate
+fingerprint. Enter those in the client, with the password from that folder's `password.txt` (never printed). Allow
+the firewall prompt on **Private** networks only. Further instances: `Start-BeamIt.cmd -Instance teams -Port 17390`.
+`Start-BeamIt.cmd` runs PowerShell with `-ExecutionPolicy Bypass` for that script only, so unzipped (internet-marked)
+copies start without changing the machine policy.
+
+Rejected alternatives: an installer/MSIX (more signing and installation steps for a LAN test tool), a
+framework-dependent client (requires installing the Windows App Runtime and VC++ redistributable on each client),
+and printing or copying the password automatically (it would end up in console scrollback or clipboard history).
+
 ## Current status
 
 This repository has full-monitor DXGI capture, monitor or single-window WGC capture, and automatic codec-preserving selection between D3D12 Video Encode and native NVENC DirectX 11 encoding, prioritizing 4:4:4 sampling.
-The host serves the authenticated **WSS protocol** in [`PROTOCOL.md`](PROTOCOL.md) : one JSON signaling WebSocket plus one binary WebSocket per video stream, over TLS with a shared password. This is the executable's only mode; the earlier recorder, plaintext TCP test streamer, window listing and capability probes were removed. Remote keyboard and mouse input is routed per stream over the signaling socket. The `HTML/` browser test client is served at `/`. The host reports every top-level window (`window_opened`/`window_changed`/`window_closed`) so clients can choose secondary windows to stream. The macOS client lives in `clients/osx`; the [Windows client integration scaffold](clients/windows/README.md) is not yet a functional streaming client and awaits Windows validation.
+The host serves the authenticated **WSS protocol** in [`PROTOCOL.md`](PROTOCOL.md) : one JSON signaling WebSocket plus one binary WebSocket per video stream, over TLS with a shared password. This is the executable's only mode; the earlier recorder, plaintext TCP test streamer, window listing and capability probes were removed. Remote keyboard and mouse input is routed per stream over the signaling socket. The `HTML/` browser test client is served at `/`. The host reports every top-level window (`window_opened`/`window_changed`/`window_closed`) so clients can choose secondary windows to stream. The macOS client lives in `clients/osx`; the [Windows client](clients/windows/README.md) (WinUI 3, Media Foundation, HEVC) connects, authenticates with certificate pinning, picks sources and streams windows/desktops with keyboard and mouse input. Its clipboard, text-sending, anti-idle, popup and audio parity features are still pending.
 
 ### Current near-term goal
 
@@ -324,7 +354,7 @@ Or use the launcher script, which prepares everything per instance and starts th
 .\scripts\Start-BeamItServer.ps1 -Instance admin-apps -Port 17391 --elevate-input
 ```
 
-It keeps files in `%LOCALAPPDATA%\BeamIt\<Instance>` (or `-DataDirectory`). If missing, it creates `password.txt` (32 random bytes, base64url) and a self-signed RSA-2048 `cert.pem`/`key.pem` (PKCS#8) with the host name, `localhost` and local IPs as subject alternative names, valid for two years and regenerated within 30 days of expiry. The directory, password and key are restricted to the current user. The password is not printed; copy it from the file. The script prints the certificate SHA-256 fingerprint for client pinning, then runs the newest `cmake-build-*\BeamIt.exe` (or `-Executable`). Remaining arguments are passed to BeamIt. Using per-instance PEM files instead of the built-in `CurrentUser\My` certificate gives each instance its own pinnable identity. Works with Windows PowerShell 5.1 and PowerShell 7; ACLs are set by SID through .NET, avoiding `Set-Acl` name lookups that fail on machines with a broken domain trust.
+It keeps files in `%LOCALAPPDATA%\BeamIt\<Instance>` (or `-DataDirectory`). If missing, it creates `password.txt` (32 random bytes, base64url) and a self-signed RSA-2048 `cert.pem`/`key.pem` (PKCS#8) with the host name, `localhost` and local IPs as subject alternative names, valid for two years and regenerated within 30 days of expiry. The directory, password and key are restricted to the current user. The password is not printed; copy it from the file. The script prints the server URL for each local IPv4 address and the certificate SHA-256 fingerprint for client pinning, then runs `BeamIt.exe` next to the script (release package) or else the newest `cmake-build-*\[<config>\]BeamIt.exe` (or `-Executable`). Remaining arguments are passed to BeamIt. Using per-instance PEM files instead of the built-in `CurrentUser\My` certificate gives each instance its own pinnable identity. Works with Windows PowerShell 5.1 and PowerShell 7; ACLs are set by SID through .NET, avoiding `Set-Acl` name lookups that fail on machines with a broken domain trust.
 
 The wire protocol is specified in [`PROTOCOL.md`](PROTOCOL.md); clients are written against that document. Summary:
 
@@ -411,6 +441,7 @@ Input messages (`mouse_move`, `mouse_button`, `mouse_wheel`, `key`, `text`, `rel
 - **No stuck input.** Held keys/buttons are tracked per stream and released on `release_all`, `stop_stream`, stream failure and session end/supersede.
 - **State query.** `get_input_state` returns the host pointer position in the stream's video pixels (desktop: relative to the primary monitor, possibly outside the video on other monitors; window: relative to the window frame, or `-1,-1` when outside it or minimized) plus Shift/Ctrl/Alt/Win held state and Caps/Num/Scroll Lock toggles. The inverse mapping is exact for the even-cropped video of odd-sized windows. Verified live, including injected Shift and Caps Lock changes.
 - **DPI.** The host makes the process per-monitor DPI aware (v2) so window rectangles, the cursor and the virtual desktop are all in physical pixels.
+- **Pointer shape (opt-in).** With `start_stream.input.cursor: "client"` WGC capture omits the pointer and the host polls `GetCursorInfo` every 16 ms, sending a `cursor` message with a CSS shape name only on change (`src/host/wss/ControlInput.cpp`). Shared system cursor handles (`LoadCursorW(nullptr, IDC_*)`) are compared directly; custom cursors map to `default`, a hidden pointer to `none`. Rejected: sending cursor bitmaps (larger messages and per-application images; standard shapes cover text fields, links and resizing) and keeping the pointer in the video (it lags by a full capture/encode/decode round trip and cannot change the local pointer shape).
 
 Rejected alternatives: binary input on the stream socket (stream sockets are host→client only, and one signaling socket gives one total order across streams); `PostMessage`/`SendMessage` to the target window (bypasses focus/keyboard state and breaks many UI frameworks); virtual-key codes from the client (layout-dependent); mapping relative motion for window streams as raw deltas (the pointer escapes the streamed window).
 
@@ -430,18 +461,18 @@ keys/buttons, preserves each stream's mouse mode and switches all routes to the 
 stream IDs are unchanged; new streams also use the helper. Cancellation, launch/verification failures or a
 failure preparing the new routes leave the host running with the previous input handler and report the error
 in a local message box and log. This graceful optional activation differs from explicit `--elevate-input`, which
-still fails startup if it cannot establish the helper. Once installed, helper failure still stops the host
-(no silent fallback), preserving held-input cleanup and the existing fail-closed policy.
+still fails startup if it cannot establish the helper. Once installed, a helper failure downgrades the instance to
+normal input instead of stopping it (see below).
 
-The policy is **fail closed, stop the host**: a denied/cancelled UAC prompt, missing/invalid helper, wrong peer/session, failed IPC, a hung input operation, or unexpected helper exit is fatal. There is no normal-input fallback, reconnect or second UAC prompt. Successful RPCs use one local round trip; each has a total 200 ms I/O deadline (not a latency guarantee), and helper-process health is checked every 50 ms while serving. Startup connection establishment allows 15 seconds after UAC returns. Normal Ctrl+C shutdown closes the helper channel without reporting a helper crash.
+The policy is **fail closed at startup, downgrade while serving**: with explicit `--elevate-input`, a denied/cancelled UAC prompt, missing/invalid helper or wrong peer/session is fatal at startup. Once serving, failed IPC, a hung input operation, or unexpected helper exit closes the helper channel (its watchdog releases held input and exits), replaces every stream's input with normal non-elevated input, logs an error and shows a local "Input elevation failed" notice. Clients stay connected; the request that failed gets `internal_error`, and administrator windows reject input again until elevation is re-enabled from the tray. There is no automatic reconnect or second UAC prompt. Successful RPCs use one local round trip; each has a total 200 ms I/O deadline (not a latency guarantee), and round trips of 20 ms or more are logged as warnings (at most once every five seconds) to diagnose slow foreground windows. Helper-process health is checked every 50 ms while serving. Startup connection establishment allows 15 seconds after UAC returns. Normal Ctrl+C shutdown closes the helper channel without reporting a helper crash.
 
 Each host pre-creates a cryptographically random, single-instance, first-instance-only **local message-mode named pipe**. Its explicit protected ACL grants access only to the current logon SID, administrators and SYSTEM; remote clients are rejected. Before any command is accepted, the host verifies the kernel-reported client PID against the process handle returned by `runas`, plus its executable, session and elevated token. The helper independently verifies the pipe server PID, retained host process handle/creation time, sibling `BeamIt.exe` identity and same nonzero interactive session; its pipe handle permits identification only, not host impersonation of its elevated token. An unrelated process racing startup causes a fatal identity failure, never accepted input. The helper has no network-address, authentication-credential, process-launch, file-access or arbitrary `INPUT`-array IPC operations.
 
 The private versioned binary IPC has exact fixed message sizes, validated operation-specific fields, whitelisted scan-code mappings, finite/bounded coordinates, at most 1024 UTF-16 text units and 64 stream states. It does not change the WSS protocol. Per-stream focus, coordinates, held keys/buttons, cursor and modifier queries all execute in the helper. Its dispatch thread uses the host's MMCSS policy and holds its own 1 ms timer-resolution request. Stream/session teardown releases input there. An independent helper watchdog revokes all streams and releases held input on pipe disconnect or host exit, even if the dispatch thread is stuck in a foreground API; it then exits. Separate random pipes and expected PIDs isolate simultaneous instances.
 
-Rejected alternatives: elevating the network host (unnecessarily enlarges the privileged attack surface), a service (wrong desktop/session and unnecessary persistence), and silent fallback after UAC/helper failure (violates the requested stop-host policy).
+Rejected alternatives: elevating the network host (unnecessarily enlarges the privileged attack surface), a service (wrong desktop/session and unnecessary persistence), and silent fallback after a startup UAC/helper failure. Stopping the host on a runtime helper failure was replaced by the downgrade because an occasional slow foreground window (Win32 error 1460 at the 200 ms deadline) disconnected every client.
 
-Validation: build `BeamIt`/`BeamItTests` with CLion's configured Windows CMake, then run `[input]` in its `BeamItTests` configuration for IPC validation, stream isolation/limits/revocation and the local non-elevated path. Interactive checks still require a Windows user: launch with the switch and deny UAC (nonzero exit/no listener), approve and control an elevated test window (cursor/modifier/key/button/text/release behavior), stop the helper (host exits nonzero), use Ctrl+C (clean exit), close/kill the host with a held modifier (released), and run two distinct instances. Also check an unresponsive foreground window: a 200 ms helper RPC timeout must stop the host and release held input. UAC approval and secure-desktop behavior cannot be validated by noninteractive unit tests.
+Validation: build `BeamIt`/`BeamItTests` with CLion's configured Windows CMake, then run `[input]` in its `BeamItTests` configuration for IPC validation, stream isolation/limits/revocation and the local non-elevated path. Interactive checks still require a Windows user: launch with the switch and deny UAC (nonzero exit/no listener), approve and control an elevated test window (cursor/modifier/key/button/text/release behavior), stop the helper (host keeps running, logs the downgrade, shows the notice, held input released, input to normal windows still works), use Ctrl+C (clean exit), close/kill the host with a held modifier (released), and run two distinct instances. Also check an unresponsive foreground window: a 200 ms helper RPC timeout must downgrade to normal input and release held input. UAC approval and secure-desktop behavior cannot be validated by noninteractive unit tests.
 
 ### Taskbar attention
 
@@ -543,7 +574,8 @@ These remain open before client/network implementation:
 ## Build
 
 This project uses CMake and C++26.
-Use the IDE's configured CMake version for configure/build steps; do not assume the command-line `cmake` installation matches the project requirements.
+Use the IDE's configured CMake version for configure/build steps; do not assume the command-line `cmake` installation matches the project requirements. `scripts\Build-Release.ps1` uses the CMake bundled with Visual Studio (Build Tools) 2026 by default.
+All host targets and dependencies use the static MSVC runtime (`/MT`, `/MTd`; Opus via `OPUS_STATIC_RUNTIME`), so `BeamIt.exe` and `BeamItInputHelper.exe` run without the Visual C++ redistributable.
 For implementation details, inspect `CMakeLists.txt`.
 
 Boost **1.90.0**, including Beast and its transitive dependencies, is downloaded by CPM/CMake from the official CMake release archive with a pinned SHA-256. Only the Beast dependency graph is enabled; upstream tests, examples and fuzzers are disabled. `BeamIt` and `BeamItTests` link `Boost::beast`. The first configuration requires network access; subsequent configurations reuse the populated source. Run the `[beast]` test filter through CLion's `BeamItTests` configuration for an in-memory HTTP/WebSocket upgrade parsing check. Boost.JSON is also enabled for signaling messages, and boost-wintls **1.0.0** is downloaded by CPM (`DOWNLOAD_ONLY`, pinned SHA-256) and wrapped in the local `beamit_wintls` interface target, which links `crypt32`, `secur32` and `bcrypt` and adds MSVC `/bigobj` (the coroutine server exceeds the default object section limit). `_WIN32_WINNT` is set to Windows 10+ (`0x0A00`).
@@ -595,6 +627,8 @@ The macOS client sources live in `clients/osx/BeamIt/BeamIt/`. `BeamItApp.swift`
 - `tests/WindowIconTests.cpp` — icon PNG conversion and source-selection tests
 - `tests/WssFieldsTests.cpp` — signaling field validation and HWND text round-trip tests
 - `scripts/Start-BeamItServer.ps1` — creates per-instance password/certificate files and starts the WSS host
+- `scripts/Build-Release.ps1` — Release build of host and Windows client, packaged into `dist\` (see *Release packages*)
+- `scripts/build-macos-release.sh` — Release build of the macOS client into `dist/BeamIt-macOS.zip` (run on a Mac)
 - `src/ApplicationWindows.hpp` and `src/ApplicationWindows.cpp` — window listing and PID selection heuristic (`list_windows`, `application` sources)
 - `src/media/CodecHeaders.hpp` and `src/media/CodecHeaders.cpp` — encoder-specific Annex B parameter-set generation
 - `CMakeLists.txt` — CMake build configuration

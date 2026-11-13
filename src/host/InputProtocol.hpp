@@ -10,6 +10,8 @@ namespace beamit::host::input::ipc {
 
 inline constexpr std::uint32_t version = 1;
 inline constexpr DWORD request_timeout_ms = 200;
+// Round trips at least this long are logged (rate-limited) to diagnose stalls before they reach the timeout.
+inline constexpr ULONGLONG slow_request_ms = 20;
 inline constexpr std::size_t max_streams = 64;
 enum class Operation : std::uint32_t {
     Ping, Create, Destroy, Absolute, Relative, Button, Wheel, Key, Text, Cursor, Modifiers, Release, Shutdown

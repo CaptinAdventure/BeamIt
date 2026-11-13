@@ -128,3 +128,7 @@ _deps
 CMakeUserPresets.json
 
 reference
+
+# Release packages (scripts\Build-Release.ps1)
+/dist/
+/clients/osx/BeamIt/build/
