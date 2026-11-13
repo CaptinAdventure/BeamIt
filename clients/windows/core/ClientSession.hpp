@@ -35,6 +35,12 @@ struct StreamCallbacks {
     std::function<void(const SessionError&)> failed;
 };
 
+struct AudioCallbacks {
+    // Audio packets run on the network thread; implementations must enqueue quickly.
+    std::function<void(const net::protocol::AudioPacket&, const media::AudioConfiguration&)> packet;
+    std::function<void(const SessionError&)> failed;
+};
+
 // One authenticated signaling session plus its stream sockets (PROTOCOL.md §2-§7).
 // Request completions and events run through the dispatcher; none run after destruction.
 class Session {
@@ -67,6 +73,12 @@ public:
     void close_stream(const std::string& stream_id);
     // Drops pictures until the next key frame and asks the host for one, e.g. after a decoder error.
     void restart_stream_decoding(const std::string& stream_id);
+
+    void open_audio(const AudioOffer& offer, AudioCallbacks callbacks, Completion<void> opened);
+    void configure_audio_track(AudioTrackConfiguration track);
+    void remove_audio_track(std::uint32_t track_id);
+    void send_audio_packet(std::vector<std::byte> packet);
+    void close_audio();
 
     [[nodiscard]] std::optional<ClockEstimate::Sample> clock() const;
     [[nodiscard]] std::optional<Endpoint> endpoint() const;

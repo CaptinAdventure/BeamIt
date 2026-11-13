@@ -1,6 +1,7 @@
 #pragma once
 
 #include "net/Crypto.hpp"
+#include "net/AudioProtocol.hpp"
 
 #include <boost/json.hpp>
 
@@ -89,9 +90,24 @@ struct StreamOffer {
     std::string cursor;
 };
 
+struct AudioTrackConfiguration {
+    std::uint32_t track_id{};
+    media::AudioConfiguration configuration;
+};
+
+struct AudioOffer {
+    std::string audio_id;
+    std::string target;
+    std::chrono::milliseconds token_lifetime{};
+    AudioTrackConfiguration microphone;
+};
+
 // Rejects offers whose URL is not wss:// on the control endpoint's authority (PROTOCOL.md §5.4).
 [[nodiscard]] std::expected<StreamOffer, std::string> parse_stream_offer(const json::object& offer,
                                                                          const Endpoint& control);
+[[nodiscard]] std::expected<AudioTrackConfiguration, std::string> parse_audio_track(const json::value& value);
+[[nodiscard]] std::expected<AudioOffer, std::string> parse_audio_offer(const json::object& offer,
+                                                                       const Endpoint& control);
 
 // RTT-filtered host clock offset from ping/pong samples (PROTOCOL.md §5.15).
 class ClockEstimate {

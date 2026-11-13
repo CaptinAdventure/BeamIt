@@ -32,6 +32,7 @@ using namespace std::chrono_literals;
 // Clipboard replies may need up to six bytes per content byte after JSON escaping (PROTOCOL.md §5.11).
 constexpr std::size_t control_receive_limit = 64ULL * 1024 * 1024;
 constexpr std::size_t stream_receive_limit = 32ULL * 1024 * 1024;
+constexpr std::size_t audio_receive_limit = net::protocol::max_audio_message;
 constexpr std::size_t max_queued_bytes = 64ULL * 1024 * 1024;
 constexpr std::size_t max_held_frames = 16;
 constexpr std::size_t max_held_bytes = 64ULL * 1024 * 1024;
@@ -213,6 +214,23 @@ struct Session::State {
         bool closing{};
     };
 
+    struct Audio {
+        Audio(asio::io_context& io, wintls::context& tls, const AudioOffer& offer, AudioCallbacks callbacks)
+            : socket(io, tls), resolver(io), id(offer.audio_id), target(offer.target), lifetime(offer.token_lifetime),
+              callbacks(std::move(callbacks)) {}
+        WebSocket socket;
+        tcp::resolver resolver;
+        std::string id;
+        std::string target;
+        std::chrono::milliseconds lifetime;
+        AudioCallbacks callbacks;
+        std::map<std::uint32_t, media::AudioConfiguration> tracks;
+        std::map<std::uint32_t, std::uint64_t> previous_sequences;
+        std::deque<std::vector<std::byte>> writes;
+        std::shared_ptr<std::vector<std::byte>> active_write;
+        bool closing{};
+    };
+
     State(Dispatcher dispatcher_, Events events_)
         : dispatcher(std::move(dispatcher_)), events(std::move(events_)), clock_timer(io) {
         tls.verify_server_certificate(false);
@@ -357,6 +375,12 @@ struct Session::State {
             }
         } else if (type == "stream_stopped" && stream_id) {
             drop_stream(std::string(*stream_id));
+        } else if (type == "audio_stopped") {
+            drop_audio();
+        } else if (type == "audio_track_stopped") {
+            if (const auto track_id = integer_field(message, "track_id"); track_id && *track_id > 0) {
+                drop_audio_track(static_cast<std::uint32_t>(*track_id));
+            }
         }
         if (events.message) {
             post_ui([this, shared = std::make_shared<json::object>(std::move(message))] { events.message(*shared); });
@@ -438,10 +462,125 @@ struct Session::State {
             stream->resolver.cancel();
             close_transport(stream->socket);
         }
+        drop_audio();
         if (control) close_transport(*control);
         if (notify && events.disconnected) {
             post_ui([this, error = std::move(error)] { events.disconnected(error); });
         }
+    }
+
+    awaitable<void> run_audio(std::shared_ptr<Audio> audio, Completion<void> opened) {
+            Endpoint target_endpoint;
+            PinPolicy pin;
+            {
+                std::scoped_lock lock(mutex);
+                target_endpoint = *endpoint;
+                pin = pin_policy;
+            }
+            try {
+                {
+                    Deadline deadline(io, std::min<Clock::duration>(audio->lifetime, 15s), [&] {
+                        audio->resolver.cancel();
+                        close_transport(audio->socket);
+                    });
+                    try {
+                        (void)co_await establish(audio->socket, audio->resolver, target_endpoint, pin, audio->target,
+                                                 audio_receive_limit);
+                    } catch (...) {
+                        if (deadline.expired()) throw Failure("timeout", "The audio socket did not open in time.");
+                        throw;
+                    }
+                }
+                complete<void>(std::exchange(opened, nullptr), {});
+                beast::flat_buffer buffer;
+                while (!audio->closing) {
+                    buffer.clear();
+                    co_await audio->socket.async_read(buffer, use_awaitable);
+                    if (audio->closing) break;
+                    if (!audio->socket.got_binary()) {
+                        throw Failure("protocol_error", "The host sent a non-binary audio message.");
+                    }
+                    const auto data = buffer.cdata();
+                    const std::span<const std::byte> bytes(static_cast<const std::byte*>(data.data()), data.size());
+                    if (bytes.size() < net::protocol::audio_header_size) {
+                        throw Failure("protocol_error", "The host sent a truncated audio packet.");
+                    }
+                    const auto track_id = (std::to_integer<std::uint32_t>(bytes[12]) << 24) |
+                        (std::to_integer<std::uint32_t>(bytes[13]) << 16) |
+                        (std::to_integer<std::uint32_t>(bytes[14]) << 8) |
+                        std::to_integer<std::uint32_t>(bytes[15]);
+                    const auto track = audio->tracks.find(track_id);
+                    if (track == audio->tracks.end()) continue;
+                    const auto previous = audio->previous_sequences.find(track_id);
+                    auto packet = net::protocol::decode_audio_packet(bytes, track->second,
+                        previous == audio->previous_sequences.end()
+                            ? std::optional<std::uint64_t>{}
+                            : std::optional(previous->second));
+                    audio->previous_sequences[track_id] = packet.sequence;
+                    if (audio->callbacks.packet) audio->callbacks.packet(packet, track->second);
+                }
+            } catch (...) {
+                if (audio->closing) co_return;
+                auto error = describe(std::current_exception(), false);
+                drop_audio();
+                if (audio->callbacks.failed) audio->callbacks.failed(error);
+                if (opened) complete<void>(std::move(opened), std::unexpected(std::move(error)));
+                co_return;
+            }
+        }
+
+    void write_audio_next(const std::shared_ptr<Audio>& audio) {
+            if (audio->closing || audio->active_write || audio->writes.empty()) return;
+            audio->active_write = std::make_shared<std::vector<std::byte>>(std::move(audio->writes.front()));
+            audio->writes.pop_front();
+            audio->socket.async_write(asio::buffer(*audio->active_write),
+                [this, audio, packet = audio->active_write](beast::error_code error, std::size_t) {
+                    audio->active_write.reset();
+                    if (error) {
+                        if (!audio->closing) {
+                            const auto failure = describe(std::make_exception_ptr(boost::system::system_error(error)), false);
+                            drop_audio();
+                            if (audio->callbacks.failed) audio->callbacks.failed(failure);
+                        }
+                        return;
+                    }
+                    write_audio_next(audio);
+                });
+        }
+
+    void enqueue_audio_packet(std::vector<std::byte> packet) {
+            const auto audio = audio_session;
+            if (!audio || audio->closing || phase != Phase::Authenticated) return;
+            const auto in_flight = audio->active_write ? 1U : 0U;
+            if (audio->writes.size() + in_flight >= 3) {
+                if (!audio->writes.empty()) {
+                    audio->writes.pop_front();
+                    if (!audio->writes.empty()) {
+                        audio->writes.front()[7] |= std::byte{2};
+                    } else if (packet.size() > 7) {
+                        packet[7] |= std::byte{2};
+                    }
+                } else if (packet.size() > 7) {
+                    packet[7] |= std::byte{2};
+                }
+            }
+            audio->writes.push_back(std::move(packet));
+            write_audio_next(audio);
+        }
+
+    void drop_audio_track(std::uint32_t track_id) {
+        if (!audio_session) return;
+        audio_session->tracks.erase(track_id);
+        audio_session->previous_sequences.erase(track_id);
+    }
+
+    void drop_audio() {
+        auto audio = std::exchange(audio_session, {});
+        if (!audio) return;
+        audio->closing = true;
+        audio->resolver.cancel();
+        audio->writes.clear();
+        close_transport(audio->socket);
     }
 
     // Stream sockets (PROTOCOL.md §6-§7). All stream state is owned by the network thread.
@@ -567,6 +706,7 @@ struct Session::State {
     asio::steady_timer clock_timer;
     std::unordered_map<std::int64_t, Pending> pending;
     std::map<std::string, std::shared_ptr<Stream>> streams;
+    std::shared_ptr<Audio> audio_session;
     std::deque<std::string> writes;
     std::size_t queued_bytes{};
     bool writing{};
@@ -671,6 +811,53 @@ void Session::restart_stream_decoding(const std::string& stream_id) {
         found->second->gate.reset();
         state->request_key_frame(stream_id);
     });
+}
+
+void Session::open_audio(const AudioOffer& offer, AudioCallbacks callbacks, Completion<void> opened) {
+    auto* state = state_.get();
+    asio::post(state->io, [state, offer, callbacks = std::move(callbacks), opened = std::move(opened)]() mutable {
+        if (state->phase != State::Phase::Authenticated) {
+            state->complete<void>(std::move(opened),
+                std::unexpected(SessionError{"not_connected", "Not connected to a host."}));
+            return;
+        }
+        if (state->audio_session) {
+            state->complete<void>(std::move(opened),
+                std::unexpected(SessionError{"limit_reached", "An audio socket is already open."}));
+            return;
+        }
+        auto audio = std::make_shared<State::Audio>(state->io, state->tls, offer, std::move(callbacks));
+        state->audio_session = audio;
+        asio::co_spawn(state->io, state->run_audio(audio, std::move(opened)), asio::detached);
+    });
+}
+
+void Session::configure_audio_track(AudioTrackConfiguration track) {
+    if (!track.track_id) throw std::invalid_argument("Audio track ID must be positive.");
+    track.configuration.validate();
+    auto* state = state_.get();
+    asio::post(state->io, [state, track = std::move(track)] {
+        if (!state->audio_session) return;
+        state->audio_session->tracks.insert_or_assign(track.track_id, track.configuration);
+        state->audio_session->previous_sequences.erase(track.track_id);
+    });
+}
+
+void Session::remove_audio_track(std::uint32_t track_id) {
+    auto* state = state_.get();
+    asio::post(state->io, [state, track_id] { state->drop_audio_track(track_id); });
+}
+
+void Session::send_audio_packet(std::vector<std::byte> packet) {
+    auto* state = state_.get();
+    asio::post(state->io, [state, packet = std::move(packet)]() mutable {
+        state->enqueue_audio_packet(std::move(packet));
+    });
+}
+
+void Session::close_audio() {
+    auto* state = state_.get();
+    asio::post(state->io, [state] { state->drop_audio(); });
 }
 
 std::optional<ClockEstimate::Sample> Session::clock() const {

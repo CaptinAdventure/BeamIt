@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
+#include <atomic>
 #include <set>
 
 using namespace beamit;
@@ -15,6 +16,20 @@ namespace {
 class TestAudioCapture final : public AudioCapture {
 public:
     void stop() noexcept override {}
+};
+
+class TestMicrophoneDevice final : public BeamItMicrophoneDevice {
+public:
+    void acquire() override {}
+    void write(const BeamItMicPacket&) override {}
+    void release() noexcept override {}
+};
+
+class BusyMicrophoneDevice final : public BeamItMicrophoneDevice {
+public:
+    void acquire() override { throw std::runtime_error("Simulated driver lease busy"); }
+    void write(const BeamItMicPacket&) override {}
+    void release() noexcept override {}
 };
 
 std::map<std::uint32_t, AudioCaptureCallbacks> capture_callbacks;
@@ -101,9 +116,18 @@ awaitable<void> exercise_audio(Server& server, unsigned short port) {
 
     auto control = co_await authenticate_client(server, tls, port);
     co_await send_json(*control, {{"type", "start_audio"}, {"id", 1}});
+    const auto microphone_failure = co_await read_json(*control);
+    CHECK(microphone_failure.at("type") == "error");
+    CHECK(microphone_failure.at("code") == "audio_failed");
+    CHECK(microphone_failure.at("id") == 1);
+    CHECK_FALSE(server.options.audio->connected());
+    co_await send_json(*control, {{"type", "ping"}, {"id", 20}});
+    CHECK((co_await read_json(*control)).at("type") == "pong");
+
+    co_await send_json(*control, {{"type", "start_audio"}, {"id", 2}});
     auto offer = co_await read_json(*control);
     REQUIRE(offer.at("type") == "audio_offer");
-    CHECK(offer.at("id") == 1);
+    CHECK(offer.at("id") == 2);
     CHECK(offer.at("audio_version") == 2);
     CHECK(offer.at("hostToClient").as_object().at("tracks").as_array().empty());
     CHECK(offer.at("clientToHost").as_object().at("track_id") == protocol::microphone_track_id);
@@ -113,7 +137,7 @@ awaitable<void> exercise_audio(Server& server, unsigned short port) {
     auto path = offer_path(offer);
     co_await reject_upgrade(server, tls, port, path + "wrong");
     co_await reject_upgrade(server, tls, port, path, "https://foreign.invalid");
-    co_await send_json(*control, {{"type", "start_audio"}, {"id", 2}});
+    co_await send_json(*control, {{"type", "start_audio"}, {"id", 3}});
     CHECK((co_await read_json(*control)).at("code") == "limit_reached");
     co_await send_json(*control, {{"type", "start_audio_track"}, {"audio_id", offer.at("audio_id")},
         {"source", json::object{{"kind", "desktop"}}}});
@@ -339,6 +363,11 @@ TEST_CASE("Audio WSS authenticates and exchanges Opus in both directions", "[.au
         if (track.pid == 7777) callbacks.failed("Simulated activation failure");
         else if (track.pid != 8888) callbacks.started();
         return std::make_unique<TestAudioCapture>();
+    };
+    const auto fail_first_microphone = std::make_shared<std::atomic<bool>>(true);
+    options.make_microphone_device = [fail_first_microphone]() -> std::unique_ptr<BeamItMicrophoneDevice> {
+        if (fail_first_microphone->exchange(false)) return std::make_unique<BusyMicrophoneDevice>();
+        return std::make_unique<TestMicrophoneDevice>();
     };
     Server server(std::move(options));
     server.tls.use_certificate(server.options.identity.certificate.get());

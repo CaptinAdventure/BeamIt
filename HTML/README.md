@@ -1,9 +1,10 @@
 # BeamIt JavaScript protocol library
 
-`beamit.js` is a browser-native client library for the signaling and video
-frame contract in the repository's `PROTOCOL.md`. `index.html` is a test UI
+`beamit.js` is a browser-native client library for the signaling, video, and
+audio contracts in the repository's `PROTOCOL.md`. `index.html` is a test UI
 that exercises the host connection, authentication, window listing, stream
-controls, WebCodecs video playback, and keyboard/mouse input.
+controls, WebCodecs video and Opus playback, microphone uplink, and
+keyboard/mouse input.
 
 Load it from a secure origin (HTTPS). The BeamIt host uses WSS only; browsers
 must first trust the host certificate, for example by visiting its HTTPS
@@ -12,8 +13,8 @@ Open the host HTTPS URL; the page defaults its address field to the current
 host. The library performs the protocol's PBKDF2-HMAC-SHA256 mutual
 authentication, exposes signaling requests, opens token-authorized stream
 sockets, tracks encoder generations, parses binary video frames, and forwards
-input according to protocol section 5.9. Audio and the reserved window
-lifecycle events are not implemented.
+input according to protocol section 5.9. Audio version 2 follows protocol
+section 5.16. Reserved window lifecycle events are not implemented.
 
 ## Window attention
 
@@ -124,6 +125,40 @@ change. It uses raw pointer-lock deltas in relative mode and sends a mouse
 move before button presses and wheel events. It does not forward paste
 automatically: call `stream.text()` explicitly instead of forwarding physical
 keys for the same text.
+
+## Two-way audio testing
+
+Use **Start audio** from a trusted HTTPS page. The client checks the
+`audio_version` and negotiated Opus metadata, opens the separate WSS audio
+socket, requests microphone permission, and uses AudioWorklet/WebCodecs to
+encode the advertised packet size and send the microphone route. Host capture
+packets are decoded with a separate WebCodecs decoder for every track and
+played through the browser's default Web Audio output. Audio is independent of
+video; stopping a video stream does not stop audio.
+
+Choose **Application process tree** and enter its PID to request a host
+loopback-capture track, or choose **Desktop** for the exclusive desktop mix.
+Multiple different application PIDs can be active. Desktop cannot be combined
+with application tracks, and duplicate PIDs are rejected. Stop tracks
+individually or stop the complete audio session. The page never logs password
+or audio payload data.
+
+Audio requires secure-context `getUserMedia`, Web Audio with AudioWorklet,
+`AudioEncoder`, `AudioDecoder`, and Opus support for the negotiated sample
+rate and channel count. Missing APIs, unsupported metadata, nonmatching
+encoder packet durations, and malformed/gapped packets fail explicitly;
+there is no synthetic audio or success fallback. Queues are capped at three
+packets. The client rejects negotiated FEC because the browser API cannot
+configure it, and currently accepts the VOIP Opus application for microphone
+encoding. Host-side microphone packets are decoded by the host protocol but
+are not exposed as a virtual microphone to Teams.
+
+Library callers can use `client.startAudio()` to open an audio session. The
+returned audio object exposes `startMicrophone()`, `startTrack(source)`,
+`stopTrack(trackId)`, `stop()`, `tracks`, and audio lifecycle events. Sources
+are `{ kind: "desktop" }` or `{ kind: "application", pid }`. Browser API
+constructors and `mediaDevices` can be injected through `startAudio(options)`
+for tests; production callers should use the browser defaults.
 
 ## Video API
 

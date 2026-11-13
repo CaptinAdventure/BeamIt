@@ -1,6 +1,7 @@
 #pragma once
 
 #include "host/AudioEndpoint.hpp"
+#include "host/BeamItMicrophoneOutput.hpp"
 #include "host/wss/WebSocket.hpp"
 
 namespace beamit::host::wss {
@@ -10,7 +11,7 @@ namespace beamit::host::wss {
 class AudioSocket : public std::enable_shared_from_this<AudioSocket> {
 public:
     AudioSocket(std::shared_ptr<WebSocket> socket, std::shared_ptr<AudioEndpoint> endpoint,
-                media::AudioConfiguration configuration);
+                media::AudioConfiguration configuration, std::shared_ptr<BeamItMicrophoneOutput> microphone_output);
     void start();
     void close(websocket::close_reason reason);
     void add_track(const AudioTrack& track);
@@ -27,6 +28,7 @@ private:
     std::shared_ptr<WebSocket> ws_;
     std::shared_ptr<AudioEndpoint> endpoint_;
     media::AudioConfiguration configuration_;
+    std::shared_ptr<BeamItMicrophoneOutput> microphone_output_;
     struct TrackState {
         AudioTrack description;
         std::shared_ptr<AudioPipeline> pipeline;

@@ -9,14 +9,17 @@ INF/catalog package and deployment/test utility are implemented. The unsigned
 package can be built and checked without installation. Loading the signed
 package, Driver Verifier/HLK, sleep/resume/removal testing and actual Teams
 validation remain required; a successful build is not runtime certification.
-The existing host is not yet connected to this device.
+The host now bridges authenticated incoming Opus microphone audio to this
+device. Physical driver loading and Teams behavior remain unverified.
 
 ## Architecture and scope
 
 ```text
 Remote microphone -> authenticated audio WebSocket -> Opus / AudioEndpoint
                                                    |
-                                  future host bridge: playout/drift/float->PCM16
+                                           BeamItMicrophoneOutput
+                                           bounded PCM frame queue
+                                           float->PCM16 / IOCTL
                                                    |
 Test producer ----------------------------> versioned local control interface
                                                    |
@@ -44,9 +47,11 @@ virtual cable violates the source-build requirement, and a user-mode WASAPI
 library alone cannot create this endpoint.
 
 Opus, sockets, password authentication, jitter buffering and adaptive
-resampling stay out of kernel mode. They belong in the future user-mode bridge,
-which must parse the negotiated wire configuration rather than assume this
-driver's format or a fixed packet duration.
+resampling stay out of kernel mode. The host's user-mode bridge decodes the
+negotiated microphone format, validates packet metadata, converts float PCM
+to the driver's 48 kHz stereo PCM16 format, and writes through the versioned
+local control interface. The protocol configuration is validated rather than
+assuming the driver's format.
 
 ## Local injection ABI v2
 
@@ -213,7 +218,11 @@ audio, and capture restart. It requires an otherwise idle endpoint/producer.
 For a manual recording test, open **BeamIt Microphone** in a recording app
 first, then run `BeamItMicProducer.exe 5` to send a quiet 997 Hz tone for five
 seconds. The utility uses a high-resolution waitable timer with QPC deadlines
-and prints queue/overrun/underrun counters. It has no playback route.
+and prints queue/overrun/underrun counters. It has no playback route. For
+remote microphone audio, keep the host recording stream active and select
+**BeamIt Microphone** in the application (for example, in a Teams call) before
+starting audio in the client. The host ends audio with an explicit failure if
+the driver is unavailable or cannot accept PCM; video remains unaffected.
 
 Before calling this production-ready, complete Driver Verifier and applicable
 Windows audio HLK testing, competing-process/crash tests, long-run timing,

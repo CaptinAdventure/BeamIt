@@ -1,11 +1,11 @@
 # BeamIt Windows client
 
-**Status: functional streaming client, feature parity in progress.** The
+**Status: functional streaming client with two-way audio, feature parity in progress.** The
 client connects to a host, pins its certificate, authenticates, lists host
 applications and streams windows, applications and desktops into native
 windows with keyboard and mouse input. Clipboard sync, text sending,
-anti-idle, the remote popup coordinator and audio
-are not implemented yet (see [the implementation plan](IMPLEMENTATION-PLAN.md)).
+anti-idle and the remote popup coordinator are not implemented yet (see
+[the implementation plan](IMPLEMENTATION-PLAN.md)).
 Teams and cross-machine LAN behavior have not been validated.
 
 ## Architecture
@@ -21,7 +21,8 @@ and taskbar attention.
   `FrameProtocol` (binary frames, generation/key-frame gate), `HostWindows`
   (window model, application grouping, search, window following),
   `KeyCodes` (scan code to `KeyboardEvent.code`) and `VideoPipeline`
-  (Media Foundation decoding and D3D11 presentation).
+  (Media Foundation decoding and D3D11 presentation), `AudioClient` (Opus,
+  event-driven WASAPI microphone capture and mixed host-track playback).
 - **`app/` (WinUI MSBuild project):** `ClientApp` (connection and source
   window, tray, stream bookkeeping) and `StreamWindow` (one window per
   stream: presentation, system menu, input).
@@ -128,6 +129,27 @@ the WinUI project its include paths, definitions and static libraries.
   **Exit fullscreen** and **Close**. It hides again shortly after the
   pointer leaves it unless pinned.
 
+### Two-way audio
+
+- Start audio independently of video, select **Desktop audio** or one of the
+  host's listed applications, then start the authenticated full-duplex Opus
+  socket. The client captures its default microphone with event-driven WASAPI
+  and plays host audio tracks through its default render endpoint.
+- Each host track uses its negotiated Opus metadata and has an independent
+  decoder. The client bounds packet queues, drops stale playback audio under
+  overload, and tears audio down on stop, socket failure or session end.
+- On the host, client microphone PCM is delivered only to the installed
+  **BeamIt Microphone** virtual recording device; there is no fallback to a
+  physical microphone or unrelated endpoint. Install a properly signed host
+  driver package, select **BeamIt Microphone** in Teams and keep its recording
+  stream active. If the device is missing, busy or inaccessible, audio startup
+  fails visibly; if the driver cannot accept PCM, the host stops audio without
+  affecting video. Driver deployment and Teams validation are documented in
+  [`drivers/BeamItMicrophone/README.md`](../../drivers/BeamItMicrophone/README.md).
+- Audio is independent of video stream lifetimes. Ending a video stream does
+  not stop the microphone or outgoing audio track; **Stop audio** ends both
+  directions for the authenticated session.
+
 ## Windows prerequisites
 
 - Windows 11 x64.
@@ -189,7 +211,8 @@ configurations use the dynamic runtime (`/MDd`, `/MD`). Output goes to
 .\clients\windows\build\core\Debug\BeamItClientTests.exe
 ```
 
-`BeamItClientTests` covers URL/fingerprint/hello/offer validation, proofs,
+`BeamItClientTests` covers URL/fingerprint/hello/offer validation (including
+audio), proofs,
 the clock estimate, host-window grouping/search/following, key mapping and,
 against an in-process mock WSS host with an ephemeral self-signed
 certificate, pinning before the upgrade, password and forged-proof

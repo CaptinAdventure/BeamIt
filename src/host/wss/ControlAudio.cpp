@@ -29,6 +29,39 @@ void ControlSession::start_audio(const json::object&, const RequestId& id) {
     auto entry = std::make_shared<AudioEntry>();
     entry->id = net::base64url_encode(net::random_bytes(16));
     entry->token = net::base64url_encode(net::random_bytes(32));
+    entry->start_request_id = id;
+    audio_ = entry;
+    try {
+        entry->microphone_output = std::make_shared<BeamItMicrophoneOutput>(
+            entry->configuration,
+            [executor = ws_->get_executor(), weak = weak_from_this(), weak_entry = std::weak_ptr(entry)](
+                std::string message) {
+                asio::post(executor, [weak, weak_entry, message = std::move(message)] {
+                    if (const auto self = weak.lock(); self && self->audio_ == weak_entry.lock()) {
+                        self->end_audio("audio_failed", message);
+                    }
+                });
+            },
+            server_.options.make_microphone_device,
+            [executor = ws_->get_executor(), weak = weak_from_this(), weak_entry = std::weak_ptr(entry), id] {
+                asio::post(executor, [weak, weak_entry, id] {
+                    if (const auto self = weak.lock(); self) {
+                        if (const auto audio = weak_entry.lock(); audio && self->audio_ == audio) {
+                            self->offer_audio(audio, id);
+                        }
+                    }
+                });
+            });
+    } catch (const std::exception& error) {
+        audio_.reset();
+        throw ProtocolError{"audio_failed", error.what()};
+    }
+}
+
+void ControlSession::offer_audio(const std::shared_ptr<AudioEntry>& entry, const RequestId& id) {
+    if (closing_ || audio_ != entry || entry->offered) return;
+    entry->offered = true;
+    entry->start_request_id.reset();
     entry->token_expiry = Clock::now() + protocol::token_lifetime;
     entry->token_timer = std::make_unique<asio::steady_timer>(ws_->get_executor(), entry->token_expiry);
     entry->token_timer->async_wait([weak = weak_from_this(), weak_entry = std::weak_ptr(entry)](beast::error_code error) {
@@ -37,7 +70,6 @@ void ControlSession::start_audio(const json::object&, const RequestId& id) {
         if (!error && self && audio && self->audio_ == audio) self->end_audio("token_expired");
     });
     const auto microphone = track_json({.id = protocol::microphone_track_id, .configuration = entry->configuration});
-    audio_ = entry;
     reply(id, {{"type", "audio_offer"}, {"audio_id", entry->id},
         {"url", fmt::format("wss://{}/audio/{}?token={}", authority_, entry->id, entry->token)},
         {"token_expires_in_ms", std::chrono::duration_cast<std::chrono::milliseconds>(protocol::token_lifetime).count()},
@@ -164,7 +196,8 @@ std::shared_ptr<AudioEntry> ControlSession::claim_audio(std::string_view audio_i
 
 void ControlSession::attach_audio(const std::shared_ptr<AudioEntry>& entry, std::shared_ptr<WebSocket> socket) {
     try {
-        entry->socket = std::make_shared<AudioSocket>(std::move(socket), server_.options.audio, entry->configuration);
+        entry->socket = std::make_shared<AudioSocket>(std::move(socket), server_.options.audio,
+            entry->configuration, entry->microphone_output);
         entry->socket->on_ended = [weak = weak_from_this(), weak_entry = std::weak_ptr(entry)](
                                       std::string reason, std::string message) {
             if (auto self = weak.lock(); self && self->audio_ == weak_entry.lock()) {
@@ -172,26 +205,36 @@ void ControlSession::attach_audio(const std::shared_ptr<AudioEntry>& entry, std:
             }
         };
         entry->socket->start();
-        entry->token_timer->cancel();
+        if (entry->token_timer) entry->token_timer->cancel();
         spdlog::info("Audio connected");
     } catch (const std::exception& error) {
         spdlog::error("Audio initialization failed: {}", error.what());
-        end_audio("codec_failed", error.what());
+        end_audio("audio_failed", error.what());
     }
 }
 
 void ControlSession::end_audio(std::string_view reason, std::string_view message, const RequestId& id) {
     auto entry = std::exchange(audio_, {});
     if (!entry) return;
-    entry->token_timer->cancel();
+    const bool was_offered = entry->offered;
+    if (entry->token_timer) entry->token_timer->cancel();
     for (auto& [track_id, capture] : entry->captures) {
         if (capture.capture) capture.capture->stop();
     }
     entry->captures.clear();
     if (entry->socket) entry->socket->close({websocket::close_code::normal, reason});
+    if (entry->microphone_output) {
+        entry->microphone_output->stop();
+        entry->microphone_output.reset();
+    }
+    if (entry->start_request_id) {
+        send_error(entry->start_request_id, "audio_failed",
+                   message.empty() ? "Audio ended before the microphone device was ready" : message);
+        entry->start_request_id.reset();
+    }
     json::object stopped{{"type", "audio_stopped"}, {"audio_id", entry->id}, {"reason", reason}};
     if (!message.empty()) stopped["message"] = message;
-    reply(id, std::move(stopped));
+    if (was_offered) reply(id, std::move(stopped));
     spdlog::info("Audio stopped: {}", reason);
 }
 

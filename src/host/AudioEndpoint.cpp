@@ -64,8 +64,10 @@ void AudioEndpoint::detach(std::uint32_t track_id, const std::shared_ptr<AudioPi
     if (found != tracks_.end() && found->second.pipeline.lock() == pipeline) tracks_.erase(found);
 }
 
-AudioPipeline::AudioPipeline(media::AudioConfiguration configuration, std::function<void()> notify_output)
-    : codec_(configuration), notify_output_(std::move(notify_output)), worker_([this] { run(); }) {}
+AudioPipeline::AudioPipeline(media::AudioConfiguration configuration, std::function<void()> notify_output,
+                             std::function<void(const AudioPcmPacket&)> notify_decoded)
+    : codec_(configuration), notify_output_(std::move(notify_output)), notify_decoded_(std::move(notify_decoded)),
+      worker_([this] { run(); }) {}
 
 AudioPipeline::~AudioPipeline() { stop(); }
 
@@ -172,13 +174,16 @@ void AudioPipeline::run() {
             if (incoming) {
                 AudioPcmPacket packet{incoming->sequence, incoming->sample_timestamp, incoming->discontinuity,
                                       codec_.decode(incoming->payload, incoming->discontinuity)};
-                std::lock_guard lock(mutex_);
-                if (decoded_.size() >= max_queued_audio_packets) {
-                    decoded_.pop_front();
-                    spdlog::warn("Audio PCM queue full; dropping oldest packet");
-                    if (!decoded_.empty()) decoded_.front().discontinuity = true;
+                {
+                    std::lock_guard lock(mutex_);
+                    if (decoded_.size() >= max_queued_audio_packets) {
+                        decoded_.pop_front();
+                        spdlog::warn("Audio PCM queue full; dropping oldest packet");
+                        if (!decoded_.empty()) decoded_.front().discontinuity = true;
+                    }
+                    decoded_.push_back(packet);
                 }
-                decoded_.push_back(std::move(packet));
+                if (notify_decoded_) notify_decoded_(packet);
             }
         }
     } catch (const std::exception& error) {
