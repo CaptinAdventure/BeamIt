@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AppUtil.hpp"
+#include "AudioClient.hpp"
 #include "ClientSession.hpp"
 #include "HostWindows.hpp"
 #include "StreamWindow.hpp"
@@ -41,6 +42,9 @@ private:
     void on_connected();
     void end_session(std::optional<std::string> error);
     void handle_message(const json::object& message);
+    void start_audio();
+    void stop_audio(bool notify_host);
+    void audio_failed(std::string message);
 
     void start_stream(json::object source, bool activate, bool from_picker, std::optional<std::int64_t> follow);
     void reconcile();
@@ -56,6 +60,8 @@ private:
 
     Settings settings_;
     std::unique_ptr<Session> session_;
+    std::shared_ptr<AudioClient> audio_client_;
+    std::string audio_id_;
     bool connecting_{};
     HostWindowList host_windows_;
     std::map<std::string, std::shared_ptr<StreamWindow>> streams_;
@@ -86,6 +92,10 @@ private:
     winrt::Microsoft::UI::Xaml::Controls::TextBlock applications_count_{nullptr};
     winrt::Microsoft::UI::Xaml::Controls::TextBox search_box_{nullptr};
     winrt::Microsoft::UI::Xaml::Controls::ComboBox mode_box_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::ComboBox audio_source_box_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::Button audio_button_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::Button stop_audio_button_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::TextBlock audio_status_{nullptr};
 };
 
 } // namespace beamit::client

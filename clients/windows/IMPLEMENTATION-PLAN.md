@@ -7,12 +7,14 @@ Give Copilot this instruction in the target machine's BeamIt checkout:
 > Read the repository agent instructions, `clients/windows/IMPLEMENTATION-PLAN.md`,
 > `clients/windows/README.md`, and `PROTOCOL.md`. The scaffold gate,
 > `win-session`, and the first versions of `win-shell`, `win-media`, and
-> `win-input` are done (see "Current status"). Inspect the worktree before
+> `win-input` are done; two-way audio is now implemented (see "Current
+> status"). Inspect the worktree before
 > editing and preserve unrelated changes. Build with
 > `scripts/Build-WindowsClient.ps1` (Debug and Release) and run
 > `BeamItClientTests`. Then continue with the remaining items in the task
-> table: user-facing LAN validation, clipboard/text/anti-idle, rate controls,
-> the popup coordinator, and finally audio. Keep the host protocol and product
+> table: user-facing LAN validation, clipboard/text/anti-idle, rate controls
+> and the popup coordinator. Verify audio on physical devices and in Teams.
+> Keep the host protocol and product
 > decisions unchanged. Update this handoff with actual results and blockers.
 
 This file is the portable handoff. Session-local plans and todo lists are not
@@ -31,7 +33,7 @@ This machine has only Build Tools 2026, so the user approved retargeting:
   inbox H.264 decoder rejects High 4:4:4, the host's NVENC default, while
   HEVC 4:2:0/4:4:4 decode with the HEVC Video Extension. There is no codec
   picker or retry.
-- PNG screenshots are in scope. Audio (§5.16) is a final phase after video
+- PNG screenshots are in scope. Audio (§5.16) is implemented after video
   parity. The current macOS baseline also has "All windows" application mode
   (follow new main/owned/tool windows), which the Windows client implements.
 - FFmpeg is installed locally only to generate decoder fixtures.
@@ -58,10 +60,14 @@ Implemented and verified (details and measurements in the README):
   focus loss/menus, local Alt+Space, Ctrl+Alt+G and double Escape.
 - Stream window: 1×/scaling/fullscreen, stream info, rate dialog, host icon,
   taskbar attention.
+- Two-way Opus audio: the client captures its microphone and plays host
+  capture tracks through WASAPI; the host microphone route is supplied by the
+  BeamIt Microphone device bridge.
 
 Not verified yet: interactive use of the production app (the user will test
-from a second desktop on the LAN), Teams, mixed DPI, other GPUs, and
-machines without the HEVC Video Extension. The prototype sources
+from a second desktop on the LAN), Teams, microphone/render endpoints, a
+loaded and signed BeamIt Microphone driver, mixed DPI, other GPUs, and machines
+without the HEVC Video Extension. The prototype sources
 (`app/PrototypeWindow.*`, `app/Surface.*`) are no longer built; delete them
 once the user confirms.
 
@@ -89,7 +95,7 @@ in `clients/osx`, adapting global menus to Windows conventions.
 | Preferences | Clipboard sync and anti-idle are global, initially off |
 | Shortcuts | Alt+Space local menu; Ctrl+Alt+G always releases capture; double Escape within one second exits fullscreen |
 | Input | Windows modifier conventions; OS-reserved shortcuts remain local |
-| Out of scope | Gamepads, file transfer, cloud/NAT/discovery, auto-reconnect, password storage, ARM64, installer/MSIX, new host capabilities. Audio is a final phase after video parity |
+| Out of scope | Gamepads, file transfer, cloud/NAT/discovery, auto-reconnect, password storage, ARM64, installer/MSIX, new host capabilities |
 
 Do not reopen these choices unless a concrete blocker requires a product
 decision. Document the blocker/tradeoff and ask before changing architecture
@@ -489,7 +495,7 @@ Recreate session-local tasks if necessary; markdown is the portable source.
 | `win-utilities` | Pending (clipboard, paced text, anti-idle) | `win-input` |
 | `win-options` | Partial (stream info, scaling, screenshot, rate dialog); richer live diagnostics pending | `win-popups`, `win-utilities` |
 | `win-validation` | Pending | `win-options` |
-| `win-audio` | Pending; final phase | `win-validation` |
+| `win-audio` | Implemented; automated checks pass, physical-device/Teams validation pending | `win-session`, `win-media` |
 
 For clipboard work, the host's pure conversion helpers in
 `src/host/Clipboard.cpp` (`html_clipboard_fragment`,

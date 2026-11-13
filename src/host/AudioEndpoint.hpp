@@ -31,7 +31,7 @@ struct AudioTrack {
     media::AudioConfiguration configuration;
 };
 
-// Thread-safe PCM boundary for future device capture/playback. One endpoint per host instance.
+// One thread-safe PCM endpoint per host instance for audio capture and incoming microphone output.
 class AudioPipeline;
 class AudioEndpoint {
 public:
@@ -56,7 +56,8 @@ private:
 // Codec work never executes on the WSS thread. All queues are bounded.
 class AudioPipeline {
 public:
-    AudioPipeline(media::AudioConfiguration configuration, std::function<void()> notify_output);
+    AudioPipeline(media::AudioConfiguration configuration, std::function<void()> notify_output,
+                  std::function<void(const AudioPcmPacket&)> notify_decoded = {});
     ~AudioPipeline();
     void stop();
     [[nodiscard]] AudioSubmitResult submit_pcm(std::span<const float> samples, bool discontinuity = false);
@@ -71,6 +72,7 @@ private:
     void run();
     media::OpusAudio codec_;
     std::function<void()> notify_output_;
+    std::function<void(const AudioPcmPacket&)> notify_decoded_;
     mutable std::mutex mutex_;
     std::condition_variable wake_;
     struct EncodeInput {

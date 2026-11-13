@@ -212,6 +212,30 @@ void ClientApp::build_source_view() {
     streams_panel_.Spacing(4);
     source_view_.Children().Append(streams_panel_);
 
+    source_view_.Children().Append(caption(L"TWO-WAY AUDIO"));
+    audio_source_box_ = controls::ComboBox();
+    audio_source_box_.HorizontalAlignment(xaml::HorizontalAlignment::Stretch);
+    controls::ComboBoxItem desktop_audio;
+    desktop_audio.Content(winrt::box_value(L"Desktop audio"));
+    desktop_audio.Tag(winrt::box_value(std::int64_t{}));
+    audio_source_box_.Items().Append(desktop_audio);
+    audio_source_box_.SelectedIndex(0);
+    source_view_.Children().Append(audio_source_box_);
+    controls::StackPanel audio_actions;
+    audio_actions.Orientation(controls::Orientation::Horizontal);
+    audio_actions.Spacing(8);
+    audio_button_ = controls::Button();
+    audio_button_.Content(winrt::box_value(L"Start audio + microphone"));
+    stop_audio_button_ = controls::Button();
+    stop_audio_button_.Content(winrt::box_value(L"Stop audio"));
+    stop_audio_button_.IsEnabled(false);
+    audio_actions.Children().Append(audio_button_);
+    audio_actions.Children().Append(stop_audio_button_);
+    source_view_.Children().Append(audio_actions);
+    audio_status_ = text(L"Audio off", 12);
+    audio_status_.Opacity(0.75);
+    source_view_.Children().Append(audio_status_);
+
     source_view_.Children().Append(caption(L"DESKTOP"));
     auto dxgi = source_button(L"Desktop · DXGI", L"Desktop Duplication of the primary monitor");
     auto wgc = source_button(L"Desktop · WGC", L"Windows.Graphics.Capture of the primary monitor");
@@ -245,6 +269,12 @@ void ClientApp::build_source_view() {
     const std::weak_ptr<ClientApp> weak = weak_from_this();
     disconnect.Click([weak](auto&&, auto&&) {
         if (const auto self = weak.lock()) self->end_session(std::nullopt);
+    });
+    audio_button_.Click([weak](auto&&, auto&&) {
+        if (const auto self = weak.lock()) self->start_audio();
+    });
+    stop_audio_button_.Click([weak](auto&&, auto&&) {
+        if (const auto self = weak.lock()) self->stop_audio(true);
     });
     dxgi.Click([weak](auto&&, auto&&) {
         if (const auto self = weak.lock()) self->start_stream({{"kind", "desktop"}, {"capture", "dxgi"}}, true, true, std::nullopt);
@@ -284,6 +314,9 @@ void ClientApp::update_connect_state() {
     trust_hint_.Text(trust ? L"Certificate checks are disabled. Only use this on a network you trust."
                            : L"Copy the fingerprint from the BeamIt host log and verify it before connecting.");
     trust_hint_.Foreground(trust ? brush(0xC0, 0x6A, 0x00) : brush(0x80, 0x80, 0x80));
+    if (audio_button_) audio_button_.IsEnabled(session_ != nullptr && !audio_client_);
+    if (stop_audio_button_) stop_audio_button_.IsEnabled(audio_client_ != nullptr);
+    if (audio_source_box_) audio_source_box_.IsEnabled(session_ != nullptr && !audio_client_);
 }
 
 void ClientApp::set_error(const std::string& message) {
@@ -362,10 +395,12 @@ void ClientApp::on_connected() {
 
 void ClientApp::end_session(std::optional<std::string> error) {
     if (!session_) return;
+    stop_audio(false);
     for (auto& [id, stream] : std::exchange(streams_, {})) stream->close_after_host_stop();
     followed_.clear();
     handled_.clear();
     host_windows_.clear();
+    audio_source_box_.Items().Clear();
     starting_ = 0;
     session_->disconnect();
     session_.reset();
@@ -381,7 +416,20 @@ void ClientApp::end_session(std::optional<std::string> error) {
 void ClientApp::handle_message(const json::object& message) {
     if (!session_) return;
     const auto type = string_field(message, "type").value_or("");
-    if (type == "window_opened" || type == "window_changed" || type == "window_closed") {
+    if (type == "audio_stopped") {
+        const auto reason = std::string(string_field(message, "reason").value_or(""));
+        stop_audio(false);
+        audio_status_.Text(L"Audio off");
+        if (!reason.empty() && reason != "requested") set_error("Audio stopped: " + reason);
+    } else if (type == "audio_track_stopped") {
+        if (const auto track_id = integer_field(message, "track_id"); track_id && *track_id > 0) {
+            session_->remove_audio_track(static_cast<std::uint32_t>(*track_id));
+            if (audio_client_) audio_client_->remove_track(static_cast<std::uint32_t>(*track_id));
+        }
+        if (string_field(message, "reason") != "requested") {
+            set_error(std::string(string_field(message, "message").value_or("Host audio track stopped.")));
+        }
+    } else if (type == "window_opened" || type == "window_changed" || type == "window_closed") {
         const auto* object = message.if_contains("window");
         const auto window = object ? parse_host_window(*object) : std::nullopt;
         if (!window) return;
@@ -425,6 +473,141 @@ void ClientApp::handle_message(const json::object& message) {
             set_error(text);
         }
     }
+}
+
+void ClientApp::start_audio() {
+    if (!session_ || audio_client_) return;
+    set_error({});
+    audio_status_.Text(L"Opening authenticated audio socket…");
+    update_connect_state();
+    const std::weak_ptr<ClientApp> weak = weak_from_this();
+    session_->request("start_audio", {}, "audio_offer",
+        [weak](std::expected<json::object, SessionError> reply) {
+            const auto self = weak.lock();
+            if (!self || !self->session_) return;
+            if (!reply) {
+                self->audio_status_.Text(L"Audio unavailable");
+                self->set_error(reply.error().message);
+                self->update_connect_state();
+                return;
+            }
+            const auto endpoint = self->session_->endpoint();
+            const auto offer = endpoint ? parse_audio_offer(*reply, *endpoint)
+                                        : std::expected<AudioOffer, std::string>(
+                                              std::unexpected(std::string("The host endpoint is unavailable.")));
+            if (!offer) {
+                const auto audio_id = string_field(*reply, "audio_id");
+                if (audio_id) {
+                    self->session_->request("stop_audio", {{"audio_id", *audio_id}}, "audio_stopped", [](auto&&) {});
+                }
+                self->audio_status_.Text(L"Audio unavailable");
+                self->set_error(offer.error());
+                self->update_connect_state();
+                return;
+            }
+
+            self->audio_id_ = offer->audio_id;
+            std::int64_t pid{};
+            if (const auto selected = self->audio_source_box_.SelectedItem()) {
+                pid = winrt::unbox_value<std::int64_t>(selected.as<controls::ComboBoxItem>().Tag());
+            }
+            json::object source = pid > 0
+                ? json::object{{"kind", "application"}, {"pid", pid}}
+                : json::object{{"kind", "desktop"}};
+            const auto queue = DispatcherQueue::GetForCurrentThread();
+            const auto audio = std::make_shared<AudioClient>(offer->microphone,
+                [session = self->session_.get()](std::vector<std::byte> packet) {
+                    session->send_audio_packet(std::move(packet));
+                },
+                [weak, queue](std::string message) {
+                    queue.TryEnqueue([weak, message = std::move(message)] {
+                        if (const auto app = weak.lock()) app->audio_failed(std::move(message));
+                    });
+                });
+            self->audio_client_ = audio;
+            self->audio_status_.Text(L"Starting microphone…");
+            AudioCallbacks callbacks;
+            callbacks.packet = [audio_weak = std::weak_ptr(audio)](
+                const net::protocol::AudioPacket& packet, const media::AudioConfiguration& configuration) {
+                if (const auto client = audio_weak.lock()) client->receive(packet, configuration);
+            };
+            callbacks.failed = [weak, queue](const SessionError& error) {
+                queue.TryEnqueue([weak, message = error.message] {
+                    if (const auto app = weak.lock()) app->audio_failed(message);
+                });
+            };
+            self->session_->open_audio(*offer, std::move(callbacks),
+                [weak, audio, audio_id = offer->audio_id, source = std::move(source)](
+                    std::expected<void, SessionError> opened) mutable {
+                    const auto app = weak.lock();
+                    if (!app || !app->session_ || app->audio_client_ != audio) return;
+                    if (!opened) {
+                        app->audio_failed(opened.error().message);
+                        return;
+                    }
+                    try {
+                        audio->start();
+                    } catch (const std::exception& error) {
+                        app->audio_failed(error.what());
+                        return;
+                    }
+                    app->audio_status_.Text(L"Starting host audio track…");
+                    app->session_->request("start_audio_track",
+                        {{"audio_id", audio_id}, {"source", std::move(source)}}, "audio_track_started",
+                        [weak, audio](std::expected<json::object, SessionError> started) {
+                            const auto owner = weak.lock();
+                            if (!owner || !owner->session_ || owner->audio_client_ != audio) return;
+                            if (!started) {
+                                owner->audio_failed(started.error().message);
+                                return;
+                            }
+                            const auto* track_value = started->if_contains("track");
+                            const auto track = track_value ? parse_audio_track(*track_value)
+                                                           : std::expected<AudioTrackConfiguration, std::string>(
+                                                                 std::unexpected(std::string(
+                                                                     "The host omitted its audio track configuration.")));
+                            if (!track) {
+                                owner->audio_failed(track.error());
+                                return;
+                            }
+                            try {
+                                audio->add_track(*track);
+                                owner->session_->configure_audio_track(*track);
+                            } catch (const std::exception& error) {
+                                owner->audio_failed(error.what());
+                                return;
+                            }
+                            owner->audio_status_.Text(L"Microphone and desktop audio active");
+                        });
+                });
+            self->update_connect_state();
+        });
+}
+
+void ClientApp::stop_audio(bool notify_host) {
+    auto audio = std::exchange(audio_client_, {});
+    if (audio) audio->stop();
+    const auto audio_id = std::exchange(audio_id_, {});
+    if (session_) {
+        session_->close_audio();
+        if (notify_host && !audio_id.empty()) {
+            const std::weak_ptr<ClientApp> weak = weak_from_this();
+            session_->request("stop_audio", {{"audio_id", audio_id}}, "audio_stopped",
+                [weak](std::expected<json::object, SessionError> result) {
+                    if (!result && result.error().code != "not_found") {
+                        if (const auto self = weak.lock()) self->set_error(result.error().message);
+                    }
+                });
+        }
+    }
+    if (audio_status_) audio_status_.Text(L"Audio off");
+    update_connect_state();
+}
+
+void ClientApp::audio_failed(std::string message) {
+    stop_audio(true);
+    audio_status_.Text(L"Audio unavailable");
+    set_error(message);
 }
 
 // Streams ------------------------------------------------------------------------------------------
@@ -595,6 +778,23 @@ void ClientApp::refresh_sources() {
     if (!applications_panel_ || !session_) return;
     applications_panel_.Children().Clear();
     const auto all = host_windows_.applications();
+    const auto selected_audio_pid = audio_source_box_.SelectedItem()
+        ? winrt::unbox_value<std::int64_t>(audio_source_box_.SelectedItem().as<controls::ComboBoxItem>().Tag())
+        : std::int64_t{};
+    audio_source_box_.Items().Clear();
+    controls::ComboBoxItem desktop_audio;
+    desktop_audio.Content(winrt::box_value(L"Desktop audio"));
+    desktop_audio.Tag(winrt::box_value(std::int64_t{}));
+    audio_source_box_.Items().Append(desktop_audio);
+    auto selected_audio_index = 0;
+    for (const auto& application : all) {
+        controls::ComboBoxItem item;
+        item.Content(winrt::box_value(widen(application.title)));
+        item.Tag(winrt::box_value(application.pid));
+        audio_source_box_.Items().Append(item);
+        if (application.pid == selected_audio_pid) selected_audio_index = static_cast<int>(audio_source_box_.Items().Size() - 1);
+    }
+    audio_source_box_.SelectedIndex(selected_audio_index);
     const auto search = narrow(search_box_.Text());
     const auto applications = filter_applications(all, search);
     applications_count_.Text(search.empty() ? std::to_wstring(all.size())

@@ -14,8 +14,10 @@ json::object audio_configuration_json(const media::AudioConfiguration& configura
 }
 
 AudioSocket::AudioSocket(std::shared_ptr<WebSocket> socket, std::shared_ptr<AudioEndpoint> endpoint,
-                         media::AudioConfiguration configuration)
-    : ws_(std::move(socket)), endpoint_(std::move(endpoint)), configuration_(configuration) {}
+                         media::AudioConfiguration configuration,
+                         std::shared_ptr<BeamItMicrophoneOutput> microphone_output)
+    : ws_(std::move(socket)), endpoint_(std::move(endpoint)), configuration_(configuration),
+      microphone_output_(std::move(microphone_output)) {}
 
 void AudioSocket::start() {
     add_track({.id = protocol::microphone_track_id, .configuration = configuration_});
@@ -24,17 +26,30 @@ void AudioSocket::start() {
 
 void AudioSocket::add_track(const AudioTrack& track) {
     if (closing_ || tracks_.contains(track.id)) throw std::logic_error("Audio track is closed or already exists");
+    if (track.kind == AudioTrack::Kind::Microphone) {
+        if (!microphone_output_) throw std::logic_error("Audio socket has no acquired microphone output");
+    }
     auto pipeline = std::make_shared<AudioPipeline>(track.configuration,
         [executor = ws_->get_executor(), weak = weak_from_this()] {
             asio::post(executor, [weak] {
                 if (auto self = weak.lock()) self->output_ready();
             });
-        });
+        },
+        track.kind == AudioTrack::Kind::Microphone
+            ? std::function<void(const AudioPcmPacket&)>{[output = std::weak_ptr(microphone_output_)](
+                  const AudioPcmPacket& packet) {
+                  if (auto sink = output.lock()) sink->submit(packet);
+              }}
+            : std::function<void(const AudioPcmPacket&)>{});
     tracks_.emplace(track.id, TrackState{track, pipeline, {}});
     try {
         endpoint_->attach(track, pipeline);
     } catch (...) {
         tracks_.erase(track.id);
+        if (track.kind == AudioTrack::Kind::Microphone) {
+            microphone_output_->stop();
+            microphone_output_.reset();
+        }
         throw;
     }
 }
@@ -45,12 +60,20 @@ void AudioSocket::remove_track(std::uint32_t track_id) {
     endpoint_->detach(track_id, found->second.pipeline);
     found->second.pipeline->stop();
     tracks_.erase(found);
+    if (track_id == protocol::microphone_track_id && microphone_output_) {
+        microphone_output_->stop();
+        microphone_output_.reset();
+    }
 }
 
 void AudioSocket::close(websocket::close_reason reason) {
     if (closing_) return;
     closing_ = true;
     while (!tracks_.empty()) remove_track(tracks_.begin()->first);
+    if (microphone_output_) {
+        microphone_output_->stop();
+        microphone_output_.reset();
+    }
     close_reason_ = std::move(reason);
     pump();
 }
@@ -65,6 +88,9 @@ void AudioSocket::fail(std::string reason, std::string message) {
 
 void AudioSocket::output_ready() {
     if (closing_) return;
+    if (microphone_output_) {
+        if (auto error = microphone_output_->error(); !error.empty()) return fail("audio_failed", std::move(error));
+    }
     for (auto& [id, track] : tracks_) {
         if (auto error = track.pipeline->error(); !error.empty()) return fail("codec_failed", std::move(error));
         while (auto packet = track.pipeline->receive_encoded()) {

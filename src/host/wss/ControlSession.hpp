@@ -87,10 +87,13 @@ struct StreamEntry {
 struct AudioEntry {
     std::string id;
     std::string token;
+    RequestId start_request_id;
+    bool offered{};
     bool token_used{};
     Clock::time_point token_expiry{};
     std::unique_ptr<asio::steady_timer> token_timer;
     media::AudioConfiguration configuration;
+    std::shared_ptr<BeamItMicrophoneOutput> microphone_output;
     std::shared_ptr<AudioSocket> socket;
     std::map<std::uint32_t, AudioTrack> capture_tracks;
     struct CaptureState {
@@ -165,6 +168,7 @@ private:
     void release_stream_execution_state(StreamEntry& entry);
     void stop_all_streams(websocket::close_code code);
     void start_audio(const json::object& message, const RequestId& id);
+    void offer_audio(const std::shared_ptr<AudioEntry>& entry, const RequestId& id);
     void stop_audio(const json::object& message, const RequestId& id);
     void start_audio_track(const json::object& message, const RequestId& id);
     void stop_audio_track(const json::object& message, const RequestId& id);

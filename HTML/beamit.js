@@ -5,8 +5,61 @@ const MAX_SIGNALING_BYTES = 64 * 1024;
 const FRAME_VERSION = 1;
 const VIDEO_MESSAGE = 1;
 const FRAME_HEADER_MIN_SIZE = 32;
+const AUDIO_VERSION = 2;
+const AUDIO_MESSAGE = 2;
+const AUDIO_HEADER_SIZE = 32;
+const MAX_AUDIO_PACKET_SIZE = 1307;
+const MAX_AUDIO_QUEUE = 3;
 
 const encoder = new TextEncoder();
+
+if (typeof globalThis.AudioWorkletProcessor === "function" &&
+    typeof globalThis.registerProcessor === "function") {
+  class BeamItMicrophoneProcessor extends AudioWorkletProcessor {
+    constructor(options) {
+      super();
+      this.frameSize = options.processorOptions.frameSize;
+      this.channels = options.processorOptions.channels;
+      this.frame = new Float32Array(this.frameSize * this.channels);
+      this.position = 0;
+      this.sequence = 0;
+      this.pending = 0;
+      this.port.onmessage = (event) => {
+        if (event.data?.type === "consumed") this.pending = Math.max(0, this.pending - 1);
+      };
+    }
+
+    process(inputs, outputs) {
+      const input = inputs[0] ?? [];
+      const output = outputs[0] ?? [];
+      for (const channel of output) channel.fill(0);
+      const frames = input[0]?.length ?? 0;
+      for (let index = 0; index < frames; index += 1) {
+        let mono = 0;
+        for (const channel of input) mono += channel[index] ?? 0;
+        if (input.length > 0) mono /= input.length;
+        for (let channel = 0; channel < this.channels; channel += 1) {
+          this.frame[this.position * this.channels + channel] =
+            this.channels === 1 || input.length === 1
+              ? mono
+              : (input[channel]?.[index] ?? mono);
+        }
+        this.position += 1;
+        if (this.position !== this.frameSize) continue;
+        const sequence = this.sequence++;
+        if (this.pending < MAX_AUDIO_QUEUE) {
+          const samples = this.frame;
+          this.frame = new Float32Array(this.frameSize * this.channels);
+          this.pending += 1;
+          this.port.postMessage({ sequence, samples }, [samples.buffer]);
+        }
+        this.position = 0;
+      }
+      return true;
+    }
+  }
+  globalThis.registerProcessor("beamit-microphone", BeamItMicrophoneProcessor);
+}
 
 export class BeamItError extends Error {
   constructor(message, { code = "client_error", id, streamId, cause } = {}) {
@@ -187,6 +240,125 @@ function validateVideo(video) {
     result.max_bitrate_kbps = video.max_bitrate_kbps;
   }
   return result;
+}
+
+function audioError(message, code = "invalid_audio") {
+  return new BeamItError(message, { code });
+}
+
+function parsePacketDuration(value) {
+  if (typeof value !== "string") throw audioError("Invalid Opus packet duration");
+  const match = /^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$/u.exec(value);
+  if (!match || !match.slice(1).some((part) => part !== undefined)) {
+    throw audioError("Invalid Opus packet duration");
+  }
+  const seconds = Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3] ?? 0);
+  if (!Number.isFinite(seconds) || seconds <= 0) throw audioError("Invalid Opus packet duration");
+  return seconds;
+}
+
+function validateOpusConfiguration(configuration) {
+  if (!configuration || typeof configuration !== "object" ||
+      !Number.isInteger(configuration.sampleRate) || configuration.sampleRate < 8000 ||
+      configuration.sampleRate > 192000 ||
+      !Number.isInteger(configuration.channels) || configuration.channels < 1 || configuration.channels > 2 ||
+      !Number.isInteger(configuration.frameSize) || configuration.frameSize < 1 ||
+      typeof configuration.useFec !== "boolean" ||
+      typeof configuration.application !== "string") {
+    throw audioError("Invalid negotiated Opus configuration");
+  }
+  const duration = parsePacketDuration(configuration.packetDuration);
+  const actualDuration = configuration.frameSize / configuration.sampleRate;
+  const legalDurations = [0.0025, 0.005, 0.01, 0.02, 0.04, 0.06];
+  if (Math.abs(duration - actualDuration) > 1e-9 ||
+      !legalDurations.some((legal) => Math.abs(duration - legal) < 1e-9)) {
+    throw audioError("Unsupported Opus frame size or packet duration");
+  }
+  if (!["VOIP", "AUDIO", "LOWDELAY"].includes(configuration.application.toUpperCase())) {
+    throw audioError("Unsupported Opus application mode");
+  }
+  if (configuration.useFec) {
+    throw audioError("This browser client cannot configure the negotiated Opus FEC mode");
+  }
+  return {
+    sampleRate: configuration.sampleRate,
+    channels: configuration.channels,
+    frameSize: configuration.frameSize,
+    packetDuration: configuration.packetDuration,
+    duration,
+    useFec: configuration.useFec,
+    application: configuration.application,
+  };
+}
+
+function validateAudioTrack(track, { sourceKind } = {}) {
+  if (!track || typeof track !== "object" || !Number.isInteger(track.track_id) ||
+      track.track_id < 1 || track.codec !== "opus") {
+    throw audioError("Invalid Opus track metadata");
+  }
+  const configuration = validateOpusConfiguration(track.opusAudioConfiguration);
+  if (sourceKind === "application" &&
+      (track.source?.kind !== "application" || !Number.isInteger(track.source.pid) || track.source.pid < 1 ||
+       track.source.include_process_tree !== true)) {
+    throw audioError("Invalid application audio source metadata");
+  }
+  if (sourceKind === "desktop" &&
+      (track.source?.kind !== "desktop" || track.source.exclude_host_process_tree !== true)) {
+    throw audioError("Invalid desktop audio source metadata");
+  }
+  return { ...track, configuration };
+}
+
+export function parseAudioPacket(data) {
+  let bytes;
+  if (data instanceof ArrayBuffer) {
+    bytes = new Uint8Array(data);
+  } else if (ArrayBuffer.isView(data)) {
+    bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  } else {
+    throw audioError("Audio packet must be an ArrayBuffer or typed-array view");
+  }
+  if (bytes.byteLength < AUDIO_HEADER_SIZE + 1 || bytes.byteLength > MAX_AUDIO_PACKET_SIZE) {
+    throw audioError("Invalid audio packet size");
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.getUint8(0) !== AUDIO_VERSION || view.getUint8(1) !== AUDIO_MESSAGE ||
+      view.getUint16(2) !== AUDIO_HEADER_SIZE) {
+    throw audioError("Invalid version 2 Opus packet header");
+  }
+  const trackId = view.getUint32(12);
+  if (trackId === 0) throw audioError("Audio packet has an invalid track ID");
+  return {
+    flags: view.getUint32(4),
+    discontinuity: (view.getUint32(4) & 2) !== 0,
+    frameSize: view.getUint32(8),
+    trackId,
+    sequence: view.getBigUint64(16),
+    sampleTimestamp: view.getBigUint64(24),
+    payload: bytes.subarray(AUDIO_HEADER_SIZE),
+  };
+}
+
+export function createAudioPacket({ trackId, frameSize, sequence, samples, discontinuity = false }) {
+  const payload = samples instanceof Uint8Array ? samples : new Uint8Array(samples);
+  if (!Number.isInteger(trackId) || trackId < 1 || trackId > 0xffffffff ||
+      !Number.isInteger(frameSize) || frameSize < 1 || frameSize > 0xffffffff ||
+      typeof sequence !== "bigint" || sequence < 0n ||
+      payload.byteLength < 1 || payload.byteLength > 1275) {
+    throw new TypeError("Invalid Opus packet fields");
+  }
+  const packet = new Uint8Array(AUDIO_HEADER_SIZE + payload.byteLength);
+  const view = new DataView(packet.buffer);
+  view.setUint8(0, AUDIO_VERSION);
+  view.setUint8(1, AUDIO_MESSAGE);
+  view.setUint16(2, AUDIO_HEADER_SIZE);
+  view.setUint32(4, discontinuity ? 2 : 0);
+  view.setUint32(8, frameSize);
+  view.setUint32(12, trackId);
+  view.setBigUint64(16, sequence);
+  view.setBigUint64(24, sequence * BigInt(frameSize));
+  packet.set(payload, AUDIO_HEADER_SIZE);
+  return packet;
 }
 
 function validateVideoParameters(video) {
@@ -475,6 +647,560 @@ export async function createWebCodecsDecoder(stream, {
   };
 }
 
+export class BeamItAudio extends EventHub {
+  #client;
+  #WebSocket;
+  #controlUrl;
+  #socket = null;
+  #opened = false;
+  #closed = false;
+  #tracks = new Map();
+  #pendingSources = new Map();
+  #AudioContext;
+  #AudioDecoder;
+  #EncodedAudioChunk;
+  #AudioEncoder;
+  #AudioData;
+  #AudioWorkletNode;
+  #mediaDevices;
+  #context = null;
+  #microphone = null;
+  #source = null;
+  #worklet = null;
+  #encoder = null;
+  #encoderPackets = new Map();
+  #encoderDiscontinuity = true;
+  #lastSentSequence = null;
+  #messageQueue = Promise.resolve();
+  #queuedPackets = 0;
+
+  constructor(client, offer, WebSocketImpl, controlUrl, options = {}) {
+    super();
+    this.#client = client;
+    this.#WebSocket = WebSocketImpl;
+    this.#controlUrl = controlUrl;
+    this.#AudioContext = options.AudioContext ?? globalThis.AudioContext;
+    this.#AudioDecoder = options.AudioDecoder ?? globalThis.AudioDecoder;
+    this.#EncodedAudioChunk = options.EncodedAudioChunk ?? globalThis.EncodedAudioChunk;
+    this.#AudioEncoder = options.AudioEncoder ?? globalThis.AudioEncoder;
+    this.#AudioData = options.AudioData ?? globalThis.AudioData;
+    this.#AudioWorkletNode = options.AudioWorkletNode ?? globalThis.AudioWorkletNode;
+    this.#mediaDevices = options.mediaDevices ?? globalThis.navigator?.mediaDevices;
+    this.#context = options.audioContext ?? null;
+    this.audioId = offer.audio_id;
+    this.offer = offer;
+    this.clientToHost = validateAudioTrack({
+      track_id: offer.clientToHost?.track_id,
+      source: offer.clientToHost?.source,
+      codec: offer.clientToHost?.codec,
+      opusAudioConfiguration: offer.clientToHost?.opusAudioConfiguration,
+    }, { sourceKind: "microphone" });
+    if (this.clientToHost.source?.kind !== "microphone") {
+      throw audioError("Invalid negotiated microphone route");
+    }
+    if (!Array.isArray(offer.hostToClient?.tracks)) {
+      throw audioError("Invalid host-to-client audio tracks");
+    }
+    if (typeof this.#AudioContext !== "function" || typeof this.#AudioDecoder !== "function" ||
+        typeof this.#EncodedAudioChunk !== "function" || typeof this.#AudioEncoder !== "function" ||
+        typeof this.#AudioData !== "function" || typeof this.#mediaDevices?.getUserMedia !== "function") {
+      throw new BeamItError("Web Audio, WebCodecs Opus, and microphone capture are required for audio", {
+        code: "audio_capability_unavailable",
+      });
+    }
+  }
+
+  get ready() {
+    return !this.#closed && this.#socket?.readyState === 1;
+  }
+
+  get tracks() {
+    return [...this.#tracks.values()].map(({ metadata }) => metadata);
+  }
+
+  async open() {
+    const audioUrl = new URL(this.offer.url);
+    const token = audioUrl.searchParams.get("token");
+    if (audioUrl.protocol !== "wss:" || audioUrl.host !== this.#controlUrl.host ||
+        audioUrl.pathname !== `/audio/${encodeURIComponent(this.audioId)}` ||
+        audioUrl.username || audioUrl.password || audioUrl.hash || audioUrl.searchParams.size !== 1 ||
+        !token || base64UrlDecode(token).byteLength !== 32 ||
+        this.offer.audio_version !== AUDIO_VERSION ||
+        !Number.isFinite(this.offer.token_expires_in_ms) || this.offer.token_expires_in_ms <= 0) {
+      throw audioError("Audio offer does not match the authenticated WSS host", "invalid_audio_offer");
+    }
+    for (const track of this.offer.hostToClient.tracks) {
+      await this.#installTrack(validateAudioTrack(track));
+    }
+    return new Promise((resolve, reject) => {
+      try {
+        this.#socket = new this.#WebSocket(audioUrl.href);
+      } catch (cause) {
+        reject(new BeamItError("Could not create the audio WebSocket", { cause }));
+        return;
+      }
+      this.#socket.binaryType = "arraybuffer";
+      const socket = this.#socket;
+      socket.addEventListener("open", () => {
+        if (this.#closed) return;
+        this.#opened = true;
+        this.emit("open", this.offer);
+        resolve(this);
+      }, { once: true });
+      socket.addEventListener("message", (event) => {
+        if (this.#queuedPackets >= MAX_AUDIO_QUEUE) {
+          this.#failAudio(audioError("Incoming audio socket queue exceeded three packets", "audio_overloaded"), 1011);
+          return;
+        }
+        this.#queuedPackets += 1;
+        this.#messageQueue = this.#messageQueue.then(() => this.#handlePacket(event.data)).catch((error) => {
+          this.#failAudio(error, 1007);
+        }).finally(() => { this.#queuedPackets -= 1; });
+      });
+      socket.addEventListener("close", (event) => {
+        if (this.#socket !== socket) return;
+        const unopened = !this.#opened;
+        this.close(event.code, event.reason || "audio socket closed", false);
+        if (unopened) reject(new BeamItError(`Audio socket closed before opening (${event.code})`, {
+          code: "audio_open_failed",
+        }));
+        this.emit("close", { code: event.code, reason: event.reason });
+      });
+      socket.addEventListener("error", () => this.emit("socketError", { socket: "audio", audioId: this.audioId }));
+    });
+  }
+
+  async startTrack(source) {
+    if (!this.ready) throw new BeamItError("Audio socket is not open", { code: "not_ready" });
+    const requestSource = validateAudioSource(source);
+    if (this.#tracks.size + this.#pendingSources.size >= 8) {
+      throw new TypeError("At most eight audio capture tracks can be selected");
+    }
+    const existing = [
+      ...[...this.#tracks.values()].map(({ metadata }) => metadata.source),
+      ...this.#pendingSources.values(),
+    ];
+    if (requestSource.kind === "desktop" && existing.length > 0 ||
+        requestSource.kind === "application" && existing.some((item) => item?.kind === "desktop") ||
+        requestSource.kind === "application" && existing.some((item) =>
+          item?.kind === "application" && item.pid === requestSource.pid)) {
+      throw new TypeError("Desktop audio is exclusive and application PIDs cannot be duplicated");
+    }
+    const key = requestSource.kind === "desktop" ? "desktop" : `application:${requestSource.pid}`;
+    this.#pendingSources.set(key, requestSource);
+    let failedTrackId;
+    try {
+      const response = await this.#client._startAudioTrack(this.audioId, requestSource);
+      if (response.audio_id !== this.audioId) throw audioError("Audio track reply belongs to another session");
+      if (response.type === "audio_track_stopped") {
+        throw new BeamItError(response.message ?? `Audio capture failed: ${response.reason ?? "unknown"}`, {
+          code: response.reason ?? "capture_failed",
+          id: response.id,
+        });
+      }
+      if (Number.isInteger(response.track?.track_id) && response.track.track_id > 0 &&
+          !this.#tracks.has(response.track.track_id)) failedTrackId = response.track.track_id;
+      const track = validateAudioTrack(response.track, { sourceKind: requestSource.kind });
+      if (requestSource.kind === "application" && track.source.pid !== requestSource.pid) {
+        throw audioError("Audio track reply changed the requested application PID");
+      }
+      if ([...this.#tracks.keys()].includes(track.track_id)) throw audioError("Audio track ID was reused");
+      await this.#installTrack(track);
+      failedTrackId = undefined;
+      this.emit("trackStarted", track);
+      return track;
+    } catch (error) {
+      if (failedTrackId !== undefined) {
+        void this.#client._stopAudioTrack(this.audioId, failedTrackId).catch(() => {});
+      }
+      throw error;
+    } finally {
+      this.#pendingSources.delete(key);
+    }
+  }
+
+  async stopTrack(trackId) {
+    if (!this.#tracks.has(trackId)) throw new BeamItError("Audio track is not active", { code: "not_found" });
+    const response = await this.#client._stopAudioTrack(this.audioId, trackId);
+    if (response.audio_id !== this.audioId || response.track_id !== trackId) {
+      throw audioError("Audio track stop reply does not match the request");
+    }
+    this.#removeTrack(trackId);
+    this.emit("trackStopped", response);
+    return response;
+  }
+
+  async startMicrophone() {
+    if (!this.ready) throw new BeamItError("Audio socket is not open", { code: "not_ready" });
+    if (this.#encoder) throw new BeamItError("Microphone capture is already running");
+    const configuration = this.clientToHost.configuration;
+    if (configuration.application.toUpperCase() !== "VOIP") {
+      throw new BeamItError("This browser encoder supports only the negotiated VOIP Opus application", {
+        code: "audio_config_unsupported",
+      });
+    }
+    const codecConfig = {
+      codec: "opus",
+      sampleRate: configuration.sampleRate,
+      numberOfChannels: configuration.channels,
+    };
+    if (typeof this.#AudioEncoder.isConfigSupported !== "function") {
+      throw new BeamItError("AudioEncoder.isConfigSupported is required for safe Opus setup", {
+        code: "audio_capability_unavailable",
+      });
+    }
+    const support = await this.#AudioEncoder.isConfigSupported(codecConfig);
+    if (this.#closed) throw new BeamItError("Audio session ended during microphone setup", { code: "audio_stopped" });
+    if (!support?.supported) {
+      throw new BeamItError("The browser cannot encode the negotiated Opus configuration", {
+        code: "audio_config_unsupported",
+      });
+    }
+    try {
+      if (this.#context && this.#context.sampleRate !== configuration.sampleRate) {
+        const previousContext = this.#context;
+        this.#context = null;
+        if (previousContext.state !== "closed") await previousContext.close();
+      }
+      this.#context ??= new this.#AudioContext({
+        sampleRate: configuration.sampleRate,
+        latencyHint: "interactive",
+      });
+      if (this.#context.sampleRate !== configuration.sampleRate) {
+        throw new BeamItError("Web Audio cannot provide the negotiated microphone sample rate", {
+          code: "audio_config_unsupported",
+        });
+      }
+      await this.#context.resume();
+      if (this.#closed) throw new BeamItError("Audio session ended during microphone setup", { code: "audio_stopped" });
+      if (!this.#context.audioWorklet?.addModule || typeof this.#AudioWorkletNode !== "function") {
+        throw new BeamItError("AudioWorklet microphone capture is unavailable", {
+          code: "audio_capability_unavailable",
+        });
+      }
+      await this.#context.audioWorklet.addModule(new URL("./beamit.js", import.meta.url));
+      if (this.#closed) throw new BeamItError("Audio session ended during microphone setup", { code: "audio_stopped" });
+      const microphone = await this.#mediaDevices.getUserMedia({
+        audio: { channelCount: { ideal: configuration.channels }, sampleRate: { ideal: configuration.sampleRate } },
+      });
+      if (this.#closed) {
+        for (const track of microphone.getTracks?.() ?? []) track.stop();
+        throw new BeamItError("Audio session ended during microphone setup", { code: "audio_stopped" });
+      }
+      this.#microphone = microphone;
+      const encoderInstance = new this.#AudioEncoder({
+        output: (chunk) => this.#handleEncodedChunk(chunk),
+        error: (error) => this.#microphoneFailed(error),
+      });
+      encoderInstance.configure(codecConfig);
+      this.#encoder = encoderInstance;
+      this.#source = this.#context.createMediaStreamSource(microphone);
+      this.#worklet = new this.#AudioWorkletNode(this.#context, "beamit-microphone", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        channelCount: configuration.channels,
+        channelCountMode: "explicit",
+        processorOptions: {
+          frameSize: configuration.frameSize,
+          channels: configuration.channels,
+        },
+      });
+      this.#worklet.port.onmessage = (event) => this.#handleMicrophoneFrame(event.data);
+      this.#source.connect(this.#worklet);
+      this.#worklet.connect(this.#context.destination);
+      this.emit("microphoneStarted", this.clientToHost);
+      return this.clientToHost;
+    } catch (error) {
+      this.#stopMicrophone();
+      throw error;
+    }
+  }
+
+  async stop() {
+    if (this.#closed) return;
+    return this.#client.stopAudio(this.audioId);
+  }
+
+  handleTrackStopped(message) {
+    if (message.audio_id !== this.audioId || !Number.isInteger(message.track_id)) return;
+    this.#removeTrack(message.track_id);
+    this.emit("trackStopped", message);
+  }
+
+  handleStopped(message) {
+    if (this.#closed) return;
+    this.emit("stopped", message);
+    this.close(1000, "audio stopped");
+  }
+
+  controlClosed(error) {
+    this.emit("error", error);
+    this.close(1001, "control connection closed");
+  }
+
+  close(code = 1000, reason = "audio closed", closeSocket = true) {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const trackId of this.#tracks.keys()) this.#removeTrack(trackId);
+    this.#stopMicrophone();
+    if (closeSocket && this.#socket && this.#socket.readyState < 2) {
+      this.#socket.close(code, reason.slice(0, 120));
+    }
+    const context = this.#context;
+    this.#context = null;
+    if (context && context.state !== "closed") void context.close().catch(() => {});
+    this.#client._removeAudio(this.audioId, this);
+  }
+
+  async #installTrack(metadata) {
+    if (this.#tracks.has(metadata.track_id)) throw audioError("Duplicate audio track ID");
+    const AudioDecoderImpl = this.#AudioDecoder;
+    const configuration = metadata.configuration ?? validateOpusConfiguration(metadata.opusAudioConfiguration);
+    const decoderConfig = {
+      codec: "opus",
+      sampleRate: configuration.sampleRate,
+      numberOfChannels: configuration.channels,
+    };
+    if (typeof AudioDecoderImpl.isConfigSupported !== "function" ||
+        !(await AudioDecoderImpl.isConfigSupported(decoderConfig))?.supported) {
+      throw new BeamItError("The browser cannot decode the negotiated Opus configuration", {
+        code: "audio_config_unsupported",
+      });
+    }
+    const trackState = {
+      metadata,
+      decoder: null,
+      lastSequence: null,
+      nextPlaybackTime: 0,
+      sources: new Set(),
+    };
+    const decoder = new AudioDecoderImpl({
+      output: (audioData) => this.#playDecoded(trackState, audioData),
+      error: (error) => this.#microphoneFailed(error),
+    });
+    try {
+      decoder.configure(decoderConfig);
+    } catch (cause) {
+      decoder.close();
+      throw new BeamItError("Could not configure the negotiated Opus decoder", {
+        code: "audio_config_unsupported", cause,
+      });
+    }
+    trackState.decoder = decoder;
+    this.#tracks.set(metadata.track_id, trackState);
+  }
+
+  async #handlePacket(data) {
+    if (this.#closed) return;
+    if (typeof data === "string") throw audioError("Audio socket accepts binary packets only");
+    const packet = parseAudioPacket(data instanceof Blob ? await data.arrayBuffer() : data);
+    const track = this.#tracks.get(packet.trackId);
+    if (!track) return;
+    const configuration = track.metadata.configuration;
+    if (packet.frameSize !== configuration.frameSize ||
+        packet.sampleTimestamp !== packet.sequence * BigInt(configuration.frameSize)) {
+      throw audioError("Audio packet timing does not match negotiated Opus metadata");
+    }
+    const previous = track.lastSequence;
+    if (previous !== null && packet.sequence <= previous) {
+      throw audioError("Audio packet sequence is duplicate or reversed");
+    }
+    const gap = previous === null ? packet.sequence !== 0n : packet.sequence !== previous + 1n;
+    if ((gap || previous === null) && !packet.discontinuity) {
+      throw audioError("Audio packet gap is missing its discontinuity flag");
+    }
+    if (packet.discontinuity) {
+      track.decoder.reset();
+      track.decoder.configure({
+        codec: "opus",
+        sampleRate: configuration.sampleRate,
+        numberOfChannels: configuration.channels,
+      });
+      track.nextPlaybackTime = 0;
+      for (const source of track.sources) {
+        try { source.stop(); } catch {}
+      }
+      track.sources.clear();
+    }
+    track.lastSequence = packet.sequence;
+    if (track.decoder.decodeQueueSize >= MAX_AUDIO_QUEUE) {
+      throw audioError("Incoming Opus decoder queue exceeded three packets", "audio_overloaded");
+    }
+    const chunk = new this.#EncodedAudioChunk({
+      type: "key",
+      timestamp: Number(packet.sampleTimestamp * 1_000_000n / BigInt(configuration.sampleRate)),
+      duration: Math.round(configuration.duration * 1_000_000),
+      data: packet.payload,
+    });
+    track.decoder.decode(chunk);
+    this.emit("packet", { trackId: packet.trackId, sequence: packet.sequence, discontinuity: packet.discontinuity });
+  }
+
+  #playDecoded(track, audioData) {
+    if (this.#closed || !this.#context || !this.#tracks.has(track.metadata.track_id)) {
+      audioData.close();
+      return;
+    }
+    try {
+      const configuration = track.metadata.configuration;
+      const duration = audioData.numberOfFrames / configuration.sampleRate;
+      if (audioData.sampleRate !== configuration.sampleRate ||
+          audioData.numberOfChannels !== configuration.channels ||
+          audioData.numberOfFrames !== configuration.frameSize) {
+        throw audioError("Decoded Opus frame does not match negotiated audio metadata");
+      }
+      if (track.sources.size >= MAX_AUDIO_QUEUE ||
+          track.nextPlaybackTime - this.#context.currentTime > duration * MAX_AUDIO_QUEUE + 0.015) {
+        throw audioError("Incoming decoded audio queue exceeded three packets", "audio_overloaded");
+      }
+      const buffer = this.#context.createBuffer(
+        configuration.channels, audioData.numberOfFrames, configuration.sampleRate,
+      );
+      for (let channel = 0; channel < configuration.channels; channel += 1) {
+        audioData.copyTo(buffer.getChannelData(channel), { planeIndex: channel, format: "f32-planar" });
+      }
+      const source = this.#context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(this.#context.destination);
+      source.onended = () => track.sources.delete(source);
+      const startAt = Math.max(this.#context.currentTime + 0.015, track.nextPlaybackTime);
+      track.nextPlaybackTime = startAt + duration;
+      track.sources.add(source);
+      source.start(startAt);
+    } catch (error) {
+      this.#microphoneFailed(error);
+    } finally {
+      audioData.close();
+    }
+  }
+
+  #handleMicrophoneFrame(message) {
+    const configuration = this.clientToHost.configuration;
+    const { sequence, samples } = message ?? {};
+    try {
+      if (!Number.isSafeInteger(sequence) || !(samples instanceof Float32Array) ||
+          samples.length !== configuration.frameSize * configuration.channels) {
+        throw audioError("AudioWorklet returned an invalid PCM frame");
+      }
+      if (this.#encoder.encodeQueueSize >= MAX_AUDIO_QUEUE ||
+          this.#encoderPackets.size >= MAX_AUDIO_QUEUE ||
+          this.#socket.bufferedAmount > MAX_AUDIO_QUEUE * MAX_AUDIO_PACKET_SIZE) {
+        this.#encoderDiscontinuity = true;
+        return;
+      }
+      const timestamp = Number(BigInt(sequence) * BigInt(configuration.frameSize) *
+        1_000_000n / BigInt(configuration.sampleRate));
+      const frame = new this.#AudioData({
+        format: "f32",
+        sampleRate: configuration.sampleRate,
+        numberOfFrames: configuration.frameSize,
+        numberOfChannels: configuration.channels,
+        timestamp,
+        data: samples,
+      });
+      this.#encoderPackets.set(timestamp, {
+        sequence: BigInt(sequence),
+        discontinuity: this.#encoderDiscontinuity ||
+          this.#lastSentSequence === null || BigInt(sequence) !== this.#lastSentSequence + 1n,
+      });
+      this.#encoderDiscontinuity = false;
+      this.#encoder.encode(frame);
+      frame.close();
+    } catch (error) {
+      this.#microphoneFailed(error);
+    } finally {
+      this.#worklet?.port.postMessage({ type: "consumed" });
+    }
+  }
+
+  #handleEncodedChunk(chunk) {
+    try {
+      const configuration = this.clientToHost.configuration;
+      const metadata = this.#encoderPackets.get(chunk.timestamp);
+      if (!metadata) throw audioError("Opus encoder returned an unmatched timestamp");
+      this.#encoderPackets.delete(chunk.timestamp);
+      if (chunk.duration !== Math.round(configuration.duration * 1_000_000)) {
+        throw audioError("Browser Opus encoder did not honor the negotiated packet duration", "audio_config_unsupported");
+      }
+      if (!Number.isInteger(chunk.byteLength) || chunk.byteLength < 1 || chunk.byteLength > 1275) {
+        throw audioError("Browser Opus encoder returned an invalid packet size");
+      }
+      if (this.#socket?.readyState !== 1 ||
+          this.#socket.bufferedAmount > MAX_AUDIO_QUEUE * MAX_AUDIO_PACKET_SIZE) {
+        this.#encoderDiscontinuity = true;
+        return;
+      }
+      const payload = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(payload);
+      const packet = createAudioPacket({
+        trackId: this.clientToHost.track_id,
+        frameSize: configuration.frameSize,
+        sequence: metadata.sequence,
+        samples: payload,
+        discontinuity: metadata.discontinuity,
+      });
+      this.#socket.send(packet);
+      this.#lastSentSequence = metadata.sequence;
+    } catch (error) {
+      this.#microphoneFailed(error);
+    }
+  }
+
+  #microphoneFailed(error) {
+    if (this.#closed) return;
+    const failure = error instanceof Error ? error : new BeamItError(String(error));
+    const stopping = this.ready ? this.stop() : Promise.resolve();
+    this.close(1011, "audio processing failed");
+    this.emit("error", failure);
+    void stopping.catch(() => {});
+  }
+
+  #failAudio(error, code) {
+    if (this.#closed) return;
+    const stopping = this.ready ? this.stop() : Promise.resolve();
+    this.close(code, "audio protocol failure");
+    this.emit("error", error);
+    void stopping.catch(() => {});
+  }
+
+  #stopMicrophone() {
+    this.#source?.disconnect();
+    this.#worklet?.disconnect();
+    if (this.#worklet?.port) this.#worklet.port.onmessage = null;
+    if (this.#encoder && this.#encoder.state !== "closed") this.#encoder.close();
+    this.#encoder = null;
+    this.#encoderPackets.clear();
+    for (const track of this.#microphone?.getTracks?.() ?? []) track.stop();
+    this.#microphone = null;
+    this.#source = null;
+    this.#worklet = null;
+  }
+
+  #removeTrack(trackId) {
+    const track = this.#tracks.get(trackId);
+    if (!track) return;
+    this.#tracks.delete(trackId);
+    for (const source of track.sources) {
+      try { source.stop(); } catch {}
+    }
+    track.sources.clear();
+    if (track.decoder.state !== "closed") track.decoder.close();
+  }
+}
+
+function validateAudioSource(source) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    throw new TypeError("Audio source is required");
+  }
+  if (source.kind === "desktop") return { kind: "desktop" };
+  if (source.kind === "application" && Number.isInteger(source.pid) &&
+      source.pid > 0 && source.pid <= 0xffffffff) {
+    return { kind: "application", pid: source.pid };
+  }
+  throw new TypeError('Audio source must be { kind: "desktop" } or { kind: "application", pid }');
+}
+
 export class BeamItClient extends EventHub {
   #WebSocket;
   #crypto;
@@ -484,6 +1210,8 @@ export class BeamItClient extends EventHub {
   #state = "disconnected";
   #pending = new Map();
   #streams = new Map();
+  #audios = new Map();
+  #audioStarting = false;
   #nextId = 1;
   #messageQueue = Promise.resolve();
   #connectResolve = null;
@@ -593,6 +1321,56 @@ export class BeamItClient extends EventHub {
     return response;
   }
 
+  async startAudio(options = {}) {
+    this.#assertConnected();
+    if (this.#audioStarting || this.#audios.size > 0) {
+      throw new BeamItError("An audio session is already starting or active", { code: "limit_reached" });
+    }
+    this.#audioStarting = true;
+    let offer;
+    try {
+      offer = await this.#request("start_audio", {}, "audio_offer");
+      if (typeof offer.audio_id !== "string" || offer.audio_id.length === 0 ||
+          typeof offer.url !== "string") {
+        throw audioError("Invalid audio offer");
+      }
+      const audio = new BeamItAudio(this, offer, this.#WebSocket, this.#controlUrl, options);
+      this.#audios.set(offer.audio_id, audio);
+      try {
+        await audio.open();
+        return audio;
+      } catch (error) {
+        audio.close(1002, "audio setup failed");
+        throw error;
+      }
+    } catch (error) {
+      if (offer?.audio_id && this.connected) {
+        void this.#request("stop_audio", { audio_id: offer.audio_id }, "audio_stopped").catch(() => {});
+      }
+      throw error;
+    } finally {
+      this.#audioStarting = false;
+    }
+  }
+
+  async stopAudio(audioId) {
+    const audio = this.#audioSession(audioId);
+    const response = await this.#request("stop_audio", { audio_id: audioId }, "audio_stopped");
+    if (response.audio_id !== audioId) throw audioError("Audio stop reply does not match the request");
+    audio.handleStopped(response);
+    return response;
+  }
+
+  _startAudioTrack(audioId, source) {
+    return this.#request("start_audio_track", { audio_id: audioId, source },
+      ["audio_track_started", "audio_track_stopped"]);
+  }
+
+  _stopAudioTrack(audioId, trackId) {
+    return this.#request("stop_audio_track", { audio_id: audioId, track_id: trackId },
+      "audio_track_stopped");
+  }
+
   async requestKeyFrame(streamId) {
     this.#assertConnected();
     this.#send({ type: "request_key_frame", stream_id: streamId });
@@ -683,6 +1461,8 @@ export class BeamItClient extends EventHub {
     this.#state = "closing";
     for (const stream of this.#streams.values()) stream.close(1000, "client disconnected");
     this.#streams.clear();
+    for (const audio of this.#audios.values()) audio.close(1000, "client disconnected");
+    this.#audios.clear();
     const error = new BeamItError("Control connection closed", { code: "disconnected" });
     this.#rejectPending(error);
     this.#connectReject?.(error);
@@ -763,6 +1543,9 @@ export class BeamItClient extends EventHub {
       this.#streams.get(message.stream_id)?.handleStopped(message);
       this.#streams.delete(message.stream_id);
     }
+    if (message.type === "audio_track_stopped") {
+      this.#audios.get(message.audio_id)?.handleTrackStopped(message);
+    }
 
     if (message.type === "error") {
       const error = new BeamItError(message.message ?? message.code ?? "Protocol error", {
@@ -785,12 +1568,19 @@ export class BeamItClient extends EventHub {
       const pending = this.#pending.get(message.id);
       clearTimeout(pending.timer);
       this.#pending.delete(message.id);
-      if (message.type !== pending.expectedType) {
-        pending.reject(protocolError(`Expected ${pending.expectedType}, received ${message.type}`, "unexpected_response", { id: message.id }));
+      const expectedTypes = Array.isArray(pending.expectedType) ? pending.expectedType : [pending.expectedType];
+      if (!expectedTypes.includes(message.type)) {
+        pending.reject(protocolError(`Expected ${expectedTypes.join(" or ")}, received ${message.type}`, "unexpected_response", { id: message.id }));
       } else {
         pending.resolve(message);
       }
+      if (message.type === "audio_stopped") {
+        this.#audios.get(message.audio_id)?.handleStopped(message);
+      }
     } else {
+      if (message.type === "audio_stopped") {
+        this.#audios.get(message.audio_id)?.handleStopped(message);
+      }
       this.emit("message", message);
     }
   }
@@ -831,7 +1621,7 @@ export class BeamItClient extends EventHub {
         this.#pending.delete(id);
         reject(new BeamItError(`${type} request timed out`, { code: "timeout", id }));
       }, this.#requestTimeoutMs);
-      this.#pending.set(id, { resolve, reject, expectedType, timer });
+      this.#pending.set(id, { resolve, reject, expectedType, timer, audioId: fields.audio_id });
       try {
         this.#send({ type, id, ...fields });
       } catch (error) {
@@ -881,6 +1671,8 @@ export class BeamItClient extends EventHub {
     this.#password = null;
     for (const stream of this.#streams.values()) stream.controlClosed(error);
     this.#streams.clear();
+    for (const audio of this.#audios.values()) audio.controlClosed(error);
+    this.#audios.clear();
     this.emit("close", { code: event.code, reason: event.reason });
   }
 
@@ -909,6 +1701,25 @@ export class BeamItClient extends EventHub {
 
   _removeStream(streamId, stream) {
     if (this.#streams.get(streamId) === stream) this.#streams.delete(streamId);
+  }
+
+  _removeAudio(audioId, audio) {
+    if (this.#audios.get(audioId) === audio) this.#audios.delete(audioId);
+    for (const [id, pending] of this.#pending) {
+      if (pending.audioId !== audioId) continue;
+      clearTimeout(pending.timer);
+      this.#pending.delete(id);
+      pending.reject(new BeamItError("Audio session ended", { code: "audio_stopped", id }));
+    }
+  }
+
+  #audioSession(audioId) {
+    this.#assertConnected();
+    const audio = this.#audios.get(audioId);
+    if (!audio) throw new BeamItError("Audio session does not belong to this connection", {
+      code: "not_found",
+    });
+    return audio;
   }
 
   _sendRequestKeyFrame(streamId) {

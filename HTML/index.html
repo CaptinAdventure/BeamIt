@@ -49,7 +49,7 @@
   <body>
     <header>
       <h1>BeamIt Protocol Test Client</h1>
-      <p>Browser test harness for the v1 WSS signaling and video protocol. Use HTTPS and trust the host certificate before connecting.</p>
+      <p>Browser test harness for the WSS signaling, video, and two-way Opus audio protocols. Use HTTPS and trust the host certificate before connecting.</p>
     </header>
 
     <main class="layout">
@@ -123,6 +123,25 @@
         <div class="actions">
           <button id="send-text" type="button" disabled>Send text</button>
         </div>
+
+        <h2>Two-way audio</h2>
+        <p>Start the independent full-duplex Opus connection. Host playback is sent to the browser's default output; microphone permission is requested for uplink.</p>
+        <div class="actions">
+          <button id="start-audio" type="button" disabled>Start audio</button>
+          <button id="stop-audio" class="danger" type="button" disabled>Stop audio</button>
+        </div>
+        <p id="audio-status" class="status" role="status">No active audio session</p>
+        <label for="audio-source-kind">Host playback capture</label>
+        <select id="audio-source-kind" disabled>
+          <option value="application">Application process tree</option>
+          <option value="desktop">Desktop (exclusive)</option>
+        </select>
+        <label id="audio-pid-label" for="audio-pid">Application PID</label>
+        <input id="audio-pid" type="number" min="1" max="4294967295" step="1" inputmode="numeric" disabled>
+        <div class="actions">
+          <button id="start-audio-track" class="secondary" type="button" disabled>Add capture track</button>
+        </div>
+        <ul id="audio-tracks" aria-live="polite"></ul>
       </section>
 
       <section aria-labelledby="video-heading">
@@ -159,6 +178,7 @@
       let stream = null;
       let decoderHandle = null;
       let inputBinding = null;
+      let audio = null;
       let lastSequence = null;
       let frameCount = 0;
       let lastStatsAt = 0;
@@ -221,8 +241,60 @@
         $("refresh-windows-button").disabled = !connected;
         $("ping-button").disabled = !connected;
         $("start-button").disabled = !connected || stream !== null;
+        $("start-audio").disabled = !connected || audio !== null;
         $("connection-status").textContent = connected ? "Authenticated" : "Disconnected";
+        setAudioControls();
         updateSourceFields();
+      }
+
+      function setAudioStatus(text, error = false) {
+        $("audio-status").textContent = text;
+        $("audio-status").classList.toggle("error", error);
+      }
+
+      function setAudioControls() {
+        const active = audio !== null;
+        $("start-audio").disabled = !client?.connected || active;
+        $("stop-audio").disabled = !active;
+        $("audio-source-kind").disabled = !active;
+        $("audio-pid").disabled = !active || $("audio-source-kind").value !== "application";
+        $("start-audio-track").disabled = !active;
+        $("audio-pid-label").hidden = $("audio-source-kind").value !== "application";
+      }
+
+      function detachAudio(target = audio) {
+        if (!target || audio !== target) return;
+        target.close();
+        audio = null;
+        $("audio-tracks").replaceChildren();
+        setAudioControls();
+        setAudioStatus("No active audio session");
+      }
+
+      function renderAudioTracks() {
+        const list = $("audio-tracks");
+        list.replaceChildren();
+        for (const track of audio?.tracks ?? []) {
+          const item = document.createElement("li");
+          const source = track.source.kind === "application"
+            ? `application PID ${track.source.pid}`
+            : "desktop";
+          item.append(document.createTextNode(`Track ${track.track_id}: ${source} · Opus ${track.configuration.sampleRate} Hz, ${track.configuration.channels} ch, ${track.configuration.packetDuration} `));
+          const stop = document.createElement("button");
+          stop.type = "button";
+          stop.className = "secondary";
+          stop.textContent = "Stop track";
+          stop.addEventListener("click", async () => {
+            try {
+              await audio?.stopTrack(track.track_id);
+              renderAudioTracks();
+            } catch (error) {
+              log(`Audio track: ${error.message}`, true);
+            }
+          });
+          item.append(stop);
+          list.append(item);
+        }
       }
 
       function updateSourceFields() {
@@ -301,6 +373,52 @@
       function setInputEnabled(enabled) {
         for (const id of ["mouse-mode", "release-input", "input-state", "send-text"]) {
           $(id).disabled = !enabled;
+        }
+
+        async function startAudio() {
+          if (!client?.connected || audio) return;
+          $("start-audio").disabled = true;
+          setAudioStatus("Negotiating full-duplex audio…");
+          let started;
+          let preparedContext;
+          try {
+            if (typeof AudioContext !== "function") {
+              throw new Error("Web Audio is unavailable in this browser.");
+            }
+            preparedContext = new AudioContext({ latencyHint: "interactive" });
+            void preparedContext.resume().catch(() => {});
+            started = await client.startAudio({ audioContext: preparedContext });
+            audio = started;
+            audio.on("trackStarted", renderAudioTracks);
+            audio.on("trackStopped", renderAudioTracks);
+            audio.on("error", (error) => {
+              log(`Audio: ${error.message}`, true);
+              if (audio === started) detachAudio(started);
+            });
+            audio.on("stopped", (message) => {
+              log(`Audio stopped: ${message.reason ?? "unknown"}${message.message ? ` — ${message.message}` : ""}`);
+              detachAudio(started);
+            });
+            audio.on("close", () => detachAudio(started));
+            audio.on("socketError", () => log("Audio socket reported an error.", true));
+            renderAudioTracks();
+            setAudioControls();
+            await started.startMicrophone();
+            if (audio !== started) return;
+            setAudioStatus("Full-duplex audio active · microphone uplink and host playback enabled");
+            log("Full-duplex audio connection opened.");
+          } catch (error) {
+            if (started && audio === started) {
+              try { await started.stop(); } catch {}
+              detachAudio(started);
+            } else {
+              if (preparedContext && preparedContext.state !== "closed") void preparedContext.close();
+              audio = null;
+              setAudioControls();
+            }
+            setAudioStatus(error.message, true);
+            log(`Audio: ${error.message}`, true);
+          }
         }
       }
 
@@ -409,6 +527,7 @@
           client.on("close", ({ code, reason }) => {
             log(`Control socket closed (${code})${reason ? `: ${reason}` : ""}.`);
             detachStream();
+            detachAudio();
             setConnected(false);
           });
           client.on("protocolError", (error) => log(error.message, true));
@@ -432,6 +551,7 @@
         client?.disconnect();
         client = null;
         detachStream();
+        detachAudio();
         setConnected(false);
         log("Disconnected.");
       });
@@ -477,6 +597,34 @@
           setStreamStatus(error.message, true);
           $("stop-button").disabled = false;
           log(error.message, true);
+        }
+      });
+
+      $("start-audio").addEventListener("click", () => void startAudio());
+      $("stop-audio").addEventListener("click", async () => {
+        if (!audio) return;
+        const target = audio;
+        $("stop-audio").disabled = true;
+        try {
+          await target.stop();
+        } catch (error) {
+          setAudioStatus(error.message, true);
+          if (audio === target) $("stop-audio").disabled = false;
+          log(`Audio: ${error.message}`, true);
+        }
+      });
+      $("audio-source-kind").addEventListener("change", setAudioControls);
+      $("start-audio-track").addEventListener("click", async () => {
+        if (!audio) return;
+        const source = $("audio-source-kind").value === "desktop"
+          ? { kind: "desktop" }
+          : { kind: "application", pid: Number($("audio-pid").value) };
+        try {
+          const track = await audio.startTrack(source);
+          renderAudioTracks();
+          log(`Host audio capture track ${track.track_id} started.`);
+        } catch (error) {
+          log(`Audio track: ${error.message}`, true);
         }
       });
 

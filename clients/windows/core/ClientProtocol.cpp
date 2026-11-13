@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <format>
 #include <limits>
 
@@ -93,6 +94,20 @@ bool valid_identifier(std::string_view text) {
     return text.size() >= 8 && text.size() <= 128 && std::ranges::all_of(text, [](char character) {
         return std::isalnum(static_cast<unsigned char>(character)) || character == '-' || character == '_';
     });
+}
+
+std::optional<std::chrono::microseconds> parse_audio_duration(std::string_view text) {
+    if (!text.starts_with("PT") || !text.ends_with('S') || text.size() < 4) return std::nullopt;
+    const auto number = text.substr(2, text.size() - 3);
+    double seconds{};
+    const auto [end, error] = std::from_chars(number.data(), number.data() + number.size(), seconds);
+    if (error != std::errc{} || end != number.data() + number.size() || !std::isfinite(seconds) ||
+        seconds <= 0 || seconds > 0.06) {
+        return std::nullopt;
+    }
+    const auto microseconds = std::llround(seconds * 1'000'000);
+    if (std::abs(seconds * 1'000'000 - static_cast<double>(microseconds)) > 0.001) return std::nullopt;
+    return std::chrono::microseconds(microseconds);
 }
 
 } // namespace
@@ -284,6 +299,89 @@ std::expected<StreamOffer, std::string> parse_stream_offer(const json::object& o
         if (string_field(input->get_object(), "cursor") == "client") result.cursor = "client";
     }
     return result;
+}
+
+std::expected<AudioTrackConfiguration, std::string> parse_audio_track(const json::value& value) {
+    const auto* object = value.if_object();
+    if (!object || string_field(*object, "codec") != "opus") {
+        return std::unexpected("The host sent an invalid audio track.");
+    }
+    const auto track_id = bounded<std::uint32_t>(*object, "track_id", 1, std::numeric_limits<std::uint32_t>::max());
+    const auto* opus_value = object->if_contains("opusAudioConfiguration");
+    const auto* opus = opus_value ? opus_value->if_object() : nullptr;
+    if (!track_id || !opus) return std::unexpected("The host sent an incomplete audio track.");
+
+    const auto sample_rate = bounded<std::uint32_t>(*opus, "sampleRate", 8'000, 48'000);
+    const auto channels = bounded<unsigned>(*opus, "channels", 1, 2);
+    const auto frame_size = bounded<std::uint32_t>(*opus, "frameSize", 1, 2'880);
+    const auto packet_duration = string_field(*opus, "packetDuration");
+    const auto* use_fec = opus->if_contains("useFec");
+    if (!sample_rate || !channels || !frame_size || !packet_duration ||
+        !use_fec || !use_fec->is_bool() || use_fec->as_bool() ||
+        string_field(*opus, "application") != "VOIP") {
+        return std::unexpected("The host offered an unsupported Opus configuration.");
+    }
+    const auto duration = parse_audio_duration(*packet_duration);
+    if (!duration) return std::unexpected("The host offered an unsupported Opus packet duration.");
+
+    media::AudioConfiguration configuration{
+        .sample_rate = *sample_rate,
+        .packet_duration = *duration,
+        .channels = *channels,
+    };
+    try {
+        configuration.validate();
+    } catch (const std::invalid_argument&) {
+        return std::unexpected("The host offered an unsupported Opus configuration.");
+    }
+    if (configuration.frame_size() != *frame_size) {
+        return std::unexpected("The host's Opus frame size does not match its packet duration.");
+    }
+    return AudioTrackConfiguration{*track_id, configuration};
+}
+
+std::expected<AudioOffer, std::string> parse_audio_offer(const json::object& offer, const Endpoint& control) {
+    const auto audio_id = string_field(offer, "audio_id");
+    const auto url = string_field(offer, "url");
+    const auto lifetime = integer_field(offer, "token_expires_in_ms");
+    const auto version = integer_field(offer, "audio_version");
+    const auto* microphone = offer.if_contains("clientToHost");
+    if (string_field(offer, "type") != "audio_offer" || !audio_id || !valid_identifier(*audio_id) ||
+        !url || !lifetime || *lifetime <= 0 || *lifetime > 60'000 ||
+        version != net::protocol::audio_frame_version || !microphone || !microphone->is_object()) {
+        return std::unexpected("The host sent an invalid audio offer.");
+    }
+    constexpr std::string_view scheme = "wss://";
+    if (url->size() <= scheme.size() || !equals_ignore_case(url->substr(0, scheme.size()), scheme)) {
+        return std::unexpected("The audio URL is not a secure WebSocket URL.");
+    }
+    const auto rest = url->substr(scheme.size());
+    const auto path_start = rest.find('/');
+    if (path_start == std::string_view::npos || !control.same_origin(rest.substr(0, path_start))) {
+        return std::unexpected("The audio URL does not match the connected host.");
+    }
+    const auto target = rest.substr(path_start);
+    const auto expected_path = "/audio/" + std::string(*audio_id);
+    if (!target.starts_with(expected_path) || target.size() <= expected_path.size() ||
+        target[expected_path.size()] != '?' || !target.substr(expected_path.size() + 1).starts_with("token=") ||
+        target.find('#') != std::string_view::npos) {
+        return std::unexpected("The audio URL has an unexpected path.");
+    }
+    const auto& microphone_object = microphone->get_object();
+    const auto* source_value = microphone_object.if_contains("source");
+    const auto* source = source_value ? source_value->if_object() : nullptr;
+    if (!source || string_field(*source, "kind") != "microphone") {
+        return std::unexpected("The host did not offer a microphone route.");
+    }
+    auto track = parse_audio_track(*microphone);
+    if (!track) return std::unexpected(track.error());
+    const auto token = target.substr(expected_path.size() + 7);
+    const auto decoded_token = net::base64url_decode(token);
+    if (!decoded_token || decoded_token->size() != 32 || target.find('&') != std::string_view::npos) {
+        return std::unexpected("The audio URL has an invalid token.");
+    }
+    return AudioOffer{std::string(*audio_id), std::string(target), std::chrono::milliseconds(*lifetime),
+                      std::move(*track)};
 }
 
 void ClockEstimate::record(std::uint64_t host_us, std::chrono::steady_clock::time_point sent,
