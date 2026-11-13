@@ -275,13 +275,15 @@ capture track, returning
 `Accepted`, `NotConnected` or `QueueFull`; `receive_pcm` returns decoded
 `AudioPcmPacket`s from the single microphone route, with sequence/sample
 timestamp/discontinuity metadata. The host sends that route to
-`\\.\BeamItMicCtl` on a dedicated output worker: the installed BeamIt
-Microphone driver must be available and its exclusive producer lease idle.
+`\\.\BeamItMicCtl` on a dedicated output worker when the installed BeamIt
+Microphone driver is available and its exclusive producer lease idle.
 Packets must be 48 kHz stereo, 10 ms PCM; float samples are clipped and
 converted to signed PCM16, preserving sequence, sample timestamp and
 discontinuity. The three-packet user-mode queue drops stale packets and marks
-the next retained packet discontinuous. A missing or busy device reports
-`audio_failed` and ends only audio; video is unaffected. No physical
+the next retained packet discontinuous. The driver is optional: a missing or
+busy device is reported as `clientToHost.available: false` in the offer (and a
+later driver failure is logged), the host discards microphone PCM, and
+host-to-client playback and video continue. No physical
 microphone or speaker fallback is used. The lease is explicitly released when
 the audio socket ends, with handle cleanup as a final safeguard. Submitting
 host PCM to that incoming microphone ID throws instead of mixing directions.
