@@ -19,6 +19,8 @@ struct BeamItVideoColor: Decodable {
     /// The host currently always streams limited-range BT.709/sRGB SDR (PROTOCOL.md §5.5).
     static let sdr = BeamItVideoColor(primaries: "bt709", transfer: "srgb", matrix: "bt709", range: "limited")
 
+    var isHDR: Bool { transfer == "pq" || transfer == "hlg" }
+
     func tag(_ buffer: CVPixelBuffer) {
         let primariesValue: CFString = primaries == "bt2020" ? kCVImageBufferColorPrimaries_ITU_R_2020 : kCVImageBufferColorPrimaries_ITU_R_709_2
         let transferValue: CFString = switch transfer {
@@ -36,6 +38,9 @@ struct BeamItVideoColor: Decodable {
 
 struct BeamItVideo: Decodable {
     let color: BeamItVideoColor?
+
+    /// HDR when the host signals PQ/HLG; unknown hosts and 8-bit streams are SDR.
+    var isHDR: Bool { (color ?? .sdr).isHDR && (bit_depth ?? 8) > 8 }
     let generation: Int
     let codec: String
     let width: Int
