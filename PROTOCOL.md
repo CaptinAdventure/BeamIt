@@ -108,6 +108,7 @@ produce an `error` with code `unknown_type` but do not close the socket.
 | `limit_reached`      | Too many concurrent streams                                     | no            |
 | `capture_failed`     | Capture could not start for the requested source                | no            |
 | `encoder_failed`     | No encoder could be configured                                  | no            |
+| `unsupported_codec`  | No `video.codecs` entry can be served within its limits (§5.3)  | no            |
 | `audio_failed`       | Host PCM audio endpoint is unavailable                          | no            |
 | `not_ready`          | Input sent before the stream socket opened                      | no            |
 | `focus_failed`       | Target window could not be brought to the foreground (§5.9)     | no            |
@@ -208,7 +209,14 @@ candidate of that process, so several windows of one process may be
   "type": "start_stream",
   "id": 3,
   "source": { "kind": "window", "hwnd": "0x1A2B3C" },
-  "video": { "codec": "h264", "frame_rate": 60, "bitrate_kbps": 20000, "max_bitrate_kbps": 40000 }
+  "video": {
+    "codecs": [
+      { "codec": "av1",  "max_width": 7680, "max_height": 4320, "max_frame_rate": 120, "max_bitrate_kbps": 200000, "max_bit_depth": 10, "color_spaces": [ { "primaries": "bt2020", "transfer": "pq", "matrix": "bt2020" }, { "primaries": "bt709", "transfer": "srgb", "matrix": "bt709" } ], "user_preferred": false },
+      { "codec": "h265", "max_width": 7680, "max_height": 4320, "max_frame_rate": 120, "max_bitrate_kbps": 200000, "max_bit_depth": 10, "color_spaces": [ { "primaries": "bt709", "transfer": "srgb", "matrix": "bt709" } ], "user_preferred": true },
+      { "codec": "h264", "max_width": 4096, "max_height": 2304, "max_frame_rate": 60,  "max_bitrate_kbps": 100000, "max_bit_depth": 8, "user_preferred": false }
+    ],
+    "frame_rate": 60, "bitrate_kbps": 20000, "max_bitrate_kbps": 40000
+  }
 }
 ```
 
@@ -233,9 +241,48 @@ choosing an `application` window, minimized windows are compared by their
 restored size.
 
 `video` and each of its fields are optional; omitted fields default to
-`"h264"`, 60 FPS and 48000 kbps. `codec` is `"h264"` or `"h265"`; `frame_rate` is
-1–240; `bitrate_kbps` is 1–1000000. The host keeps the codec and picks the
-best available chroma sampling (§8).
+`"h264"`, 60 FPS and 48000 kbps. `codec` is `"h264"`, `"h265"` or `"av1"`;
+`frame_rate` is 1–240; `bitrate_kbps` is 1–1000000. The host keeps the
+codec and picks the best available chroma sampling (§8).
+
+**Codec list.** `video.codecs` is an ordered list describing what the
+client can decode, most preferred first. It is additive: when present it
+takes precedence over `video.codec`, which older clients keep sending alone.
+Each entry has:
+
+| Field              | Meaning                                                            |
+|--------------------|--------------------------------------------------------------------|
+| `codec`            | `"h264"`, `"h265"` or `"av1"`; unknown values are skipped by the host |
+| `max_width`, `max_height` | Largest picture (video pixels) the client can decode with this codec |
+| `max_frame_rate`   | Highest frame rate (FPS) it can decode                             |
+| `max_bitrate_kbps` | Highest peak bit rate it can decode                                |
+| `max_bit_depth`    | Highest luma bit depth it can decode (default 8)                   |
+| `color_spaces`     | Ordered list of `{primaries, transfer, matrix}` it can decode and display, most preferred first, using the §5.5 `color` values; default is SDR `bt709`/`srgb`/`bt709` only |
+| `user_preferred`   | `true` when the user explicitly chose this codec; at most one entry |
+
+The limits are optional (omitted = unlimited) and are decoder capabilities,
+not targets: the host never exceeds them. Selection:
+
+1. If an entry has `user_preferred: true`, the host tries it first, then the
+   remaining entries in list order.
+2. An entry is usable when the host can encode that codec (§8) and the
+   source's video size is within `max_width`×`max_height`. The host does not
+   scale, so a larger source makes the entry unusable.
+3. The host picks the first `color_spaces` item it can produce for the
+   source (HDR items, i.e. `pq`/`hlg`, require `max_bit_depth` of at least
+   10) and reports it as `color` (§5.5). If the source is SDR, or no
+   listed item is producible, it uses SDR when the list contains it and
+   otherwise the entry is unusable. Color is chosen at stream start and
+   may change on reconfiguration (a new `stream_config`) within the list.
+4. For the chosen entry the host clamps `frame_rate` to `max_frame_rate`
+   and the effective peak bit rate to the entry's `max_bitrate_kbps`; the
+   average target is lowered to the peak if it would exceed it.
+5. If no entry is usable the reply is `unsupported_codec`.
+
+The selected codec is reported in `stream_offer.video.codec` (§5.4) and
+never changes during the stream. If a later reconfiguration (for example a
+resize) exceeds the chosen entry's limits, the stream ends with `stopped`
+reason `encoder_failed` rather than switching codecs.
 
 Encoding uses variable bit rate (VBR): `bitrate_kbps` is the average target
 and `max_bitrate_kbps` (0–4000000, default 0) the peak. 0 selects twice the
@@ -308,12 +355,17 @@ omit this additive field; clients must not assume a measured DPI in that case.
 * `codec_string` is the RFC 6381 string derived from the actual SPS, usable
   directly as WebCodecs `VideoDecoderConfig.codec`. Configure the decoder
   **without** `description` so it accepts Annex B input.
-* `color` describes the decoded image: `primaries`, `transfer`, `matrix`
-  and `range` (`"limited"`/`"full"`). The stream is always SDR; the host
-  currently reports `bt709`/`srgb`/`bt709`/`limited`, also signalled in the
-  SPS VUI, regardless of the host display's HDR state. Clients should tag
-  decoded frames with it instead of letting an HDR/EDR display guess.
-  Older hosts omit it; assume the same values.
+* `color` describes the decoded image: `primaries` (`bt709`, `bt2020`),
+  `transfer` (`srgb`, `bt709`, `pq`, `hlg`), `matrix` (`bt709`, `bt2020`) and
+  `range` (`"limited"`/`"full"`), also signalled in the SPS VUI. Currently the
+  host always streams SDR and reports `bt709`/`srgb`/`bt709`/`limited`,
+  regardless of the host display's HDR state. Once the host honours the
+  client's `video.codecs[].color_spaces` (§5.3) the value is the negotiated
+  one. The same object describes HDR streams: `transfer` `pq` or `hlg` with `bit_depth` above 8 means HDR.
+  Clients should tag decoded frames with it instead of letting an HDR/EDR
+  display guess, and must re-read it on every `stream_config` (the transfer
+  may change between generations). Older hosts omit it; assume the SDR values.
+* `format` is `"annexb"` for `h264`/`h265` and `"obu"` for `av1` (§7).
 * `width`/`height` are the displayed (captured) size; `codedWidth`/
   `codedHeight` may be passed as the same values.
 * `generation` starts at 1 and increments on every encoder reconfiguration
@@ -1318,12 +1370,22 @@ integers are **big-endian** (network order, `DataView` default).
 | 12     | 4    | `reserved`        | `0`                                                    |
 | 16     | 8    | `sequence`        | Per-stream counter of produced pictures, starting at 0 |
 | 24     | 8    | `capture_time_us` | Host monotonic capture time (same clock as `pong`), see below |
-| 32     | …    | payload           | One Annex B access unit                                |
+| 32     | …    | payload           | One Annex B access unit (H.264/H.265) or AV1 temporal unit |
 
 * Clients must locate the payload with `header_length`, not a constant, and
   must ignore unknown flag bits.
-* Payload: start-code delimited NAL units including an access unit
-  delimiter. Key frames repeat SPS/PPS (and VPS for H.265).
+* H.264/H.265 payload (`format` `"annexb"`): start-code delimited NAL units
+  including an access unit delimiter. Key frames repeat SPS/PPS (and VPS for
+  H.265).
+* AV1 payload (`format` `"obu"`): exactly one temporal unit as a
+  low-overhead OBU stream (AV1 spec §5.2). Every OBU has
+  `obu_has_size_field = 1`; the unit begins with a temporal delimiter OBU and
+  contains one shown frame. Key frames (random access points, flag bit 0)
+  repeat the sequence header OBU before the frame. There is no
+  `reduced_still_picture_header`, scalability layer or tile-list OBU.
+  Clients that need ISO-BMFF style samples (e.g. VideoToolbox) drop the
+  temporal delimiters and build the `av1C` record from `codec_string`
+  (`av01.P.LLT.DD…`), `chroma_format` and the sequence header.
 * `capture_time_us` is suitable as the WebCodecs `EncodedVideoChunk`
   `timestamp`; key frames map to `type: "key"`.
 * `capture_time_us` is the operating system's presentation time of the

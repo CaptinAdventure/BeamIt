@@ -409,6 +409,10 @@ xcrun swiftc -default-isolation MainActor -parse-as-library clients/osx/BeamIt/B
 /tmp/beamit-fullscreen-checks
 ```
 
+**macOS color and HDR.** The client tags every decoded frame with the host's `color` description (PROTOCOL.md §5.5; SDR BT.709/sRGB when absent). For HDR streams (`pq`/`hlg` transfer, bit depth above 8) it asks VideoToolbox for native 10-bit YCbCr matching `chroma_format` and enables extended dynamic range on the display layer; this is re-evaluated on each `stream_config`. In `start_stream` the client advertises each codec's `max_bit_depth` and `color_spaces` (PROTOCOL.md §5.3): BT.2020 PQ and HLG then SDR for H.265/AV1 when a connected screen supports extended dynamic range, SDR only otherwise and for H.264. The host does not parse or send HDR yet, so the HDR path is untested, and screenshots are still exported as 8-bit sRGB.
+
+**macOS AV1.** The client can decode `codec: "av1"` through VideoToolbox, which is hardware-only (Apple silicon with an AV1 decoder, M3/A17 Pro or later); offers are rejected otherwise. It decodes the OBU framing defined in PROTOCOL.md §7 and builds the `av1C` record from the host's `codec_string` (`av01.P.LLT.DD`) and `chroma_format`. Every `start_stream` sends the ordered `video.codecs` list (§5.3: AV1 only when hardware decoding is available, then H.265, then H.264; set the `BeamItPreferredCodec` default to `av1`, `h265` or `h264` to mark the user's choice). The host does not parse `video.codecs` or send AV1 yet, so this is untested end to end.
+
 **macOS screenshots.** Focus a stream and choose **Stream > Save PNG Screenshot…**, then choose a file location. This saves the latest presented decoded frame at its original video resolution, regardless of window scaling or fullscreen, without borders, letterboxing or separately streamed popup windows. The frame is frozen when the command is selected. No screen-recording permission or host protocol change is needed; the client retains one presented GPU frame and converts it only on export. Export checks:
 
 ```sh
