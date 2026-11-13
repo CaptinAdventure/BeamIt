@@ -94,7 +94,8 @@ struct PipelineCallbacks {
 class StreamPipeline {
 public:
     StreamPipeline(std::unique_ptr<capture::Capturer> capturer, std::unique_ptr<media::Encoder> encoder,
-                   capture::CaptureTarget target, media::EncoderOptions options);
+                   capture::CaptureTarget target, media::EncoderOptions options,
+                   capture::CaptureOptions capture_options = {});
     ~StreamPipeline();
     StreamPipeline(const StreamPipeline&) = delete;
     StreamPipeline& operator=(const StreamPipeline&) = delete;
@@ -120,6 +121,7 @@ private:
     std::unique_ptr<media::Encoder> encoder_;
     capture::CaptureTarget target_;
     media::EncoderOptions options_;
+    capture::CaptureOptions capture_options_;
     PipelineCallbacks callbacks_;
     std::atomic<bool> stop_requested_{};
     std::atomic<bool> active_{};

@@ -2,18 +2,18 @@ cmake_minimum_required(VERSION 4.3)
 project(BeamItWindowsCore LANGUAGES CXX)
 
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+set(beamit_root "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
 
 include(CTest)
 
 if(MSVC)
-    add_compile_options(/std:c++latest)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/std:c++latest> $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
 else()
     add_compile_options(-std=c++2c)
 endif()
 
 add_library(BeamItWindowsCore STATIC FrameProtocol.cpp)
-target_include_directories(BeamItWindowsCore PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_include_directories(BeamItWindowsCore PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../../src")
+target_include_directories(BeamItWindowsCore PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" "${beamit_root}/src")
 
 if(MSVC)
     target_compile_options(BeamItWindowsCore PRIVATE /W4 /permissive- /Zc:__cplusplus)
@@ -22,16 +22,59 @@ else()
 endif()
 
 if(WIN32)
-    target_sources(BeamItWindowsCore PRIVATE DecoderProbe.cpp)
-    target_compile_definitions(BeamItWindowsCore PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_link_libraries(BeamItWindowsCore PUBLIC d3d11 dxgi mf mfplat mfuuid ole32)
+    include("${beamit_root}/cmake/CPM.cmake")
+    include("${beamit_root}/cmake/BeamItDependencies.cmake")
+    beamit_add_network_dependencies()
+
+    target_sources(BeamItWindowsCore PRIVATE
+        ClientProtocol.cpp
+        ClientSession.cpp
+        DecoderProbe.cpp
+        HostWindows.cpp
+        KeyCodes.cpp
+        VideoPipeline.cpp
+        "${beamit_root}/src/net/Crypto.cpp"
+    )
+    target_compile_definitions(BeamItWindowsCore PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+    target_link_libraries(BeamItWindowsCore PUBLIC Boost::json beamit_wintls ws2_32 d3d11 dxgi mf mfplat mfuuid ole32
+        windowscodecs)
     add_executable(BeamItDecoderProbe DecoderProbeMain.cpp)
     target_link_libraries(BeamItDecoderProbe PRIVATE BeamItWindowsCore)
+
+    # The WinUI MSBuild project consumes the core's include paths, definitions and static libraries from here.
+    file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/$<CONFIG>/BeamItWindowsCore.props" CONTENT [[<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$<JOIN:$<REMOVE_DUPLICATES:$<TARGET_PROPERTY:BeamItWindowsCore,INTERFACE_INCLUDE_DIRECTORIES>;$<TARGET_PROPERTY:Boost::json,INTERFACE_INCLUDE_DIRECTORIES>;$<TARGET_PROPERTY:beamit_wintls,INTERFACE_INCLUDE_DIRECTORIES>>,;>;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>$<JOIN:$<TARGET_PROPERTY:BeamItWindowsCore,INTERFACE_COMPILE_DEFINITIONS>,;>;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$<TARGET_LINKER_FILE:BeamItWindowsCore>;$<TARGET_LINKER_FILE:Boost::json>;$<TARGET_LINKER_FILE:Boost::container>;ws2_32.lib;crypt32.lib;secur32.lib;bcrypt.lib;windowscodecs.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+</Project>
+]])
 endif()
 
 if(BUILD_TESTING)
     add_executable(BeamItFrameProtocolTests ../tests/FrameProtocolTests.cpp)
-    target_include_directories(BeamItFrameProtocolTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../../src")
     target_link_libraries(BeamItFrameProtocolTests PRIVATE BeamItWindowsCore)
     add_test(NAME BeamItFrameProtocolTests COMMAND BeamItFrameProtocolTests)
+
+    if(WIN32)
+        beamit_add_catch2()
+        add_executable(BeamItClientTests
+            ../tests/ClientProtocolTests.cpp
+            ../tests/ClientSessionTests.cpp
+            ../tests/HostWindowsTests.cpp
+            ../tests/HostEndToEndTests.cpp
+            ../tests/VideoPipelineTests.cpp
+        )
+        target_compile_definitions(BeamItClientTests PRIVATE
+            BEAMIT_CLIENT_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/../build/fixtures")
+        target_link_libraries(BeamItClientTests PRIVATE BeamItWindowsCore Catch2::Catch2WithMain)
+        target_compile_options(BeamItClientTests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4 /permissive- /Zc:__cplusplus>)
+        add_test(NAME BeamItClientTests COMMAND BeamItClientTests)
+    endif()
 endif()

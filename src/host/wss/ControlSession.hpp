@@ -72,6 +72,9 @@ struct StreamEntry {
     DWORD pid{};
     bool focus_error_sent{};
     bool input_error_sent{};
+    // input.cursor == "client" (§5.9.11): the pointer is not drawn into the video; its shape is sent instead.
+    bool mirror_cursor{};
+    std::string cursor_shape;
     // Unanswered set_stream_rate requests by pipeline serial (§5.14).
     std::vector<std::pair<std::uint64_t, RequestId>> rate_requests;
     std::string local_statistics;
@@ -131,6 +134,8 @@ struct ControlSession : std::enable_shared_from_this<ControlSession> {
     HostStatus local_status() const;
     void disconnect_stream(const std::string& id);
     void upgrade_input(const std::shared_ptr<input::ElevatedInput>& helper);
+    // Reverts every stream to normal (non-elevated) input after the elevated helper failed.
+    void downgrade_input();
 
 private:
     using Handler = void (ControlSession::*)(const json::object& message, const RequestId& id);
@@ -172,6 +177,9 @@ private:
     static input::MouseMode mouse_mode_field(const json::value& value);
     void handle_input(const json::object& message, const RequestId& id);
     void report_input_result(StreamEntry& entry, input::InputResult result, const RequestId& id);
+    // Polls the host pointer shape while any stream mirrors it (§5.9.11).
+    void schedule_cursor();
+    void poll_cursor();
 
     // Desktop (ControlDesktop.cpp).
     void list_windows(const json::object& message, const RequestId& id);
@@ -199,6 +207,8 @@ private:
     bool auth_failed_{};
     std::unique_ptr<asio::steady_timer> stats_timer_;
     Clock::time_point stats_since_{};
+    std::unique_ptr<asio::steady_timer> cursor_timer_;
+    bool cursor_polling_{};
 };
 
 } // namespace beamit::host::wss

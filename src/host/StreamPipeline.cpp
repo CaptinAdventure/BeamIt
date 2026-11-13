@@ -44,8 +44,10 @@ void restore_minimized_window(const capture::CaptureTarget& target, FrameTimer& 
 
 StreamPipeline::StreamPipeline(std::unique_ptr<capture::Capturer> capturer,
                                std::unique_ptr<media::Encoder> encoder,
-                               capture::CaptureTarget target, media::EncoderOptions options)
-    : capturer_(std::move(capturer)), encoder_(std::move(encoder)), target_(target), options_(options) {}
+                               capture::CaptureTarget target, media::EncoderOptions options,
+                               capture::CaptureOptions capture_options)
+    : capturer_(std::move(capturer)), encoder_(std::move(encoder)), target_(target), options_(options),
+      capture_options_(capture_options) {}
 
 StreamPipeline::~StreamPipeline() { stop(); }
 
@@ -129,7 +131,7 @@ void StreamPipeline::loop() {
             if (starting) throw StartFailure("capture_failed", message);
             throw std::runtime_error(message);
         };
-        if (!capturer_->configure(target_, {}) || !capturer_->start()) {
+        if (!capturer_->configure(target_, capture_options_) || !capturer_->start()) {
             fail(fmt::format("capture startup failed (HRESULT 0x{:08X})",
                              static_cast<std::uint32_t>(capturer_->last_error())));
         }

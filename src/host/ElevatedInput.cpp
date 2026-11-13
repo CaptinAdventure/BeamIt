@@ -138,6 +138,7 @@ struct ElevatedInput::State {
     HANDLE pipe{INVALID_HANDLE_VALUE};
     HANDLE process{};
     bool failed{};
+    ULONGLONG last_slow_warning{};
     ~State() {
         // Closing the only server handle also wakes the helper's independent disconnect watchdog.
         if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
@@ -240,6 +241,12 @@ ipc::Response ElevatedInput::transact(const ipc::Request& request) {
                  ipc::request_timeout_ms - static_cast<DWORD>(elapsed));
         if (!ipc::valid(response)) fail("invalid helper response");
         if (response.diagnostic_present) log_injection_diagnostic(response.diagnostic);
+        const auto now = GetTickCount64();
+        if (now - started >= ipc::slow_request_ms && now - state_->last_slow_warning >= 5000) {
+            state_->last_slow_warning = now;
+            spdlog::warn("Elevated input: helper round trip took {} ms (operation {}; limit {} ms)", now - started,
+                         static_cast<int>(request.operation), ipc::request_timeout_ms);
+        }
         return response;
     } catch (...) {
         state_->failed = true;

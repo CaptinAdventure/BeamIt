@@ -260,7 +260,7 @@ produces an `error` (`not_found`, `capture_failed`, `encoder_failed`,
   "token_expires_in_ms": 10000,
   "source": { "kind": "window", "hwnd": "0x1A2B3C", "pid": 4242, "title": "Microsoft Teams", "capture": "wgc", "dpi": { "x": 144, "y": 144 } },
   "video": { …video parameters, §5.5… },
-  "input": { "mouse_mode": "absolute" }
+  "input": { "mouse_mode": "absolute", "cursor": "video" }
 }
 ```
 
@@ -400,7 +400,8 @@ Each stream has a mouse mode, initially `"absolute"`:
 
 `mouse_mode` is the reply. `start_stream` may also include
 `"input": { "mouse_mode": "relative" }`; `stream_offer` always reports the
-current mode as `"input": { "mouse_mode": "…" }`.
+current mode as `"input": { "mouse_mode": "…" }`. `start_stream` may also
+set `input.cursor` (§5.9.11); the offer echoes it as `input.cursor`.
 
 #### 5.9.2 `mouse_move`
 
@@ -543,9 +544,12 @@ succeeds again). Desktop streams never change focus.
   helper; it does not elevate the network host or change any WSS messages.
   All input, focus and pointer/modifier queries for that instance use the
   helper. Password holders thereby gain input access to administrator
-  windows on the interactive desktop. UAC denial, unexpected helper exit
-  or failed/timed-out local IPC **stops the host**, disconnecting clients;
-  there is no silent fallback to normal input. Graceful host shutdown also
+  windows on the interactive desktop. UAC denial at startup stops the host.
+  Once serving, unexpected helper exit or failed/timed-out local IPC
+  **downgrades** the instance to normal (non-elevated) input: sessions and
+  streams stay connected, the failed request gets `internal_error`, the host
+  logs the failure and shows a local notice. Administrator windows then
+  reject input again (`input_failed`). Graceful host shutdown also
   shuts down the helper. Held input is released on stream teardown and
   helper channel disconnect/host exit. Failed injection is reported as
   `input_failed` (rate-limited). The host also logs failed `SendInput` calls,
@@ -559,6 +563,29 @@ succeeds again). Desktop streams never change focus.
 * Pop-up menus outside the window's rectangle cannot be reached through the
   stream of the window that opened them. Clients can open a stream for the
   pop-up itself after its `window_opened` (§5.12).
+
+#### 5.9.11 Pointer shape
+
+By default the host draws the pointer into window/application video
+(`"input": { "cursor": "video" }`). A client that draws its own pointer
+requests `"input": { "cursor": "client" }` in `start_stream`. The host then
+excludes the pointer from WGC capture (DXGI desktop capture never draws it)
+and sends the current host pointer shape:
+
+```json
+{ "type": "cursor", "stream_id": "…", "shape": "text" }
+```
+
+once after the offer and then whenever it changes (polled about every
+16 ms). `shape` is one of `default`, `text`, `pointer`, `wait`, `progress`,
+`crosshair`, `not-allowed`, `move`, `ns-resize`, `ew-resize`, `nwse-resize`,
+`nesw-resize`, `help` (CSS cursor names) or `none` (the host pointer is
+hidden). Application-defined custom cursors are reported as `default`. The
+shape is global to the host desktop; clients apply it only while their
+pointer is over the stream's video. Any other `input.cursor` value is
+`invalid_request`. Hosts that do not support this omit `input.cursor` from
+the offer; clients must then rely on the pointer drawn into the video.
+A host with no physical mouse may report `none`.
 
 ### 5.10 `attention` (host → client)
 

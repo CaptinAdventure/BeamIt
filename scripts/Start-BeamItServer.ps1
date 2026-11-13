@@ -22,7 +22,7 @@ param(
     [ValidateRange(1, 65535)]
     [int] $Port = 17389,
     [string] $Bind = '0.0.0.0',
-    # Path to BeamIt.exe; defaults to the newest cmake-build-*\BeamIt.exe in the repository.
+    # Path to BeamIt.exe; defaults to BeamIt.exe next to this script, else the newest cmake-build-* build.
     [string] $Executable,
     # Instance directory; defaults to %LOCALAPPDATA%\BeamIt\<Instance>.
     [string] $DataDirectory,
@@ -111,10 +111,16 @@ function New-ServerCertificate([string] $CertPath, [string] $KeyPath) {
 
 $repository = Split-Path -Parent $PSScriptRoot
 if (-not $Executable) {
-    $candidate = Get-ChildItem -Path $repository -Filter 'cmake-build-*' -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object { Join-Path $_.FullName 'BeamIt.exe' } | Where-Object { Test-Path -LiteralPath $_ } |
-        Get-Item | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if (-not $candidate) { throw "BeamIt.exe not found under $repository\cmake-build-*; build it or pass -Executable." }
+    # Release package: BeamIt.exe sits next to this script. Repository: newest build in any configuration.
+    $local = Join-Path $PSScriptRoot 'BeamIt.exe'
+    $candidate = if (Test-Path -LiteralPath $local) { Get-Item -LiteralPath $local } else {
+        Get-ChildItem -Path $repository -Filter 'cmake-build-*' -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { foreach ($sub in '', 'Release', 'RelWithDebInfo', 'MinSizeRel', 'Debug') {
+                Join-Path $_.FullName (Join-Path $sub 'BeamIt.exe') } } |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Get-Item | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    }
+    if (-not $candidate) { throw "BeamIt.exe not found next to this script or under $repository\cmake-build-*; build it or pass -Executable." }
     $Executable = $candidate.FullName
 } elseif (-not (Test-Path -LiteralPath $Executable)) {
     throw "Executable not found: $Executable"
@@ -160,7 +166,19 @@ $certificate.Dispose()
 
 $arguments = @('--port', $Port, '--bind', $Bind,
                '--password-file', $passwordFile, '--tls-cert', $certFile, '--tls-key', $keyFile) + $BeamItArguments
+$addresses = if ($Bind -ne '0.0.0.0') { @($Bind) } else {
+    [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+        Where-Object { $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' } |
+        ForEach-Object { $_.GetIPProperties().UnicastAddresses } |
+        Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.Address.ToString() }
+}
+Write-Host ''
+Write-Host 'Connect a client with:'
+foreach ($address in $addresses) { Write-Host "  Server URL:  wss://${address}:$Port" }
+Write-Host "  Password:    contents of $passwordFile"
+Write-Host "  Fingerprint: $fingerprint"
+Write-Host "  Browser test page: https://<address>:$Port/ (accept the certificate once)"
+Write-Host ''
 Write-Host "Starting $Executable $($arguments -join ' ')"
-Write-Host "Open https://$([System.Net.Dns]::GetHostName()):$Port/ and accept the certificate once."
 & $Executable @arguments
 exit $LASTEXITCODE

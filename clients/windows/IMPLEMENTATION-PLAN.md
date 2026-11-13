@@ -1,23 +1,69 @@
-# Windows client: implementation plan and WSL handoff
+# Windows client: implementation plan and handoff
 
 ## Resume instruction
 
 Give Copilot this instruction in the target machine's BeamIt checkout:
 
 > Read the repository agent instructions, `clients/windows/IMPLEMENTATION-PLAN.md`,
-> `clients/windows/README.md`, and `PROTOCOL.md`. Resume the Windows client work
-> at the scaffold validation gate. Inspect the current worktree before editing
-> and preserve unrelated macOS/README changes. The scaffold has not been built
-> on Windows. First establish Windows toolchain access from WSL, build and fix
-> the prototype, run its tests, and arrange the interactive Windows checks.
-> Do not mistake enumeration or a blue test surface for streaming support.
-> After those gates pass, implement the remaining parity features in the order
-> below. Keep the host protocol and selected product decisions unchanged.
-> Maintain task tracking and update this handoff with actual results and blockers.
+> `clients/windows/README.md`, and `PROTOCOL.md`. The scaffold gate,
+> `win-session`, and the first versions of `win-shell`, `win-media`, and
+> `win-input` are done (see "Current status"). Inspect the worktree before
+> editing and preserve unrelated changes. Build with
+> `scripts/Build-WindowsClient.ps1` (Debug and Release) and run
+> `BeamItClientTests`. Then continue with the remaining items in the task
+> table: user-facing LAN validation, clipboard/text/anti-idle, rate controls,
+> the popup coordinator, and finally audio. Keep the host protocol and product
+> decisions unchanged. Update this handoff with actual results and blockers.
 
-This file is the portable handoff. The original Copilot session's `plan.md`
-and SQL todos are local session artifacts and must not be assumed to exist
-on the target machine.
+This file is the portable handoff. Session-local plans and todo lists are not
+assumed to exist on another machine.
+
+## Current status (supersedes the historical sections 2-4)
+
+Work is native on Windows (no WSL). The first scaffold handoff targeted VS 2022.
+This machine has only Build Tools 2026, so the user approved retargeting:
+
+- Build Tools 2026 (MSVC v145) with the WinUI C++ components (installer
+  command in the README), bundled CMake 4.3.1, generator
+  `Visual Studio 18 2026`.
+- Windows App SDK `2.6.5` and C++/WinRT `3.0.260818.1` (newest stable).
+- **The client always requests HEVC.** Media Foundation fixtures showed the
+  inbox H.264 decoder rejects High 4:4:4, the host's NVENC default, while
+  HEVC 4:2:0/4:4:4 decode with the HEVC Video Extension. There is no codec
+  picker or retry.
+- PNG screenshots are in scope. Audio (§5.16) is a final phase after video
+  parity. The current macOS baseline also has "All windows" application mode
+  (follow new main/owned/tool windows), which the Windows client implements.
+- FFmpeg is installed locally only to generate decoder fixtures.
+
+Implemented and verified (details and measurements in the README):
+
+- Shared `cmake/BeamItDependencies.cmake`: Boost (as SYSTEM includes),
+  boost-wintls plus a patch step adding `stream::native_handle()` for
+  certificate pinning, and Catch2. The host uses it too. `src/net/Crypto.cpp`
+  now uses `std::format` instead of spdlog. The host builds, and its tests
+  pass with `BEAMIT_FETCH_NVENC_INTERFACE=OFF`.
+- `win-session`: `ClientProtocol`, `ClientSession`, mock-host tests (pinning
+  before upgrade, auth failures, forged proof, supersession, stream sockets,
+  held future generations).
+- `win-media`: `VideoPipeline` (MF decode, D3D11 video processor,
+  composition swap chain, coalescing, key-frame recovery, visible
+  unsupported-profile failure, screenshot). Fixture tests and a hidden
+  end-to-end test against a real local host (DXGI and WGC, HEVC 3440×1440)
+  pass.
+- `win-shell`: connection/source window, tray, persisted nonsecret settings,
+  application search, All windows following, relative placement.
+- `win-input` (first version): scan-code keys, absolute mouse/buttons/wheel,
+  relative capture with raw input after host acknowledgement, release on
+  focus loss/menus, local Alt+Space, Ctrl+Alt+G and double Escape.
+- Stream window: 1×/scaling/fullscreen, stream info, rate dialog, host icon,
+  taskbar attention.
+
+Not verified yet: interactive use of the production app (the user will test
+from a second desktop on the LAN), Teams, mixed DPI, other GPUs, and
+machines without the HEVC Video Extension. The prototype sources
+(`app/PrototypeWindow.*`, `app/Surface.*`) are no longer built; delete them
+once the user confirms.
 
 ## 1. Objective and confirmed decisions
 
@@ -32,7 +78,7 @@ in `clients/osx`, adapting global menus to Windows conventions.
 | Video | Media Foundation decoding, D3D11 presentation in WinUI |
 | Decoder policy | Hardware first, then installed MF software decoders; report actual mode |
 | Unsupported profiles | Visible stream failure; no FFmpeg, silent codec switch or host chroma downgrade |
-| Build | Separate WinUI MSBuild solution; client-only native core/test CMake entry point |
+| Build | Separate WinUI MSBuild solution (Build Tools 2026, v145); client-only native core/test CMake entry point |
 | Deployment | Unpackaged x64 app; documented Windows App SDK runtime prerequisite |
 | Session model | One host connection per client process, multiple streams |
 | Multiple hosts | Separate client processes for separate host instances |
@@ -43,7 +89,7 @@ in `clients/osx`, adapting global menus to Windows conventions.
 | Preferences | Clipboard sync and anti-idle are global, initially off |
 | Shortcuts | Alt+Space local menu; Ctrl+Alt+G always releases capture; double Escape within one second exits fullscreen |
 | Input | Windows modifier conventions; OS-reserved shortcuts remain local |
-| Out of scope | Audio, gamepads, file transfer, cloud/NAT/discovery, auto-reconnect, password storage, ARM64, installer/MSIX, new host capabilities |
+| Out of scope | Gamepads, file transfer, cloud/NAT/discovery, auto-reconnect, password storage, ARM64, installer/MSIX, new host capabilities. Audio is a final phase after video parity |
 
 Do not reopen these choices unless a concrete blocker requires a product
 decision. Document the blocker/tradeoff and ask before changing architecture
@@ -63,7 +109,7 @@ codec, host fallback, or protocol negotiation as a workaround without approval.
 Supported fixtures prove positive playback; unsupported fixtures prove
 honest failure handling. Neither proves universal codec/GPU coverage.
 
-## 2. Exact stopping point
+## 2. Historical: scaffold stopping point (superseded)
 
 Implementation was approved and **only the first scaffold/prototype phase
 was started**. The user deferred Windows validation while on the macOS machine.
@@ -151,7 +197,7 @@ do not commit or overwrite unrelated work automatically. Exclude credentials,
 certificates/private keys, build outputs, `.DS_Store`, and IDE user state.
 Compare target worktree state before applying transferred changes.
 
-## 3. Start on the target WSL machine
+## 3. Historical: WSL start instructions (superseded; work is native)
 
 ### Establish the real environment
 
@@ -201,7 +247,7 @@ Read `clients/windows/README.md` for executable paths and decoder commands.
 Run interactive WinUI checks in the logged-in Windows desktop, not a headless
 service context or a Linux/WSLg substitute.
 
-## 4. Mandatory first gate: fix and validate the scaffold
+## 4. Historical: scaffold gate (passed)
 
 Keep task `win-scaffold` active until the evidence below exists.
 
@@ -432,28 +478,26 @@ source and normative `PROTOCOL.md`, not historical descriptions alone.
 
 Recreate session-local tasks if necessary; markdown is the portable source.
 
-| ID | Status at handoff | Prerequisites |
+| ID | Status | Prerequisites |
 |---|---|---|
-| `win-scaffold` | In progress; blocked on missing Visual Studio PRI tooling | None |
-| `win-session` | Pending | `win-scaffold` |
-| `win-shell` | Pending | `win-session` |
-| `win-media` | Pending | `win-session` and scaffold media gate |
-| `win-input` | Pending | `win-shell`, `win-media` |
-| `win-popups` | Pending | `win-shell`, `win-media` |
-| `win-utilities` | Pending | `win-input` |
-| `win-options` | Pending | `win-popups`, `win-utilities` |
+| `win-scaffold` | Done (Debug/Release builds, interactive checks, MF fixtures) | None |
+| `win-session` | Done, with mock-host tests | `win-scaffold` |
+| `win-shell` | First version done; awaiting LAN user testing | `win-session` |
+| `win-media` | First version done; host end-to-end test passes | `win-session` |
+| `win-input` | First version done; awaiting interactive testing | `win-shell`, `win-media` |
+| `win-popups` | Pending (popups currently follow only via All windows for main/owned/tool roles) | `win-shell`, `win-media` |
+| `win-utilities` | Pending (clipboard, paced text, anti-idle) | `win-input` |
+| `win-options` | Partial (stream info, scaling, screenshot, rate dialog); richer live diagnostics pending | `win-popups`, `win-utilities` |
 | `win-validation` | Pending | `win-options` |
+| `win-audio` | Pending; final phase | `win-validation` |
 
-Keep `win-scaffold` active until both configurations complete the full build,
-tests, and required interactive/media gates. The approved next step is to add
-the Visual Studio Universal workload and C++ UWP support from an elevated
-native Windows PowerShell session; the WSL-instigated installer did not apply
-the workload. Then rerun `scripts/Build-WindowsClient.ps1` in Debug and
-Release, supplying `RestoreSources=https://api.nuget.org/v3/index.json` for
-the restore if the machine still has no configured NuGet source. Do not mark
-the client complete until native Windows builds, automated checks, and
-required interactive/hardware outcomes are verified. List unverified
-Teams/GPU cases explicitly.
+For clipboard work, the host's pure conversion helpers in
+`src/host/Clipboard.cpp` (`html_clipboard_fragment`,
+`html_clipboard_document`, `dib_from_png`, `png_from_dib`) are the
+reference. They would need to be separated from spdlog and the clipboard
+monitor before the client can share them. Do not mark the client complete
+until native builds, automated checks and the interactive/hardware outcomes
+are verified. List unverified Teams/GPU cases explicitly.
 
 Do not commit unless requested, do not revert existing work, and do not
 reintroduce removed recorder/plaintext transports or host CLI modes.

@@ -115,12 +115,20 @@ struct Device {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<IMFDXGIDeviceManager> manager;
+    std::wstring adapter;
 
     Device() {
         constexpr D3D_FEATURE_LEVEL levels[]{D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
         check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &device, nullptr, &context), "Create decoder D3D11 device");
+        ComPtr<IDXGIDevice> dxgi;
+        check(device.As(&dxgi), "Get DXGI device");
+        ComPtr<IDXGIAdapter> dxgi_adapter;
+        check(dxgi->GetAdapter(&dxgi_adapter), "Get decoder adapter");
+        DXGI_ADAPTER_DESC description{};
+        check(dxgi_adapter->GetDesc(&description), "Describe decoder adapter");
+        adapter = description.Description;
         ComPtr<ID3D10Multithread> multithread;
         check(device.As(&multithread), "Get D3D multithread protection");
         multithread->SetMultithreadProtected(TRUE);
@@ -287,6 +295,7 @@ std::wstring decode(Candidate const& candidate, bool hevc, unsigned width, unsig
         if (output_width == 0 || output_height == 0) throw std::runtime_error("Decoder output has invalid dimensions");
         return L"decoded " + std::to_wstring(output_width) + L"x" + std::to_wstring(output_height) +
             (gpu_output ? L" to a DXGI surface" : L" to system memory") +
+            (device ? L" with D3D11 device on " + device->adapter : std::wstring(L" without a D3D11 device")) +
             (asynchronous ? L" (asynchronous MFT)" : L" (synchronous MFT)");
     }
     throw std::runtime_error("Decoder did not produce a picture within the probe deadline");
@@ -296,13 +305,14 @@ std::wstring decode(Candidate const& candidate, bool hevc, unsigned width, unsig
 
 std::wstring decoder_inventory_report() {
     Platform platform;
-    std::wstring report = L"Enumeration is not proof of profile support or successful decoding.\n";
+    std::wstring report = L"Enumeration is not proof of profile support or successful decoding.\n"
+        L"Standard MFTs may still use DXVA GPU decoding when given a D3D11 device.\n";
     for (bool hevc : {false, true}) {
         report += hevc ? L"\nHEVC:\n" : L"\nH.264:\n";
         const auto entries = candidates(hevc);
         if (entries.empty()) report += L"  No installed decoder candidates.\n";
         for (auto const& entry : entries) {
-            report += (entry.hardware ? L"  Hardware: " : L"  Installed software: ") + entry.name + L"\n";
+            report += (entry.hardware ? L"  Hardware MFT: " : L"  Standard MFT: ") + entry.name + L"\n";
         }
     }
     return report;
@@ -317,7 +327,7 @@ DecoderProbeResult probe_decoder(bool hevc, unsigned width, unsigned height, std
     Platform platform;
     DecoderProbeResult result;
     for (auto const& entry : candidates(hevc)) {
-        result.report += (entry.hardware ? L"Hardware: " : L"Installed software: ") + entry.name + L": ";
+        result.report += (entry.hardware ? L"Hardware MFT: " : L"Standard MFT: ") + entry.name + L": ";
         try {
             result.report += decode(entry, hevc, width, height, access_unit) + L"\n";
             result.decoded = true;

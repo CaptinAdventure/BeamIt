@@ -1,6 +1,7 @@
 #include "host/wss/ControlSession.hpp"
 
 #include "ApplicationWindows.hpp"
+#include "host/ElevatedInput.hpp"
 #include "media/BitstreamInfo.hpp"
 #include "net/Crypto.hpp"
 
@@ -227,6 +228,7 @@ void ControlSession::close(websocket::close_code code, std::string_view reason) 
     closing_ = true;
     server_.publish_status();
     if (stats_timer_) stats_timer_->cancel();
+    if (cursor_timer_) cursor_timer_->cancel();
     stop_all_streams(websocket::close_code::going_away);
     outbox_.emplace_back(websocket::close_reason{code, reason});
     pump();
@@ -301,6 +303,7 @@ awaitable<void> ControlSession::run(std::shared_ptr<ControlSession> self) {
     }
     auth_timer->cancel();
     if (self->stats_timer_) self->stats_timer_->cancel();
+    if (self->cursor_timer_) self->cursor_timer_->cancel();
     self->closing_ = true;
     self->stop_all_streams(websocket::close_code::going_away);
     if (self->server_.active.lock() == self) self->server_.active.reset();
@@ -445,8 +448,15 @@ void ControlSession::start_stream(const json::object& message, const RequestId& 
     auto source = parse_source(message);
     const auto options = parse_video(message, server_.options);
     auto mouse_mode = input::MouseMode::Absolute;
+    auto mirror_cursor = false;
     if (const auto* input_field = optional_object(message, "input")) {
         if (const auto* mode = input_field->if_contains("mouse_mode")) mouse_mode = mouse_mode_field(*mode);
+        if (const auto* cursor = input_field->if_contains("cursor")) {
+            if (!cursor->is_string() || (cursor->as_string() != "video" && cursor->as_string() != "client")) {
+                throw ProtocolError{"invalid_request", "input.cursor must be video or client"};
+            }
+            mirror_cursor = cursor->as_string() == "client";
+        }
     }
 
     std::unique_ptr<capture::Capturer> capturer;
@@ -467,10 +477,14 @@ void ControlSession::start_stream(const json::object& message, const RequestId& 
     entry->token = bytes_text(beamit::net::random_bytes(32));
     entry->request_id = id;
     entry->source = std::move(source.description);
-    entry->pipeline =
-        std::make_unique<StreamPipeline>(std::move(capturer), std::move(encoder), source.target, options);
-    entry->input = std::make_unique<input::StreamInput>(source.target.window, server_.options.elevated_input);
+    entry->pipeline = std::make_unique<StreamPipeline>(std::move(capturer), std::move(encoder), source.target,
+                                                       options,
+                                                       capture::CaptureOptions{.capture_cursor = !mirror_cursor});
+    const auto& elevated_input = server_.options.elevated_input;
+    entry->input = std::make_unique<input::StreamInput>(
+        source.target.window, elevated_input && elevated_input->healthy() ? elevated_input : nullptr);
     entry->input->mouse_mode = mouse_mode;
+    entry->mirror_cursor = mirror_cursor;
     entry->pid = source.pid;
     streams_.emplace(entry->id, entry);
     spdlog::info("Starting stream {} for {}", entry->id, json::serialize(entry->source));
@@ -557,9 +571,11 @@ void ControlSession::offer(const std::shared_ptr<StreamEntry>& entry, const Vide
         {"token_expires_in_ms", std::chrono::milliseconds(protocol::token_lifetime).count()},
         {"source", entry->source},
         {"video", video_json(video)},
-        {"input", {{"mouse_mode", input::mouse_mode_name(entry->input->mouse_mode)}}},
+        {"input", {{"mouse_mode", input::mouse_mode_name(entry->input->mouse_mode)},
+                   {"cursor", entry->mirror_cursor ? "client" : "video"}}},
     });
     for (const auto& [window, event] : server_.attention) send_attention(*entry, event);
+    if (entry->mirror_cursor) schedule_cursor();
 }
 
 void ControlSession::stop_stream(const json::object& message, const RequestId& id) {
@@ -595,6 +611,16 @@ void ControlSession::upgrade_input(const std::shared_ptr<input::ElevatedInput>& 
     for (const auto& [entry, replacement] : replacements) entry->input->release_all();
     for (auto& [entry, replacement] : replacements) {
         entry->input = std::move(replacement);
+        entry->focus_error_sent = false;
+        entry->input_error_sent = false;
+    }
+}
+
+void ControlSession::downgrade_input() {
+    // The failed helper's channel is closed; disconnecting makes it release its held input, and destroying the old
+    // StreamInput does not contact it.
+    for (const auto& [id, entry] : streams_) {
+        entry->input = entry->input->with_elevated_input(nullptr);
         entry->focus_error_sent = false;
         entry->input_error_sent = false;
     }
