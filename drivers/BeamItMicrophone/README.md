@@ -181,6 +181,11 @@ SetupAPI/newdev to install/update the package. On failed installation it tries
 to roll back a newly created node and reports rollback errors. It does not
 bypass signature enforcement or install a certificate.
 
+The host launcher can perform this step and check for the driver before every
+start: `Start-BeamItServer.ps1 -MicrophoneDriver <package>\BeamItMicrophone.inf`
+installs the driver (with a UAC prompt) when `\\.\BeamItMicCtl` cannot be
+opened, and `-RequireMicrophone` refuses to start the host without it.
+
 Close all recording applications and producer handles before update/removal:
 
 ```powershell
