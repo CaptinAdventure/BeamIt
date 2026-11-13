@@ -1,10 +1,12 @@
 #include "beamit/media/OpusAudio.hpp"
 #include "host/AudioEndpoint.hpp"
 #include "host/BeamItMicrophoneOutput.hpp"
+#include "host/WasapiMicrophoneOutput.hpp"
 #include "host/wss/AudioSocket.hpp"
 #include "net/AudioProtocol.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <atomic>
 #include <cmath>
@@ -333,4 +335,69 @@ TEST_CASE("BeamIt microphone output reports a busy device without fallback", "[a
     CHECK(state->created == 1);
     CHECK(state->writes == 0);
     output.stop();
+}
+
+TEST_CASE("Microphone playback devices match exact names before unique substrings", "[audio]") {
+    const std::vector<std::wstring> names{L"Speakers (Realtek(R) Audio)", L"CABLE Input (VB-Audio Virtual Cable)",
+                                          L"CABLE Input", L"CABLE-A Input (VB-Audio Cable A)"};
+    CHECK(host::match_render_endpoint(names, L"cable input") == 2);
+    CHECK(host::match_render_endpoint(names, L"realtek") == 0);
+    CHECK(host::match_render_endpoint(names, L"VB-Audio Virtual") == 1);
+    CHECK_THROWS_WITH(host::match_render_endpoint(names, L"Input"), Catch::Matchers::ContainsSubstring("Several"));
+    CHECK_THROWS_WITH(host::match_render_endpoint(names, L"Headphones"), Catch::Matchers::ContainsSubstring("No "));
+    CHECK_THROWS(host::match_render_endpoint(names, L""));
+    CHECK(host::match_render_endpoint({L"CABLE Input (VB-Audio Virtual Cable)"}, host::vb_cable_render_endpoint) == 0);
+}
+
+TEST_CASE("VB-Cable playback is found under its default or renamed endpoint name", "[audio]") {
+    CHECK(host::match_vb_cable_endpoint({L"Speakers (Realtek(R) Audio)", L"CABLE In 16 Ch (VB-Audio Virtual Cable)",
+                                         L"CABLE Input (VB-Audio Virtual Cable)"}) == 2);
+    CHECK(host::match_vb_cable_endpoint({L"CABLE In 16ch (VB-Audio Virtual Cable)",
+                                         L"Speakers (VB-Audio Virtual Cable)", L"Voicemeeter Input"}) == 1);
+    CHECK_THROWS_WITH(host::match_vb_cable_endpoint({L"Speakers (Realtek(R) Audio)"}),
+                      Catch::Matchers::ContainsSubstring("not installed"));
+    CHECK_THROWS_WITH(host::match_vb_cable_endpoint({L"A (VB-Audio Virtual Cable)", L"B (VB-Audio Virtual Cable)"}),
+                      Catch::Matchers::ContainsSubstring("Several"));
+}
+
+TEST_CASE("Microphone output falls back when the primary device cannot be acquired", "[audio]") {
+    const auto busy = std::make_shared<FailedMicrophoneState>();
+    const auto recording = std::make_shared<MicrophoneDeviceState>();
+    recording->block_first_write = false;
+    const auto factory = host::make_fallback_microphone_device(
+        [busy] { return std::make_unique<BusyMicrophoneDevice>(busy); },
+        [recording] { return std::make_unique<RecordingMicrophoneDevice>(recording); });
+    auto device = factory();
+    device->acquire();
+    device->write(host::make_beamit_mic_packet({.samples = std::vector<float>(BEAMIT_MIC_FRAMES_PER_PACKET * 2)}));
+    device->release();
+    CHECK(recording->written.size() == 1);
+    CHECK(recording->released);
+
+    const auto failing = host::make_fallback_microphone_device(
+        [busy] { return std::make_unique<BusyMicrophoneDevice>(busy); },
+        [busy] { return std::make_unique<BusyMicrophoneDevice>(busy); });
+    CHECK_THROWS_WITH(failing()->acquire(), "device busy; device busy");
+}
+
+// Plays 300 ms of silence into BEAMIT_TEST_MIC_OUTPUT ("vb-cable" or a device name), else the first playback device.
+TEST_CASE("WASAPI microphone output plays into a real playback device", "[.microphone-render]") {
+    std::wstring name;
+    if (const auto* selected = _wgetenv(L"BEAMIT_TEST_MIC_OUTPUT")) name = selected;
+    if (name == L"vb-cable") {
+        name.clear();
+    } else if (name.empty()) {
+        const auto names = host::render_endpoint_names();
+        if (names.empty()) SKIP("No active playback device");
+        name = names.front();
+    }
+    auto device = host::make_wasapi_microphone_device(name);
+    device->acquire();
+    for (std::uint64_t sequence = 0; sequence < 30; ++sequence) {
+        device->write(host::make_beamit_mic_packet({.sequence = sequence,
+            .sample_timestamp = sequence * BEAMIT_MIC_FRAMES_PER_PACKET,
+            .samples = std::vector<float>(BEAMIT_MIC_FRAMES_PER_PACKET * 2)}));
+        std::this_thread::sleep_for(10ms);
+    }
+    device->release();
 }

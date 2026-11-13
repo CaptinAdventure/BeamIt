@@ -586,7 +586,7 @@ void ClientApp::start_audio() {
                             }
                             owner->audio_status_.Text(microphone_available
                                 ? L"Microphone and host audio active"
-                                : L"Host audio active (remote BeamIt Microphone driver unavailable)");
+                                : L"Host audio active (no microphone output on the host)");
                         });
                 });
             self->update_connect_state();

@@ -185,6 +185,10 @@ The host launcher can perform this step and check for the driver before every
 start: `Start-BeamItServer.ps1 -MicrophoneDriver <package>\BeamItMicrophone.inf`
 installs the driver (with a UAC prompt) when `\\.\BeamItMicCtl` cannot be
 opened, and `-RequireMicrophone` refuses to start the host without it.
+Where the unsigned driver cannot be loaded (for example with Secure Boot and
+HVCI), the host can use the signed third-party VB-Audio Virtual Cable instead:
+`--microphone-output auto` (the default) falls back to it when this driver is
+unavailable; see "Client microphone output" in the main README.
 
 Close all recording applications and producer handles before update/removal:
 

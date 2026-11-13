@@ -57,13 +57,13 @@ void ControlSession::start_audio(const json::object&, const RequestId& id) {
     }
 }
 
-// Host-to-client playback must not depend on the optional BeamIt Microphone driver: without it,
+// Host-to-client playback must not depend on an optional microphone output (the BeamIt Microphone driver or a virtual cable): without one,
 // incoming microphone packets are decoded and discarded.
 void ControlSession::microphone_unavailable(const std::shared_ptr<AudioEntry>& entry, const RequestId& id,
                                             std::string_view message) {
     if (entry->microphone_error.empty()) {
-        entry->microphone_error = message.empty() ? "BeamIt Microphone driver is unavailable" : message;
-        spdlog::warn("BeamIt Microphone unavailable; discarding client microphone audio: {}",
+        entry->microphone_error = message.empty() ? "No microphone output is available" : message;
+        spdlog::warn("Microphone output unavailable; discarding client microphone audio: {}",
                      entry->microphone_error);
     }
     if (entry->microphone_output) {

@@ -1,6 +1,7 @@
 #include "host/HostServer.hpp"
 #include "host/HostControl.hpp"
 #include "host/TrayHost.hpp"
+#include "host/WasapiMicrophoneOutput.hpp"
 #include "net/Crypto.hpp"
 #include "net/Protocol.hpp"
 #include "beamit/capture/DxgiCapturer.hpp"
@@ -46,8 +47,12 @@ int main(int argc, char** argv) {
     unsigned short port{17389};
     std::string bind_address{"0.0.0.0"};
     bool elevate_input{};
+    std::string microphone_output{"auto"};
     app.add_flag("--elevate-input", elevate_input,
         "Use a separate UAC-elevated input helper; stop the host if it cannot start or stops");
+    app.add_option("--microphone-output", microphone_output,
+        "Where client microphone audio goes: auto (BeamIt Microphone driver, else VB-Audio Virtual Cable), "
+        "beamit (driver only), vb-cable or the name of a playback device")->default_val("auto");
     app.add_option("--port", port, "TCP listening port")->default_val(17389)->check(CLI::Range(1, 65535));
     app.add_option("--bind", bind_address, "Numeric listen address (IPv4 or IPv6)")->default_val("0.0.0.0");
     app.add_option("--password-file", password_file,
@@ -68,6 +73,7 @@ int main(int argc, char** argv) {
         options.bind_address = bind_address;
         options.port = port;
         options.elevate_input = elevate_input;
+        options.make_microphone_device = beamit::host::microphone_device_factory(microphone_output);
         if (*cert_option && (!std::filesystem::exists(tls_cert) || !std::filesystem::exists(tls_key))) {
             throw beamit::host::MissingTlsCertificate("The specified TLS certificate or private key was not found.");
         }

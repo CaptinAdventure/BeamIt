@@ -138,14 +138,16 @@ the WinUI project its include paths, definitions and static libraries.
 - Each host track uses its negotiated Opus metadata and has an independent
   decoder. The client bounds packet queues, drops stale playback audio under
   overload, and tears audio down on stop, socket failure or session end.
-- On the host, client microphone PCM is delivered only to the installed
-  **BeamIt Microphone** virtual recording device; there is no fallback to a
-  physical microphone or unrelated endpoint. Install a properly signed host
-  driver package, select **BeamIt Microphone** in Teams and keep its recording
-  stream active. If the device is missing, busy or inaccessible, audio still
-  starts with host playback and the client shows that the remote microphone is
-  unavailable; microphone PCM is then discarded by the host. Driver deployment
-  and Teams validation are documented in
+- On the host, client microphone PCM is delivered to the host's microphone
+  output: the **BeamIt Microphone** virtual recording device or, without it,
+  VB-Audio Virtual Cable (select **CABLE Output** in Teams); see the host
+  `--microphone-output` option in the main README. There is no fallback to a
+  physical microphone or speaker. With the BeamIt driver, install a properly
+  signed host driver package, select **BeamIt Microphone** in Teams and keep its
+  recording stream active. If no output is available, busy or inaccessible,
+  audio still starts with host playback and the client shows that the remote
+  microphone is unavailable; microphone PCM is then discarded by the host.
+  Driver deployment and Teams validation are documented in
   [`drivers/BeamItMicrophone/README.md`](../../drivers/BeamItMicrophone/README.md).
 - Audio is independent of video stream lifetimes. Ending a video stream does
   not stop the microphone or outgoing audio track; **Stop audio** ends both

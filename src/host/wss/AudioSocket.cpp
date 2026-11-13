@@ -88,7 +88,7 @@ void AudioSocket::output_ready() {
     if (microphone_output_) {
         if (auto error = microphone_output_->error(); !error.empty()) {
             // Playback tracks keep running; later microphone packets are decoded and discarded.
-            spdlog::warn("BeamIt Microphone failed; discarding client microphone audio: {}", error);
+            spdlog::warn("Microphone output failed; discarding client microphone audio: {}", error);
             microphone_output_->stop();
             microphone_output_.reset();
         }
