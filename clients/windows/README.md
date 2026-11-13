@@ -142,9 +142,10 @@ the WinUI project its include paths, definitions and static libraries.
   **BeamIt Microphone** virtual recording device; there is no fallback to a
   physical microphone or unrelated endpoint. Install a properly signed host
   driver package, select **BeamIt Microphone** in Teams and keep its recording
-  stream active. If the device is missing, busy or inaccessible, audio startup
-  fails visibly; if the driver cannot accept PCM, the host stops audio without
-  affecting video. Driver deployment and Teams validation are documented in
+  stream active. If the device is missing, busy or inaccessible, audio still
+  starts with host playback and the client shows that the remote microphone is
+  unavailable; microphone PCM is then discarded by the host. Driver deployment
+  and Teams validation are documented in
   [`drivers/BeamItMicrophone/README.md`](../../drivers/BeamItMicrophone/README.md).
 - Audio is independent of video stream lifetimes. Ending a video stream does
   not stop the microphone or outgoing audio track; **Stop audio** ends both

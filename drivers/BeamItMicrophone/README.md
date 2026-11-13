@@ -221,8 +221,9 @@ seconds. The utility uses a high-resolution waitable timer with QPC deadlines
 and prints queue/overrun/underrun counters. It has no playback route. For
 remote microphone audio, keep the host recording stream active and select
 **BeamIt Microphone** in the application (for example, in a Teams call) before
-starting audio in the client. The host ends audio with an explicit failure if
-the driver is unavailable or cannot accept PCM; video remains unaffected.
+starting audio in the client. If the driver is unavailable or cannot accept
+PCM, the host logs it and discards microphone audio; host playback and video
+continue.
 
 Before calling this production-ready, complete Driver Verifier and applicable
 Windows audio HLK testing, competing-process/crash tests, long-run timing,
