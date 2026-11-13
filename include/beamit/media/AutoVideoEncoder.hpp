@@ -22,6 +22,13 @@ public:
     [[nodiscard]] HRESULT last_error() const noexcept override;
 
 private:
+    // Selects NVENC 4:4:4 when available; false only for a non-capability failure (error_ set).
+    bool try_select_nvenc(const CapturedFrame& frame);
+    // Submits through D3D12 restricted to the chroma range. No value: no candidate in range is supported (never
+    // returned for the last resort, which stays selected even when it fails).
+    std::optional<EncoderSubmitResult> try_select_d3d12(const CapturedFrame& frame, unsigned minimum_chroma_idc,
+                                                        unsigned maximum_chroma_idc, bool last_resort);
+
     EncoderOptions options_{};
     std::unique_ptr<Encoder> selected_;
     HRESULT error_{S_OK};

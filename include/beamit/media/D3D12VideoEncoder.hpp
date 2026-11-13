@@ -8,7 +8,8 @@ namespace beamit::media {
 
 class D3D12VideoEncoder final : public Encoder {
 public:
-    D3D12VideoEncoder();
+    // Restricts HEVC sampling candidates to chroma_format_idc in [minimum, maximum] (1 = 4:2:0 ... 3 = 4:4:4).
+    explicit D3D12VideoEncoder(unsigned minimum_chroma_idc = 1, unsigned maximum_chroma_idc = 3);
     ~D3D12VideoEncoder() override;
 
     D3D12VideoEncoder(const D3D12VideoEncoder&) = delete;

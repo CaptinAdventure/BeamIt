@@ -88,7 +88,7 @@ Prefer configuration files with restrictive permissions; command-line secrets ca
 The implementation is being organized around the following pieces:
 
 - **Capture pipeline**: desktop/window/app capture on Windows 11+ that emits a common GPU-backed frame type
-- **Encoder**: a generic interface accepting frames from either capture backend; automatic sampling-first selection between D3D12 H.264/H.265 and NVENC DirectX 11 H.264 4:4:4
+- **Encoder**: a generic interface accepting frames from either capture backend; automatic sampling-first selection between D3D12 H.264/H.265 and NVENC DirectX 11 H.264/H.265 4:4:4
 - **Transport**: authenticated, encrypted LAN video and window/control channel(s)
 - **Client integration**: native windows, remote-window mapping and taskbar/Dock attention
 - **Input injection**: keyboard and mouse handling
@@ -132,33 +132,33 @@ The D3D12 encoder chooses the same adapter as the incoming capture texture. It u
 
 ### Automatic encoder selection (default)
 
-The host always uses `AutoVideoEncoder`, which includes NVENC in its best-codec search: for the default H.264 codec, it tries NVENC High444 before falling back to D3D12 4:2:0. It prioritizes 4:4:4 while preserving the codec the client requested in `start_stream`:
+The host always uses `AutoVideoEncoder`, which includes NVENC in its best-codec search: for the default H.264 codec, it tries NVENC High444 before falling back to D3D12 4:2:0; for HEVC, it tries NVENC Main 4:4:4 when D3D12 has no 4:4:4 path. It prioritizes 4:4:4 while preserving the codec the client requested in `start_stream`:
 
 | Requested codec | Initialization priority |
 | --- | --- |
 | H.264 (default) | NVENC High444 / 8-bit 4:4:4, then D3D12 Main / 8-bit 4:2:0 |
-| HEVC (`"codec": "h265"`) | D3D12 8-bit 4:4:4, 10-bit 4:4:4, 10-bit 4:2:2, then 8-bit 4:2:0 |
+| HEVC (`"codec": "h265"`) | D3D12 8-bit 4:4:4, 10-bit 4:4:4, then NVENC Main 4:4:4 (RExt) / 8-bit 4:4:4, then D3D12 10-bit 4:2:2, then 8-bit 4:2:0 |
 
-D3D12's H.264 API exposes no 4:4:4 profile, so that impossible candidate is skipped with a log. NVENC HEVC is not implemented and is not tried for an HEVC request. No codec change is permitted: the selected codec's available 4:4:4 backends are considered before lowering sampling on D3D12.
+D3D12's H.264 API exposes no 4:4:4 profile, so that impossible candidate is skipped with a log. For HEVC, D3D12 is first restricted to its 4:4:4 candidates; only when none is supported (`ERROR_NOT_SUPPORTED`) is NVENC tried, and only when NVENC is also unavailable does D3D12 continue with its 4:2:2/4:2:0 candidates. No codec change is permitted: the selected codec's available 4:4:4 backends are considered before lowering sampling on D3D12.
 
 Selection happens when the first frame supplies the capture device and is repeated on reconfiguration/resize. NVENC availability/profile/configuration rejection (including missing SDK integration or an incompatible/missing driver API) is logged before trying D3D12. Allocation, device, GPU submission and encoding failures abort; they do not trigger backend switching. Once a backend accepts a picture, it stays selected until reconfiguration. Both encoders remain on the capture adapter. There is no option to force a backend.
 
-On the development T1000, default H.264 selects NVENC and produces `yuv444p`; HEVC tries D3D12's higher-sampling candidates and currently falls back to `yuv420p`. The selected sampling is logged. Clients must support the selected profile; automatic host selection does not negotiate client hardware-decoding support. The hidden `[.auto-hardware]` Catch2 test checks the NVENC-to-D3D12 fallback on a non-NVIDIA adapter; on the development Intel adapter, NVENC is correctly rejected and D3D12 is attempted, but D3D12 also rejects encoding with the current driver.
+On the development T1000, default H.264 selects NVENC and produces `yuv444p`; HEVC rejects D3D12's 4:4:4 candidates and selects NVENC Main 4:4:4 (`hvc1.4.…`, `yuv444p`). The selected sampling is logged. Clients must support the selected profile; automatic host selection does not negotiate client hardware-decoding support. The hidden `[.auto-hardware]` Catch2 test checks the NVENC-to-D3D12 fallback on a non-NVIDIA adapter; on the development Intel adapter, NVENC is correctly rejected and D3D12 is attempted, but D3D12 also rejects encoding with the current driver.
 
 ### Native NVENC DirectX 11 encoder
 
-`NvencVideoEncoder` implements the same `Encoder` interface; the automatic H.264 search tries it first when available. NVENC currently requires **8-bit SDR H.264 High 4:4:4 Predictive** and rejects initialization if that profile, 4:4:4 encoding, RGB input, or asynchronous encoding is unavailable, after which the automatic search falls back to D3D12 4:2:0.
+`NvencVideoEncoder` implements the same `Encoder` interface; the automatic H.264 search tries it first, and the automatic HEVC search tries it after D3D12 4:4:4, when available. NVENC requires **8-bit SDR 4:4:4**: H.264 High 4:4:4 Predictive or HEVC Main 4:4:4 (Format Range Extensions profile, `chroma_format_idc` 3, 8-bit input/output). It rejects initialization if that profile, 4:4:4 encoding, RGB input, asynchronous encoding or the frame size is unavailable (NVENC HEVC rejects very small frames such as 64×64), after which the automatic search continues with D3D12's lower-sampling candidates.
 
 The NVENC session uses `NV_ENC_DEVICE_TYPE_DIRECTX` on the capture texture's D3D11 device. Each fresh frame is copied on the GPU to one reusable encoder-owned BGRA texture, registered as NVENC's word-ordered ARGB format (BGRA bytes). NVENC performs RGB-to-YUV conversion for 4:4:4 encoding; no CPU pixel readback, CUDA toolkit, manual planar packing, or packed AYUV intermediate is required. The copy is deliberately encoder-side: it preserves the last image for DXGI idle-frame repeats without accessing a released duplication surface. Capture remains copy-free for DXGI. Capture must already be on an NVENC-capable NVIDIA device; cross-GPU transfer is not implemented.
 
-The P1 ultra-low-latency preset favors throughput over compression efficiency. Encoding uses VBR (average target, peak 2× by default or the client's `max_bitrate_kbps`) with a one-frame VBV at the average target, a ten-second I/P GOP, one reference frame, no B-frames, no lookahead, no temporal AQ, and no multipass. Async Windows completion events bound submission to one outstanding picture; output is Annex B with AUD and repeated SPS/PPS on IDRs. The complete captured-frame lease is retained through completion, with a D3D11 copy fence also protecting shutdown/error cleanup. Reconfiguration rebuilds the session for resized windows; the next picture is an IDR.
+The P1 ultra-low-latency preset favors throughput over compression efficiency. Encoding uses VBR (average target, peak 2× by default or the client's `max_bitrate_kbps`) with a one-frame VBV at the average target, a ten-second I/P GOP, one reference frame, no B-frames, no lookahead, no temporal AQ, and no multipass. Async Windows completion events bound submission to one outstanding picture; output is Annex B with AUD and repeated SPS/PPS (plus VPS for HEVC) on IDRs. The complete captured-frame lease is retained through completion, with a D3D11 copy fence also protecting shutdown/error cleanup. Reconfiguration rebuilds the session for resized windows; the next picture is an IDR.
 
-Both WGC and DXGI 1080p60 recordings made with the former recorder on the T1000 decoded as `High 4:4:4 Predictive`, `yuv444p`, with 5 I-frames and 295 P-frames per five-second recording and no B-frames. This does not prove one-frame end-to-end latency or hardware decoding on macOS: High444 support must be checked on the intended client, and software decoding can increase latency. HDR and HEVC NVENC encoding are not implemented.
+Both WGC and DXGI 1080p60 recordings made with the former recorder on the T1000 decoded as `High 4:4:4 Predictive`, `yuv444p`, with 5 I-frames and 295 P-frames per five-second recording and no B-frames. This does not prove one-frame end-to-end latency or hardware decoding on macOS: High444 support must be checked on the intended client, and software decoding can increase latency. HDR encoding is not implemented. The hidden 1080p NVENC diagnostic below also produces HEVC streams that FFmpeg decodes as `Rext`, `yuv444p`, with no B-frames and every picture decoded; HEVC 4:4:4 was not recorded from live capture.
 
 The SDK integration described below must be enabled. Driver-independent lifecycle/configuration tests run with the normal test suite; run the hidden `[.nvenc-hardware]` Catch2 tag through CLion's `BeamItTests` configuration for D3D11 submission/repeat, backpressure, lease release, in-flight shutdown and session-recreation checks on an NVIDIA GPU.
 
 **GOP quality-pulsing diagnostic.** The hidden `[.nvenc-quality]` test uses synthetic desktop-like pixels
-(not screen capture) and production NVENC settings: 1920x1080 H.264 4:4:4, P1 ultra-low-latency,
+(not screen capture) and production NVENC settings: 1920x1080 H.264 and HEVC 4:4:4, P1 ultra-low-latency,
 48,000/96,000 kbps average/peak, one-frame VBV and a ten-second GOP. Set `BEAMIT_NVENC_DIAGNOSTIC_DIR` to an
 existing empty directory, then run that test in CLion. It writes a reference PPM, Annex B streams and per-picture
 CSV sizes/timings through two full GOPs and the following IDR at both 60 and 30 FPS. Nothing is sent over the network.
@@ -187,7 +187,7 @@ On the development system, the 1080p60/24,000 kbps query reported:
 | Intel UHD Graphics (`8086:9BC4`) | H.264 and HEVC encoder codec support reported false through D3D12 |
 | Microsoft Basic Render Driver | Software adapter, skipped |
 
-These results describe this driver/API combination, not every API capability of the silicon. Prefer D3D12 when it exposes the desired sampling; use NVENC for the demonstrated NVIDIA H.264 4:4:4 gap before lowering sampling. A driver update may change results. Do not assume that swapping D3D12 adapter pointers enables cross-GPU capture: the existing D3D11/D3D12 bridge is same-adapter.
+These results describe this driver/API combination, not every API capability of the silicon. Prefer D3D12 when it exposes the desired sampling; use NVENC for the demonstrated NVIDIA H.264 and HEVC 4:4:4 gaps before lowering sampling. A driver update may change results. Do not assume that swapping D3D12 adapter pointers enables cross-GPU capture: the existing D3D11/D3D12 bridge is same-adapter.
 
 HEVC tries these formats in order, retaining the first supported capture-to-encoder path:
 
@@ -599,7 +599,7 @@ The macOS client sources live in `clients/osx/BeamIt/BeamIt/`. `BeamItApp.swift`
 - `include/beamit/capture/WgcCapturer.hpp` and `src/capture/WgcCapturer.cpp` — WGC monitor/window capture backend
 - `include/beamit/media/Encoder.hpp` — common asynchronous encoder interface
 - `include/beamit/media/D3D12VideoEncoder.hpp` and `src/media/D3D12VideoEncoder.cpp` — H.264/H.265 D3D12 hardware encoder
-- `include/beamit/media/NvencVideoEncoder.hpp` and `src/media/NvencVideoEncoder.cpp` — DirectX 11 NVENC H.264 4:4:4 encoder
+- `include/beamit/media/NvencVideoEncoder.hpp` and `src/media/NvencVideoEncoder.cpp` — DirectX 11 NVENC H.264/HEVC 4:4:4 encoder
 - `include/beamit/media/AutoVideoEncoder.hpp` and `src/media/AutoVideoEncoder.cpp` — default codec-preserving encoder selection
 - `include/beamit/media/VideoFrame.hpp` — shared captured-frame and encoded-packet types
 - `PROTOCOL.md` — WSS signaling/stream protocol v1 specification

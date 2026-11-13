@@ -59,48 +59,72 @@ EncoderSubmitResult AutoVideoEncoder::try_submit(const CapturedFrame& frame) {
         }
         if (options_.codec == VideoCodec::H264) {
             spdlog::info("Automatic H.264: D3D12 has no 4:4:4 profile; trying NVENC 4:4:4 first");
-#ifdef BEAMIT_HAS_NVENC
-            auto nvenc = std::make_unique<NvencVideoEncoder>();
-            if (!nvenc->configure(options_) || !nvenc->start()) {
-                error_ = nvenc->last_error();
-                return EncoderSubmitResult::Failed;
-            }
-            if (nvenc->prepare(frame)) {
-                selected_ = std::move(nvenc);
-                spdlog::info("Automatic encoder selected NVENC H.264 4:4:4");
-            } else {
-                const auto reason = nvenc->last_error();
-                nvenc->stop();
-                if (nvenc->last_error() != reason) {
-                    error_ = nvenc->last_error();
-                    return EncoderSubmitResult::Failed;
-                }
-                if (reason != DXGI_ERROR_UNSUPPORTED && reason != E_NOINTERFACE &&
-                    reason != HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND) &&
-                    reason != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) &&
-                    reason != HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND)) {
-                    error_ = reason;
-                    return EncoderSubmitResult::Failed;
-                }
-                spdlog::warn("NVENC 4:4:4 unavailable (HRESULT 0x{:08X}); trying D3D12 H.264 4:2:0",
-                             static_cast<std::uint32_t>(reason));
-            }
-#else
-            spdlog::warn("NVENC support not built; trying D3D12 H.264 4:2:0");
-#endif
+            if (!try_select_nvenc(frame)) return EncoderSubmitResult::Failed;
+            if (!selected_) return *try_select_d3d12(frame, 1, 1, true);
         } else {
-            spdlog::info("Automatic HEVC: D3D12 4:4:4, then 4:2:2/4:2:0; NVENC HEVC is not implemented");
-        }
-        if (!selected_) {
-            auto d3d12 = std::make_unique<D3D12VideoEncoder>();
-            if (!d3d12->configure(options_) || !d3d12->start()) {
-                error_ = d3d12->last_error();
-                return EncoderSubmitResult::Failed;
-            }
-            selected_ = std::move(d3d12);
+            spdlog::info("Automatic HEVC: D3D12 4:4:4, then NVENC 4:4:4, then D3D12 4:2:2/4:2:0");
+            if (auto submitted = try_select_d3d12(frame, 3, 3, false)) return *submitted;
+            spdlog::warn("D3D12 HEVC 4:4:4 unavailable; trying NVENC HEVC 4:4:4");
+            if (!try_select_nvenc(frame)) return EncoderSubmitResult::Failed;
+            if (!selected_) return *try_select_d3d12(frame, 1, 2, true);
         }
     }
     return selected_->try_submit(frame);
+}
+
+bool AutoVideoEncoder::try_select_nvenc([[maybe_unused]] const CapturedFrame& frame) {
+    const char* codec = options_.codec == VideoCodec::H264 ? "H.264" : "HEVC";
+#ifdef BEAMIT_HAS_NVENC
+    auto nvenc = std::make_unique<NvencVideoEncoder>();
+    if (!nvenc->configure(options_) || !nvenc->start()) {
+        error_ = nvenc->last_error();
+        return false;
+    }
+    if (nvenc->prepare(frame)) {
+        selected_ = std::move(nvenc);
+        spdlog::info("Automatic encoder selected NVENC {} 4:4:4", codec);
+        return true;
+    }
+    const auto reason = nvenc->last_error();
+    nvenc->stop();
+    if (nvenc->last_error() != reason) {
+        error_ = nvenc->last_error();
+        return false;
+    }
+    if (reason != DXGI_ERROR_UNSUPPORTED && reason != E_NOINTERFACE &&
+        reason != HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND) &&
+        reason != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) &&
+        reason != HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND)) {
+        error_ = reason;
+        return false;
+    }
+    spdlog::warn("NVENC {} 4:4:4 unavailable (HRESULT 0x{:08X}); trying D3D12", codec,
+                 static_cast<std::uint32_t>(reason));
+#else
+    spdlog::warn("NVENC support not built; skipping NVENC {} 4:4:4", codec);
+#endif
+    return true;
+}
+
+std::optional<EncoderSubmitResult> AutoVideoEncoder::try_select_d3d12(
+    const CapturedFrame& frame, unsigned minimum_chroma_idc, unsigned maximum_chroma_idc, bool last_resort) {
+    auto d3d12 = std::make_unique<D3D12VideoEncoder>(minimum_chroma_idc, maximum_chroma_idc);
+    if (!d3d12->configure(options_) || !d3d12->start()) {
+        error_ = d3d12->last_error();
+        return EncoderSubmitResult::Failed;
+    }
+    const auto submitted = d3d12->try_submit(frame);
+    // The last resort stays selected, so its backend name and error are reported.
+    if (submitted == EncoderSubmitResult::Failed && !last_resort) {
+        const auto reason = d3d12->last_error();
+        d3d12->stop();
+        // Only "no candidate in this range is supported" continues; operational failures do not.
+        if (reason == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) return std::nullopt;
+        error_ = reason;
+        return EncoderSubmitResult::Failed;
+    }
+    selected_ = std::move(d3d12);
+    return submitted;
 }
 
 void AutoVideoEncoder::request_key_frame() noexcept {

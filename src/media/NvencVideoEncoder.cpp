@@ -158,33 +158,41 @@ struct NvencVideoEncoder::Impl {
         open.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX;
         open.device = device.Get();
         if (!check(api.nvEncOpenEncodeSessionEx(&open, &session), "open D3D11 session")) return false;
+        const bool hevc = options.codec == VideoCodec::H265;
+        const GUID codec = hevc ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
+        const GUID profile = hevc ? NV_ENC_HEVC_PROFILE_FREXT_GUID : NV_ENC_H264_PROFILE_HIGH_444_GUID;
+        const char* codec_name = hevc ? "HEVC" : "H.264";
         for (const auto capability : {NV_ENC_CAPS_SUPPORT_YUV444_ENCODE, NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT}) {
             NV_ENC_CAPS_PARAM caps{};
             caps.version = NV_ENC_CAPS_PARAM_VER;
             caps.capsToQuery = capability;
             int supported{};
-            if (!check(api.nvEncGetEncodeCaps(session, NV_ENC_CODEC_H264_GUID, &caps, &supported),
-                       "query H.264 capability")) return false;
-            if (!supported) return fail(DXGI_ERROR_UNSUPPORTED, "H.264 4:4:4 or async encoding unsupported");
+            if (!check(api.nvEncGetEncodeCaps(session, codec, &caps, &supported), "query codec capability")) {
+                return false;
+            }
+            if (!supported) {
+                spdlog::warn("NVENC {} 4:4:4 or asynchronous encoding unsupported", codec_name);
+                return fail(DXGI_ERROR_UNSUPPORTED, "4:4:4 or async capability");
+            }
         }
         std::uint32_t count{}, written{};
-        if (!check(api.nvEncGetEncodeProfileGUIDCount(session, NV_ENC_CODEC_H264_GUID, &count),
-                   "count H.264 profiles")) return false;
+        if (!check(api.nvEncGetEncodeProfileGUIDCount(session, codec, &count), "count profiles")) return false;
         std::vector<GUID> profiles(count);
-        if (!count) return fail(DXGI_ERROR_UNSUPPORTED, "no H.264 profiles");
-        if (!check(api.nvEncGetEncodeProfileGUIDs(session, NV_ENC_CODEC_H264_GUID,
-                   profiles.data(), count, &written), "query H.264 profiles")) return false;
+        if (!count) return fail(DXGI_ERROR_UNSUPPORTED, "profile query (no profiles)");
+        if (!check(api.nvEncGetEncodeProfileGUIDs(session, codec, profiles.data(), count, &written),
+                   "query profiles")) return false;
         if (written > count) return fail(E_UNEXPECTED, "invalid profile count");
         profiles.resize(written);
-        if (std::ranges::none_of(profiles, [](const GUID& guid) {
-            return IsEqualGUID(guid, NV_ENC_H264_PROFILE_HIGH_444_GUID);
-        })) return fail(DXGI_ERROR_UNSUPPORTED, "High 4:4:4 Predictive profile unavailable");
-        if (!check(api.nvEncGetInputFormatCount(session, NV_ENC_CODEC_H264_GUID, &count),
-                   "count input formats")) return false;
+        if (std::ranges::none_of(profiles, [&](const GUID& guid) { return IsEqualGUID(guid, profile); })) {
+            spdlog::warn("NVENC {} 4:4:4 profile ({}) unavailable", codec_name,
+                         hevc ? "Format Range Extensions" : "High 4:4:4 Predictive");
+            return fail(DXGI_ERROR_UNSUPPORTED, "4:4:4 profile query");
+        }
+        if (!check(api.nvEncGetInputFormatCount(session, codec, &count), "count input formats")) return false;
         std::vector<NV_ENC_BUFFER_FORMAT> formats(count);
-        if (!count) return fail(DXGI_ERROR_UNSUPPORTED, "no H.264 input formats");
-        if (!check(api.nvEncGetInputFormats(session, NV_ENC_CODEC_H264_GUID,
-                   formats.data(), count, &written), "query input formats")) return false;
+        if (!count) return fail(DXGI_ERROR_UNSUPPORTED, "input format query (no formats)");
+        if (!check(api.nvEncGetInputFormats(session, codec, formats.data(), count, &written),
+                   "query input formats")) return false;
         if (written > count) return fail(E_UNEXPECTED, "invalid input format count");
         formats.resize(written);
         if (std::ranges::find(formats, NV_ENC_BUFFER_FORMAT_ARGB) == formats.end()) {
@@ -193,11 +201,11 @@ struct NvencVideoEncoder::Impl {
         NV_ENC_PRESET_CONFIG preset{};
         preset.version = NV_ENC_PRESET_CONFIG_VER;
         preset.presetCfg.version = NV_ENC_CONFIG_VER;
-        if (!check(api.nvEncGetEncodePresetConfigEx(session, NV_ENC_CODEC_H264_GUID,
+        if (!check(api.nvEncGetEncodePresetConfigEx(session, codec,
                    NV_ENC_PRESET_P1_GUID, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &preset),
                    "query ultra-low-latency preset")) return false;
         config = preset.presetCfg;
-        config.profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID;
+        config.profileGUID = profile;
         config.gopLength = key_frame_interval(options.frame_rate);
         config.frameIntervalP = 1;
         config.frameFieldMode = NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
@@ -208,15 +216,27 @@ struct NvencVideoEncoder::Impl {
         config.rcParams.enableTemporalAQ = 0;
         config.rcParams.zeroReorderDelay = 1;
         config.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
-        auto& h264 = config.encodeCodecConfig.h264Config;
-        h264.chromaFormatIDC = 3;
-        h264.idrPeriod = config.gopLength;
-        h264.maxNumRefFrames = 1;
-        h264.repeatSPSPPS = 1;
-        h264.outputAUD = 1;
+        if (hevc) {
+            // 8-bit 4:4:4 Format Range Extensions (Main 4:4:4); VPS/SPS/PPS accompany every IDR.
+            auto& h265 = config.encodeCodecConfig.hevcConfig;
+            h265.chromaFormatIDC = 3;
+            h265.inputBitDepth = NV_ENC_BIT_DEPTH_8;
+            h265.outputBitDepth = NV_ENC_BIT_DEPTH_8;
+            h265.idrPeriod = config.gopLength;
+            h265.maxNumRefFramesInDPB = 1;
+            h265.repeatSPSPPS = 1;
+            h265.outputAUD = 1;
+        } else {
+            auto& h264 = config.encodeCodecConfig.h264Config;
+            h264.chromaFormatIDC = 3;
+            h264.idrPeriod = config.gopLength;
+            h264.maxNumRefFrames = 1;
+            h264.repeatSPSPPS = 1;
+            h264.outputAUD = 1;
+        }
         init = {};
         init.version = NV_ENC_INITIALIZE_PARAMS_VER;
-        init.encodeGUID = NV_ENC_CODEC_H264_GUID;
+        init.encodeGUID = codec;
         init.presetGUID = NV_ENC_PRESET_P1_GUID;
         init.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
         init.encodeWidth = init.darWidth = options.width;
@@ -227,7 +247,7 @@ struct NvencVideoEncoder::Impl {
         init.enableEncodeAsync = 1;
         init.encodeConfig = &config;
         const auto initialized = api.nvEncInitializeEncoder(session, &init);
-        if (!check(initialized, "initialize H.264 High444")) {
+        if (!check(initialized, hevc ? "initialize HEVC Main 4:4:4" : "initialize H.264 High444")) {
             if (initialized == NV_ENC_ERR_INVALID_PARAM) error = DXGI_ERROR_UNSUPPORTED;
             return false;
         }
@@ -262,8 +282,9 @@ struct NvencVideoEncoder::Impl {
         event.completionEvent = completion;
         if (!check(api.nvEncRegisterAsyncEvent(session, &event), "register completion event")) return false;
         event_registered = true;
-        spdlog::info("NVENC D3D11: H.264 High 4:4:4 Predictive, 8-bit 4:4:4; GPU BGRA input; VBR {} kbps target, "
+        spdlog::info("NVENC D3D11: {}, 8-bit 4:4:4; GPU BGRA input; VBR {} kbps target, "
                      "{} kbps peak, one-frame VBV, GOP {} I/P (10 s), no B-frames/lookahead",
+                     hevc ? "HEVC Main 4:4:4 (RExt)" : "H.264 High 4:4:4 Predictive",
                      options.target_bitrate_kbps, peak_bitrate_kbps(options), config.gopLength);
         return true;
     }
@@ -345,8 +366,8 @@ bool NvencVideoEncoder::configure(const EncoderOptions& options) {
     impl_->error = S_OK;
     if (!options.width || !options.height || !options.frame_rate || !options.target_bitrate_kbps ||
         options.target_bitrate_kbps > std::numeric_limits<std::uint32_t>::max() / 1000 ||
-        options.codec != VideoCodec::H264) {
-        return impl_->fail(E_INVALIDARG, "configuration (H.264 only; dimensions, FPS and bitrate must be nonzero)");
+        (options.codec != VideoCodec::H264 && options.codec != VideoCodec::H265)) {
+        return impl_->fail(E_INVALIDARG, "configuration (H.264/HEVC; dimensions, FPS and bitrate must be nonzero)");
     }
     impl_->options = options;
     impl_->configured = true;
@@ -448,7 +469,7 @@ std::optional<EncodedPacket> NvencVideoEncoder::try_receive() {
         return std::nullopt;
     }
     EncodedPacket packet;
-    packet.codec = VideoCodec::H264;
+    packet.codec = impl_->options.codec;
     packet.captured_at = impl_->timestamp;
     packet.key_frame = lock.pictureType == NV_ENC_PIC_TYPE_IDR;
     packet.data.resize(lock.bitstreamSizeInBytes);

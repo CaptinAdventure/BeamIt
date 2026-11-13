@@ -1340,7 +1340,8 @@ jitter buffer) and may drop late frames only at key-frame boundaries.
 
 The host always selects the encoder backend automatically. H.264 prefers native NVENC
 4:4:4 (High 4:4:4 Predictive) and falls back to D3D12 4:2:0; H.265 tries
-D3D12 4:4:4, then 4:2:2, then 4:2:0. The resulting sampling is reported in
+D3D12 4:4:4, then native NVENC 4:4:4 (Main 4:4:4 range extensions), then
+D3D12 4:2:2, then 4:2:0. The resulting sampling is reported in
 `chroma_format` and `codec_string`. Browser hardware decoders often lack
 4:4:4 support: a client should call `VideoDecoder.isConfigSupported()` and,
 if unsupported, restart the stream with `"codec": "h265"`.
