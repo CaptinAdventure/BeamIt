@@ -222,6 +222,11 @@ final class BeamItStreamWindowController: NSWindowController, NSWindowDelegate {
         stream.onInputError = { [weak self] message in
             self?.handleInputError(message)
         }
+        frameView.usesHostCursor = stream.offer.hostSendsCursorShape
+        frameView.cursorShape = stream.cursorShape
+        stream.onCursorShape = { [weak self] shape in
+            DispatchQueue.main.async { self?.frameView.cursorShape = shape }
+        }
         stream.onAttention = { [weak self] in
             self?.updateDockAttention()
         }

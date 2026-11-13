@@ -1,5 +1,6 @@
 #include "AppUtil.hpp"
 
+#include "AppResources.h"
 #include "ClientProtocol.hpp"
 
 #include <shlobj.h>
@@ -25,6 +26,17 @@ std::string narrow(std::wstring_view text) {
         WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr);
     }
     return result;
+}
+
+HICON app_icon(bool large) {
+    return static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_BEAMIT), IMAGE_ICON,
+                                         GetSystemMetrics(large ? SM_CXICON : SM_CXSMICON),
+                                         GetSystemMetrics(large ? SM_CYICON : SM_CYSMICON), LR_SHARED));
+}
+
+void apply_window_icon(HWND hwnd) {
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(app_icon(false)));
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(app_icon(true)));
 }
 
 std::filesystem::path Settings::path() {

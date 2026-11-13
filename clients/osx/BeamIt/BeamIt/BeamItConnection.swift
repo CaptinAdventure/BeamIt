@@ -89,7 +89,7 @@ final class BeamItConnection {
 
         let response = try await request(
             type: "start_stream",
-            fields: ["source": sourceObject],
+            fields: ["source": sourceObject, "input": ["cursor": "client"]],
             expectedType: "stream_offer"
         )
         let data = try JSONSerialization.data(withJSONObject: response)
@@ -446,6 +446,12 @@ final class BeamItConnection {
                         let window = try JSONDecoder().decode(BeamItHostWindow.self, from: data)
                         popups.update(window, closed: type == "window_closed")
                         hostWindows.update(window, closed: type == "window_closed")
+                        continue
+                    }
+                    if message["type"] as? String == "cursor",
+                       let streamID = message["stream_id"] as? String,
+                       let shape = message["shape"] as? String {
+                        streams[streamID]?.updateCursorShape(shape)
                         continue
                     }
                     if message["type"] as? String == "clipboard_changed" {

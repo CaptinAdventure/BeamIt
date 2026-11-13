@@ -229,8 +229,11 @@ Clients must parse the offer rather than assume those defaults.
 
 Outgoing tracks automatically capture Windows playback using event-driven
 WASAPI process loopback. Incoming audio is decoded to PCM only: playback,
-virtual-microphone redirection into Teams and client audio integration are
-not implemented. The production host has no synthetic audio source.
+virtual-microphone redirection into Teams and audio playback on the macOS
+client are independent. The macOS client can decode host tracks for local
+playback and sends its microphone through the host decoder; the host still
+does not route that PCM into Teams. The production host has no synthetic
+audio source.
 
 The source-built **BeamIt Microphone** driver subproject is documented in
 [`drivers/BeamItMicrophone`](drivers/BeamItMicrophone/README.md). It now includes
@@ -402,8 +405,51 @@ Tested from a stdlib Python WSS client on the development machine: authenticatio
 Fullscreen exit restores the titled window and its pixel scale after AppKit completes the native transition; transition resize events do not update the saved windowed scale. Standalone restoration regression checks (no host or fullscreen Space switch):
 
 ```sh
-xcrun swiftc -default-isolation MainActor -parse-as-library clients/osx/BeamIt/BeamIt/BeamItAntiIdle.swift clients/osx/BeamIt/BeamIt/BeamItConnectionModels.swift clients/osx/BeamIt/BeamIt/BeamItScalingMenu.swift clients/osx/BeamIt/BeamIt/BeamItStreamSurface.swift clients/osx/BeamIt/BeamIt/BeamItStreamWindowController.swift clients/osx/BeamIt/Tests/FullscreenTests.swift -o /tmp/beamit-fullscreen-checks
+xcrun swiftc -default-isolation MainActor -parse-as-library clients/osx/BeamIt/BeamIt/BeamItAntiIdle.swift clients/osx/BeamIt/BeamIt/BeamItHostWindow.swift clients/osx/BeamIt/BeamIt/BeamItConnectionModels.swift clients/osx/BeamIt/BeamIt/BeamItScalingMenu.swift clients/osx/BeamIt/BeamIt/BeamItScreenshot.swift clients/osx/BeamIt/BeamIt/BeamItStreamSurface.swift clients/osx/BeamIt/BeamIt/BeamItStreamWindowController.swift clients/osx/BeamIt/Tests/FullscreenTests.swift -o /tmp/beamit-fullscreen-checks
 /tmp/beamit-fullscreen-checks
+```
+
+**macOS screenshots.** Focus a stream and choose **Stream > Save PNG Screenshot…**, then choose a file location. This saves the latest presented decoded frame at its original video resolution, regardless of window scaling or fullscreen, without borders, letterboxing or separately streamed popup windows. The frame is frozen when the command is selected. No screen-recording permission or host protocol change is needed; the client retains one presented GPU frame and converts it only on export. Export checks:
+
+```sh
+xcrun swiftc -default-isolation MainActor clients/osx/BeamIt/BeamIt/BeamItScreenshot.swift clients/osx/BeamIt/Tests/ScreenshotTests.swift -o /tmp/beamit-screenshot-checks
+/tmp/beamit-screenshot-checks
+```
+
+**macOS application windows.** The source picker lists host applications live from the window events (PROTOCOL.md §5.12), grouped by process, showing the executable name, window count and PID; full-desktop DXGI and WGC streaming are unchanged. A persisted **Connect** choice above the list selects the mode:
+
+- **All Windows** (default): the application's main window is streamed, then every `main`, `owned` (dialogs) and `tool` window of that process gets its own native window, positioned relative to the main window as on the host. Windows opened or restored later are connected automatically while any stream of that process remains open. Minimized windows wait until restored, since starting a stream would restore and activate them on the host. A window you close locally is not reopened until the host hides/closes and shows it again.
+- **Main Window Only**: just the main window is streamed.
+
+In either mode, **Stream > Connect Window** lists the focused stream's other not-yet-connected windows of the same process and opens the chosen one. Transient `popup` windows (menus, tooltips) continue to appear automatically as child panels. Standalone listing/selection checks:
+
+```sh
+xcrun swiftc -default-isolation MainActor -parse-as-library clients/osx/BeamIt/BeamIt/BeamItHostWindow.swift clients/osx/BeamIt/BeamIt/BeamItHostWindowList.swift clients/osx/BeamIt/BeamIt/BeamItConnectionModels.swift clients/osx/BeamIt/Tests/HostWindowListTests.swift -o /tmp/beamit-host-windows
+/tmp/beamit-host-windows
+```
+
+**macOS audio testing.** The client uses the system microphone and local speakers, with libopus provided by Homebrew:
+
+```sh
+brew install opus
+xcodebuild -project clients/osx/BeamIt/BeamIt.xcodeproj -scheme BeamIt -destination 'platform=macOS' build
+```
+
+In the connected source picker, enable **Enable audio and microphone**, then explicitly add **Desktop Audio** or an application. If the picker was hidden after opening a video stream, reopen it with **Stream > Add New Stream**. Desktop audio is exclusive with application tracks; video streams do not start or stop audio tracks. Choose distinct application process trees (not a parent and its child) to avoid double capture. The first enable requests macOS microphone permission and starts the host's incoming microphone route. The host currently decodes that stream but does not feed it to Teams. Outgoing host audio tracks play locally. Audio is independent of video and remains active until stopped or the authenticated session ends.
+
+Microphone sends are paced at the offered Opus packet duration, even when a
+macOS capture callback supplies multiple packets or the sender resumes after
+a stall. At most three packets wait to send; overflow drops the oldest and
+marks the next retained packet discontinuous instead of sending a catch-up
+burst that can overload the host decoder. The host's `Audio PCM queue full`
+warnings indicate unconsumed microphone PCM (there is no device/Teams sink
+yet); they do not by themselves mean the audio socket failed.
+
+The test client links the Apple Silicon Homebrew libopus installation at `/opt/homebrew/opt/opus`; update the Xcode header/library search paths for a different Homebrew prefix or architecture. Standalone codec and framing checks:
+
+```sh
+xcrun swiftc -default-isolation MainActor -I clients/osx/BeamIt/BeamIt/Opus -I /opt/homebrew/opt/opus/include -L /opt/homebrew/opt/opus/lib -Xlinker -rpath -Xlinker /opt/homebrew/opt/opus/lib clients/osx/BeamIt/BeamIt/BeamItAudioModels.swift clients/osx/BeamIt/BeamIt/BeamItAudioCodec.swift clients/osx/BeamIt/Tests/AudioProtocolTests.swift -o /tmp/beamit-audio-checks
+/tmp/beamit-audio-checks
 ```
 
 **macOS fullscreen.** **Window > Fullscreen** toggles native fullscreen for the focused stream, independently of the windowed scaling setting. Video fills the screen without stretching, with black bars when the aspect ratios differ; pointer coordinates and popup placement use the actual video rectangle. In fullscreen, press **Escape twice within one second** to return to a **1×** window, whether or not mouse capture is active. Any active capture is released. Key auto-repeat does not count as a second press. The first Escape is forwarded normally; the second is consumed locally and held host input is released. A normal fullscreen exit restores the previous windowed scale. Control+Option+G still releases capture without leaving fullscreen.
@@ -592,7 +638,7 @@ The previous 13.1 headers exceeded the development driver's maximum API 13.0. Wi
 
 ## Repository files
 
-The macOS client sources live in `clients/osx/BeamIt/BeamIt/`. `BeamItApp.swift` owns the app scene and menus, while `ContentView.swift` owns connection/source selection. `BeamItConnection.swift` handles signaling; its wire/source models and TLS certificate delegate live in `BeamItConnectionModels.swift` and `CertificatePinDelegate.swift`. Stream reception (`BeamItVideoStream.swift`), VideoToolbox decoding (`BeamItVideoDecoder.swift`), native window lifecycle (`BeamItStreamWindowController.swift`), aspect-fit layout (`BeamItStreamSurface.swift`), frame presentation (`BeamItFrameView.swift`), scaling-menu state (`BeamItScalingMenu.swift`) and anti-idle movement (`BeamItAntiIdle.swift`) are separate files. Small related models and private helpers stay with their owning component.
+The macOS client sources live in `clients/osx/BeamIt/BeamIt/`. `BeamItApp.swift` owns the app scene and menus, while `ContentView.swift` owns connection/source selection. `BeamItConnection.swift` handles signaling; its wire/source models and TLS certificate delegate live in `BeamItConnectionModels.swift` and `CertificatePinDelegate.swift`. Audio signaling, v2 framing, Opus encoding/decoding, microphone capture and local playback live in `BeamItAudioSession.swift`, `BeamItAudioModels.swift` and `BeamItAudioCodec.swift`, using the `Opus/` Clang module shim. Host window events are kept in `BeamItHostWindowList.swift` (model in `BeamItHostWindow.swift`), and `BeamItStreamManager.swift` owns stream windows and application connection modes. Stream reception (`BeamItVideoStream.swift`), VideoToolbox decoding (`BeamItVideoDecoder.swift`), native window lifecycle (`BeamItStreamWindowController.swift`), aspect-fit layout (`BeamItStreamSurface.swift`), frame presentation (`BeamItFrameView.swift`), scaling-menu state (`BeamItScalingMenu.swift`) and anti-idle movement (`BeamItAntiIdle.swift`) are separate files. Small related models and private helpers stay with their owning component.
 
 - `include/beamit/capture/Capturer.hpp` — common capture interface and target types
 - `include/beamit/capture/DxgiCapturer.hpp` and `src/capture/DxgiCapturer.cpp` — DXGI monitor capture backend

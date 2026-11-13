@@ -294,7 +294,8 @@ private:
         icon.uID = 1;
         icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         icon.uCallbackMessage = tray_message;
-        icon.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+        icon.hIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_BEAMIT), IMAGE_ICON,
+                                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
         const auto tip = L"BeamIt - port " + std::to_wstring(port_);
         wcscpy_s(icon.szTip, tip.c_str());
         if (!Shell_NotifyIconW(NIM_ADD, &icon)) throw std::runtime_error("Cannot add the BeamIt tray icon");

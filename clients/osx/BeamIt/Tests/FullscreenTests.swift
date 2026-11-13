@@ -46,6 +46,7 @@ final class BeamItInputHandler {
 }
 
 final class BeamItFrameView: NSView {
+    var screenshotPixelBuffer: CVPixelBuffer?
     var diagnostics = 0
     var inputHandler: BeamItInputHandler?
     func display(_ pixelBuffer: CVPixelBuffer, captureUS: UInt64) {}

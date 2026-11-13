@@ -86,6 +86,7 @@ void ClientApp::initialize() {
     window_ = xaml::Window();
     window_.Title(L"BeamIt");
     winrt::check_hresult(window_.as<IWindowNative>()->get_WindowHandle(&hwnd_));
+    apply_window_icon(hwnd_);
     const auto scale = GetDpiForWindow(hwnd_) / 96.0;
     window_.AppWindow().ResizeClient({static_cast<int32_t>(620 * scale), static_cast<int32_t>(820 * scale)});
 
@@ -631,7 +632,7 @@ bool ClientApp::add_tray() {
     data.uID = tray_icon_id;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     data.uCallbackMessage = tray_message;
-    data.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    data.hIcon = app_icon(false);
     wcscpy_s(data.szTip, L"BeamIt");
     if (!Shell_NotifyIconW(NIM_ADD, &data)) return false;
     data.uVersion = NOTIFYICON_VERSION_4;

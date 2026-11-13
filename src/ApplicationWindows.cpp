@@ -16,15 +16,12 @@ std::vector<ApplicationWindow> application_windows() {
                 return TRUE;
             }
             const int length = GetWindowTextLengthW(hwnd);
-            if (length == 0) {
-                return TRUE;
-            }
-            std::wstring title(static_cast<std::size_t>(length) + 1, L'\0');
+            std::wstring title(static_cast<std::size_t>(std::max(length, 0)) + 1, L'\0');
             const int copied = GetWindowTextW(hwnd, title.data(), static_cast<int>(title.size()));
-            if (copied == 0) {
+            if (copied == 0 && !IsWindow(hwnd)) {
                 return TRUE; // The window may disappear during enumeration.
             }
-            title.resize(copied);
+            title.resize(static_cast<std::size_t>(std::max(copied, 0)));
             DWORD pid{};
             GetWindowThreadProcessId(hwnd, &pid);
             RECT rect{};

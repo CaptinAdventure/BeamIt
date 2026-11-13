@@ -27,6 +27,7 @@ json::object video_json(const VideoParameters& video) {
         {"height", video.height},
         {"chroma_format", media::chroma_format_name(video.chroma_format_idc)},
         {"bit_depth", video.bit_depth},
+        {"color", json::object{{"primaries", "bt709"}, {"transfer", "srgb"}, {"matrix", "bt709"}, {"range", "limited"}}},
         {"frame_rate", video.frame_rate},
         {"bitrate_kbps", video.bitrate_kbps},
         {"max_bitrate_kbps", video.max_bitrate_kbps},

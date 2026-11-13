@@ -28,6 +28,37 @@ final class BeamItFrameView: NSView {
         trackingArea = area
     }
 
+    /// True when the host reports pointer shapes (PROTOCOL.md §5.9.11) instead of drawing the pointer.
+    var usesHostCursor = false
+    var cursorShape = "default" {
+        didSet {
+            guard usesHostCursor, cursorShape != oldValue else { return }
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+
+    private static let hiddenCursor = NSCursor(image: NSImage(size: NSSize(width: 1, height: 1)), hotSpot: .zero)
+
+    static func cursor(for shape: String) -> NSCursor {
+        switch shape {
+        case "text": return .iBeam
+        case "pointer": return .pointingHand
+        case "crosshair": return .crosshair
+        case "not-allowed": return .operationNotAllowed
+        case "move": return .openHand
+        case "ns-resize": return .resizeUpDown
+        case "ew-resize": return .resizeLeftRight
+        case "none": return hiddenCursor
+        // AppKit has no public wait/help/diagonal-resize cursors.
+        default: return .arrow
+        }
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if usesHostCursor { addCursorRect(bounds, cursor: Self.cursor(for: cursorShape)) }
+    }
+
     override func mouseMoved(with event: NSEvent) { inputHandler?.mouseMoved(event, in: self) }
     override func mouseDragged(with event: NSEvent) { inputHandler?.mouseMoved(event, in: self) }
     override func rightMouseDragged(with event: NSEvent) { inputHandler?.mouseMoved(event, in: self) }
@@ -80,6 +111,16 @@ final class BeamItFrameView: NSView {
         presentationScheduled = false
         frameLock.unlock()
         guard let pixelBuffer else { return }
+
+        // The stream is SDR; without explicit tags an HDR/EDR display may interpret the
+        // untagged buffer with the wrong primaries or transfer function.
+        if CVBufferCopyAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, nil) == nil {
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+            CVBufferSetAttachment(pixelBuffer, kCVImageBufferCGColorSpaceKey, CGColorSpace(name: CGColorSpace.sRGB)!, .shouldPropagate)
+            formatDescription = nil
+        }
 
         if let current = formatDescription,
            !CMVideoFormatDescriptionMatchesImageBuffer(current, imageBuffer: pixelBuffer) {

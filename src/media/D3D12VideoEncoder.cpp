@@ -1202,6 +1202,13 @@ HRESULT D3D12VideoEncoder::Impl::convert(const CapturedFrame& frame) {
         return result;
     }
 
+    // Pin the conversion to full-range sRGB RGB -> limited-range BT.709 YCbCr, matching the SPS VUI.
+    ComPtr<ID3D11VideoContext1> video_context1;
+    if (SUCCEEDED(video_context11.As(&video_context1))) {
+        video_context1->VideoProcessorSetStreamColorSpace1(processor.Get(), 0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        video_context1->VideoProcessorSetOutputColorSpace1(processor.Get(), DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+    }
+
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
     stream.pInputSurface = input_view.Get();

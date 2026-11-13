@@ -197,7 +197,8 @@ Lists visible, capturable top-level windows. `primary` marks windows that
 are candidates to be an application's main window (unowned, not tool
 windows). For `{"kind":"application"}` the host picks the largest primary
 candidate of that process, so several windows of one process may be
-`primary: true`.
+`primary: true`. A window is listed even when it has no title; in that case
+`title` is an empty string.
 `hwnd` is an opaque string; clients must echo it back unchanged.
 
 ### 5.3 `start_stream`
@@ -293,6 +294,7 @@ omit this additive field; clients must not assume a measured DPI in that case.
   "height": 1080,
   "chroma_format": "4:4:4",
   "bit_depth": 8,
+  "color": {"primaries": "bt709", "transfer": "srgb", "matrix": "bt709", "range": "limited"},
   "frame_rate": 60,
   "bitrate_kbps": 20000,
   "max_bitrate_kbps": 40000,
@@ -306,6 +308,12 @@ omit this additive field; clients must not assume a measured DPI in that case.
 * `codec_string` is the RFC 6381 string derived from the actual SPS, usable
   directly as WebCodecs `VideoDecoderConfig.codec`. Configure the decoder
   **without** `description` so it accepts Annex B input.
+* `color` describes the decoded image: `primaries`, `transfer`, `matrix`
+  and `range` (`"limited"`/`"full"`). The stream is always SDR; the host
+  currently reports `bt709`/`srgb`/`bt709`/`limited`, also signalled in the
+  SPS VUI, regardless of the host display's HDR state. Clients should tag
+  decoded frames with it instead of letting an HDR/EDR display guess.
+  Older hosts omit it; assume the same values.
 * `width`/`height` are the displayed (captured) size; `codedWidth`/
   `codedHeight` may be passed as the same values.
 * `generation` starts at 1 and increments on every encoder reconfiguration

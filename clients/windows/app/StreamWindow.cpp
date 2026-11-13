@@ -181,6 +181,7 @@ void StreamWindow::initialize() {
     window_ = xaml::Window();
     window_.Title(title());
     winrt::check_hresult(window_.as<IWindowNative>()->get_WindowHandle(&hwnd_));
+    apply_window_icon(hwnd_);
     focus_ = xaml::Controls::ContentControl();
     focus_.IsTabStop(true);
     focus_.UseSystemFocusVisuals(false);

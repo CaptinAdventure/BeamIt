@@ -10,6 +10,15 @@ final class BeamItVideoStream {
     var onInputError: ((String) -> Void)?
     var onVideoConfig: ((BeamItVideo) -> Void)?
     var onAttention: (() -> Void)?
+    var onCursorShape: ((String) -> Void)?
+    private(set) var cursorShape = "default"
+
+    /// Host pointer shape (PROTOCOL.md §5.9.11), applied by the client's own pointer.
+    func updateCursorShape(_ shape: String) {
+        guard shape != cursorShape else { return }
+        cursorShape = shape
+        onCursorShape?(shape)
+    }
     private(set) var attentionWindows = Set<String>()
 
     func updateAttention(hwnd: String, requesting: Bool) {
@@ -85,6 +94,7 @@ final class BeamItVideoStream {
         attentionWindows.removeAll()
         onAttention?()
         onAttention = nil
+        onCursorShape = nil
     }
 
     func handleStopped() {
@@ -164,7 +174,9 @@ final class BeamItVideoStream {
                     )
                 }
                 guard let decoder else { continue }
+                let color = video.color ?? .sdr
                 try decoder.decode(frame.payload, timestamp: frame.timestamp) { [weak self] image, captureUS in
+                    color.tag(image)
                     self?.onFrame?(image, captureUS)
                 }
             }

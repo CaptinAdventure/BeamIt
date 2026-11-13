@@ -104,7 +104,14 @@ std::vector<std::byte> h264_headers(
     sps.flag(true); // vui_parameters_present_flag
     sps.flag(false); // aspect_ratio_info_present_flag
     sps.flag(false); // overscan_info_present_flag
-    sps.flag(false); // video_signal_type_present_flag
+    // Fixed SDR description: limited-range BT.709 primaries/matrix with sRGB transfer (PROTOCOL.md §5.5).
+    sps.flag(true); // video_signal_type_present_flag
+    sps.bits(5, 3); // video_format (unspecified)
+    sps.flag(false); // video_full_range_flag
+    sps.flag(true); // colour_description_present_flag
+    sps.bits(1, 8); // colour_primaries (BT.709)
+    sps.bits(13, 8); // transfer_characteristics (sRGB)
+    sps.bits(1, 8); // matrix_coefficients (BT.709)
     sps.flag(false); // chroma_loc_info_present_flag
     sps.flag(true); // timing_info_present_flag
     sps.bits(1, 32); // num_units_in_tick
@@ -255,7 +262,14 @@ std::vector<std::byte> hevc_headers(
     sps.flag(true); // vui_parameters_present_flag
     sps.flag(false); // aspect_ratio_info_present_flag
     sps.flag(false); // overscan_info_present_flag
-    sps.flag(false); // video_signal_type_present_flag
+    // Fixed SDR description: limited-range BT.709 primaries/matrix with sRGB transfer (PROTOCOL.md §5.5).
+    sps.flag(true); // video_signal_type_present_flag
+    sps.bits(5, 3); // video_format (unspecified)
+    sps.flag(false); // video_full_range_flag
+    sps.flag(true); // colour_description_present_flag
+    sps.bits(1, 8); // colour_primaries (BT.709)
+    sps.bits(13, 8); // transfer_characteristics (sRGB)
+    sps.bits(1, 8); // matrix_coefficients (BT.709)
     sps.flag(false); // chroma_loc_info_present_flag
     sps.flag(false); // neutral_chroma_indication_flag
     sps.flag(false); // field_seq_flag
