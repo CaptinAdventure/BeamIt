@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct BeamItApp: App {
     @AppStorage("clipboardSyncEnabled") private var clipboardSyncEnabled = false
+    @AppStorage("showHostCursor") private var showHostCursor = false
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -15,6 +16,13 @@ struct BeamItApp: App {
                 }
                 .disabled(BeamItScalingMenu.shared.controller == nil)
             }
+            if !BeamItScalingMenu.shared.streamWindowIsKey {
+                CommandMenu("Connection") {
+                    Toggle("Show Host Cursor in Video", isOn: $showHostCursor)
+                    Toggle("Clipboard Sync", isOn: $clipboardSyncEnabled)
+                }
+            }
+            if BeamItScalingMenu.shared.streamWindowIsKey {
             CommandMenu("Stream") {
                 Button("Add New Stream") {
                     BeamItMainWindow.show()
@@ -73,6 +81,7 @@ struct BeamItApp: App {
                 Button("Send Text to Target…") {
                     BeamItStreamWindowController.presentSendTextForActiveStream()
                 }
+            }
             }
         }
     }

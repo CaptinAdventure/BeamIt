@@ -1,5 +1,6 @@
 #include "beamit/media/OpusAudio.hpp"
 #include "host/AudioEndpoint.hpp"
+#include "host/BeamItMicrophoneOutput.hpp"
 #include "host/wss/AudioSocket.hpp"
 #include "net/AudioProtocol.hpp"
 
@@ -7,8 +8,10 @@
 
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <limits>
 #include <future>
+#include <mutex>
 #include <thread>
 
 using namespace beamit;
@@ -36,6 +39,54 @@ std::vector<float> tone(const media::AudioConfiguration& configuration) {
     }
     return pcm;
 }
+
+struct MicrophoneDeviceState {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<host::BeamItMicPacket> written;
+    bool first_write_started{};
+    bool block_first_write{true};
+    bool released{};
+};
+
+class RecordingMicrophoneDevice final : public host::BeamItMicrophoneDevice {
+public:
+    explicit RecordingMicrophoneDevice(std::shared_ptr<MicrophoneDeviceState> state) : state_(std::move(state)) {}
+    void acquire() override {}
+    void write(const host::BeamItMicPacket& packet) override {
+        std::unique_lock lock(state_->mutex);
+        if (state_->written.empty()) {
+            state_->first_write_started = true;
+            state_->changed.notify_all();
+            state_->changed.wait(lock, [&] { return !state_->block_first_write; });
+        }
+        state_->written.push_back(packet);
+        state_->changed.notify_all();
+    }
+    void release() noexcept override {
+        std::lock_guard lock(state_->mutex);
+        state_->released = true;
+        state_->changed.notify_all();
+    }
+private:
+    std::shared_ptr<MicrophoneDeviceState> state_;
+};
+
+struct FailedMicrophoneState {
+    std::atomic<unsigned> created{};
+    std::atomic<unsigned> writes{};
+    std::atomic<unsigned> errors{};
+};
+
+class BusyMicrophoneDevice final : public host::BeamItMicrophoneDevice {
+public:
+    explicit BusyMicrophoneDevice(std::shared_ptr<FailedMicrophoneState> state) : state_(std::move(state)) {}
+    void acquire() override { throw std::runtime_error("device busy"); }
+    void write(const host::BeamItMicPacket&) override { ++state_->writes; }
+    void release() noexcept override {}
+private:
+    std::shared_ptr<FailedMicrophoneState> state_;
+};
 
 } // namespace
 
@@ -206,4 +257,80 @@ TEST_CASE("Audio submission queues reject overload instead of growing", "[audio]
     }
     CHECK(pipeline.submit_pcm(pcm) == host::AudioSubmitResult::QueueFull);
     CHECK_FALSE(pipeline.submit_encoded({.payload = payload}));
+}
+
+TEST_CASE("BeamIt microphone output converts PCM and preserves discontinuities on overflow", "[audio]") {
+    CHECK(host::microphone_sample_to_pcm16(-1.0f) == -32768);
+    CHECK(host::microphone_sample_to_pcm16(-0.5f) == -16384);
+    CHECK(host::microphone_sample_to_pcm16(0.5f) == 16384);
+    CHECK(host::microphone_sample_to_pcm16(1.0f) == 32767);
+    CHECK(host::microphone_sample_to_pcm16(std::numeric_limits<float>::infinity()) == 0);
+
+    const auto state = std::make_shared<MicrophoneDeviceState>();
+    host::BeamItMicrophoneOutput output({}, {}, [state] {
+        return std::make_unique<RecordingMicrophoneDevice>(state);
+    });
+    const auto packet = [](std::uint64_t sequence) {
+        return host::AudioPcmPacket{
+            .sequence = sequence,
+            .sample_timestamp = sequence * BEAMIT_MIC_FRAMES_PER_PACKET,
+            .samples = std::vector<float>(BEAMIT_MIC_FRAMES_PER_PACKET * BEAMIT_MIC_CHANNELS, 0.5f),
+        };
+    };
+
+    output.submit(packet(0));
+    {
+        std::unique_lock lock(state->mutex);
+        REQUIRE(state->changed.wait_for(lock, 3s, [&] { return state->first_write_started; }));
+    }
+    output.submit(packet(1));
+    output.submit(packet(2));
+    output.submit(packet(3));
+    output.submit(packet(4));
+    {
+        std::lock_guard lock(state->mutex);
+        state->block_first_write = false;
+        state->changed.notify_all();
+    }
+    {
+        std::unique_lock lock(state->mutex);
+        REQUIRE(state->changed.wait_for(lock, 3s, [&] { return state->written.size() == 4; }));
+    }
+    output.stop();
+
+    REQUIRE(state->written.size() == 4);
+    CHECK(state->written[0].header.sequence == 0);
+    CHECK(state->written[1].header.sequence == 2);
+    CHECK((state->written[1].header.flags & BeamItMicPcmDiscontinuity) != 0);
+    CHECK(state->written[2].header.sequence == 3);
+    CHECK(state->written[3].header.sequence == 4);
+    CHECK(state->written[1].header.sample_timestamp == 960);
+    CHECK(state->written[1].header.frame_count == BEAMIT_MIC_FRAMES_PER_PACKET);
+    CHECK(state->written[1].samples.front() == 16384);
+    CHECK(state->released);
+
+    auto invalid = packet(1);
+    invalid.sample_timestamp = 0;
+    CHECK_THROWS_AS(host::make_beamit_mic_packet(invalid), std::invalid_argument);
+    invalid = packet(0);
+    invalid.samples.pop_back();
+    CHECK_THROWS_AS(host::make_beamit_mic_packet(invalid), std::invalid_argument);
+}
+
+TEST_CASE("BeamIt microphone output reports a busy device without fallback", "[audio]") {
+    const auto state = std::make_shared<FailedMicrophoneState>();
+    std::string reported_error;
+    host::BeamItMicrophoneOutput output({}, [&](std::string message) {
+        reported_error = std::move(message);
+        ++state->errors;
+    }, [state] {
+        ++state->created;
+        return std::make_unique<BusyMicrophoneDevice>(state);
+    });
+    REQUIRE(wait_for([&] { return state->errors.load() == 1; }));
+    CHECK(output.error() == "device busy");
+    CHECK(reported_error == "device busy");
+    CHECK(state->created == 1);
+    CHECK(state->writes == 0);
+    output.stop();
 }

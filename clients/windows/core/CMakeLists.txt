@@ -13,7 +13,8 @@ else()
 endif()
 
 add_library(BeamItWindowsCore STATIC FrameProtocol.cpp)
-target_include_directories(BeamItWindowsCore PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" "${beamit_root}/src")
+target_include_directories(BeamItWindowsCore PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" "${beamit_root}/src"
+    "${beamit_root}/include")
 
 if(MSVC)
     target_compile_options(BeamItWindowsCore PRIVATE /W4 /permissive- /Zc:__cplusplus)
@@ -28,7 +29,21 @@ if(WIN32)
     CPMAddPackage(NAME spdlog GIT_TAG v1.15.3 GITHUB_REPOSITORY gabime/spdlog
         OPTIONS "SPDLOG_FMT_EXTERNAL OFF")
 
+    CPMAddPackage(
+        NAME opus
+        GIT_TAG v1.5.2
+        GITHUB_REPOSITORY xiph/opus
+        OPTIONS
+            "BUILD_TESTING OFF"
+            "OPUS_BUILD_TESTING OFF"
+            "OPUS_BUILD_PROGRAMS OFF"
+            "OPUS_INSTALL_PKG_CONFIG_MODULE OFF"
+            "OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF"
+            "OPUS_STATIC_RUNTIME OFF"
+    )
+
     target_sources(BeamItWindowsCore PRIVATE
+        AudioClient.cpp
         ClientProtocol.cpp
         ClientSession.cpp
         ClipboardManager.cpp
@@ -38,12 +53,27 @@ if(WIN32)
         VideoPipeline.cpp
         "${beamit_root}/src/net/ClipboardBulk.cpp"
         "${beamit_root}/src/net/Crypto.cpp"
+        "${beamit_root}/src/media/OpusAudio.cpp"
         "${beamit_root}/src/host/Clipboard.cpp"
         "${beamit_root}/src/host/ClipboardBulkStorage.cpp"
     )
     target_compile_definitions(BeamItWindowsCore PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
-    target_link_libraries(BeamItWindowsCore PUBLIC Boost::json beamit_wintls ws2_32 d3d11 dxgi mf mfplat mfuuid ole32
-        windowscodecs normaliz spdlog user32 shell32 advapi32 gdi32)
+    target_link_libraries(BeamItWindowsCore PUBLIC 
+    		Boost::json 
+    		beamit_wintls 
+    		opus 
+    		ws2_32 
+    		d3d11 
+    		dxgi 
+    		mf 
+    		mfplat 
+    		mfuuid
+    		ole32 
+    		mmdevapi 
+    		avrt 
+    		winmm
+ 			windowscodecs
+ 			spdlog user32 shell32 advapi32 gdi32)
     add_executable(BeamItDecoderProbe DecoderProbeMain.cpp)
     target_link_libraries(BeamItDecoderProbe PRIVATE BeamItWindowsCore)
 
@@ -52,11 +82,11 @@ if(WIN32)
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$<JOIN:$<REMOVE_DUPLICATES:$<TARGET_PROPERTY:BeamItWindowsCore,INTERFACE_INCLUDE_DIRECTORIES>;$<TARGET_PROPERTY:Boost::json,INTERFACE_INCLUDE_DIRECTORIES>;$<TARGET_PROPERTY:beamit_wintls,INTERFACE_INCLUDE_DIRECTORIES>>,;>;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$<JOIN:$<REMOVE_DUPLICATES:$<TARGET_PROPERTY:BeamItWindowsCore,INTERFACE_INCLUDE_DIRECTORIES>;$<TARGET_PROPERTY:Boost::json,INTERFACE_INCLUDE_DIRECTORIES>;$<TARGET_PROPERTY:beamit_wintls,INTERFACE_INCLUDE_DIRECTORIES>;$<TARGET_PROPERTY:opus,INTERFACE_INCLUDE_DIRECTORIES>>,;>;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>$<JOIN:$<TARGET_PROPERTY:BeamItWindowsCore,INTERFACE_COMPILE_DEFINITIONS>,;>;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$<TARGET_LINKER_FILE:BeamItWindowsCore>;$<TARGET_LINKER_FILE:Boost::json>;$<TARGET_LINKER_FILE:Boost::container>;$<TARGET_LINKER_FILE:spdlog>;ws2_32.lib;crypt32.lib;secur32.lib;bcrypt.lib;windowscodecs.lib;normaliz.lib;advapi32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$<TARGET_LINKER_FILE:BeamItWindowsCore>;$<TARGET_LINKER_FILE:Boost::json>;$<TARGET_LINKER_FILE:Boost::container>;$<TARGET_LINKER_FILE:opus>;$<TARGET_LINKER_FILE:spdlog>;ws2_32.lib;crypt32.lib;secur32.lib;bcrypt.lib;mmdevapi.lib;avrt.lib;winmm.lib;windowscodecs.lib;windowscodecs.lib;normaliz.lib;advapi32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 </Project>

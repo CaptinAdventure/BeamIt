@@ -1293,9 +1293,12 @@ host-to-client capture tracks and exactly one client-to-host microphone
 route. Capture tracks have independent codecs, queues, counters and
 lifetimes; they do not create virtual microphones. The host automatically
 captures Windows playback for each selected outgoing track using event-driven
-WASAPI process loopback. It does **not** render incoming audio or expose a
-microphone to Teams; incoming decoded PCM is available for future device I/O.
-No synthetic source runs in the production host.
+WASAPI process loopback. Incoming microphone PCM is sent to the installed
+BeamIt Microphone capture-only recording endpoint, which applications such as
+Teams can select as their microphone. This route does not use a physical
+microphone or render to a speaker. The driver must be installed and its
+exclusive producer lease available; no synthetic source runs in the
+production host.
 
 #### 5.16.1 Start and stop
 
@@ -1348,9 +1351,16 @@ overrides. Clients must check `audio_version` before using the audio socket.
 
 The offer starts with no outgoing capture tracks; it establishes only the
 single incoming microphone route. This route lasts for the audio connection,
-independent of which video streams or outgoing audio tracks are stopped.
-The host currently decodes microphone PCM only; selecting/feeding an actual
-virtual-microphone device remains future work.
+independent of which video streams or outgoing audio tracks are stopped. The
+host decodes microphone PCM and forwards 48 kHz stereo, 10 ms packets to the
+BeamIt Microphone device. It converts float samples to clipped signed PCM16,
+preserving sequence, sample timestamp and discontinuity metadata. Its
+three-packet user-mode queue drops stale packets and marks the next retained
+packet discontinuous. If the device is missing, busy or inaccessible, the
+host returns `audio_failed`; it does not fall back to a physical microphone
+or another endpoint. A recording application must have an active stream on
+the virtual device; if the driver cannot accept PCM, the host ends audio with
+`reason: "audio_failed"` while video and control remain usable.
 
 The URL token is 32 random bytes, base64url, single-use, and valid for ten
 seconds while the issuing authenticated session remains open. Invalid,
@@ -1379,7 +1389,9 @@ ends, with reason `token_expired`, `disconnected`, `invalid_packet`,
 The audio socket closes; video/control remain usable. Ending, revoking or
 superseding the signaling session also stops audio (`session_ended`);
 delivery of that notification during signaling teardown is not guaranteed.
-If the host PCM endpoint is unavailable, `start_audio` returns `audio_failed`.
+If the BeamIt Microphone endpoint is unavailable or cannot acquire its
+exclusive producer lease, `start_audio` returns `audio_failed`; video and
+control remain usable.
 
 #### Capture track selection
 

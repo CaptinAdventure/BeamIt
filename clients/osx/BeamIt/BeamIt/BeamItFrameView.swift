@@ -76,6 +76,14 @@ final class BeamItFrameView: NSView {
     private var formatDescription: CMVideoFormatDescription?
     private(set) var screenshotPixelBuffer: CVPixelBuffer?
 
+    /// Lets the layer exceed SDR white for PQ/HLG streams.
+    var isHDR = false {
+        didSet {
+            (layer as? AVSampleBufferDisplayLayer)?.wantsExtendedDynamicRangeContent = isHDR
+            formatDescription = nil
+        }
+    }
+
     override var wantsUpdateLayer: Bool { true }
 
     override func makeBackingLayer() -> CALayer {
@@ -114,7 +122,7 @@ final class BeamItFrameView: NSView {
 
         // The stream is SDR; without explicit tags an HDR/EDR display may interpret the
         // untagged buffer with the wrong primaries or transfer function.
-        if CVBufferCopyAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, nil) == nil {
+        if !isHDR, CVBufferCopyAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, nil) == nil {
             CVBufferSetAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
             CVBufferSetAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB, .shouldPropagate)
             CVBufferSetAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)

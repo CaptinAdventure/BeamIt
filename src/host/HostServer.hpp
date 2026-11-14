@@ -1,6 +1,7 @@
 #pragma once
 
 #include "host/TlsIdentity.hpp"
+#include "host/BeamItMicrophoneOutput.hpp"
 #include "host/AudioEndpoint.hpp"
 #include "host/AudioCapture.hpp"
 #include "beamit/capture/Capturer.hpp"
@@ -33,8 +34,9 @@ struct HostServerOptions {
     bool elevate_input{};
     std::shared_ptr<input::ElevatedInput> elevated_input;
     std::shared_ptr<HostControl> control;
-    // Capture feeds outgoing tracks; future microphone rendering consumes incoming packet-sized PCM here.
+    // Capture feeds outgoing tracks; incoming microphone PCM is sent to the BeamIt virtual microphone.
     std::shared_ptr<AudioEndpoint> audio{std::make_shared<AudioEndpoint>()};
+    BeamItMicrophoneDeviceFactory make_microphone_device{make_beamit_microphone_device};
     std::function<std::unique_ptr<AudioCapture>(AudioTrack, std::shared_ptr<AudioEndpoint>, AudioCaptureCallbacks)>
         make_audio_capture{make_wasapi_audio_capture};
     std::function<std::unique_ptr<capture::Capturer>(CaptureBackend)> make_capturer;

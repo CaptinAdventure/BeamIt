@@ -1,3 +1,4 @@
+import AppKit
 import CommonCrypto
 import CryptoKit
 import Foundation
@@ -75,6 +76,27 @@ final class BeamItConnection {
         }
     }
 
+    /// Decodable codecs, most preferred first (PROTOCOL.md §5.3). `BeamItPreferredCodec` in
+    /// UserDefaults marks the user's explicit choice. Limits are conservative VideoToolbox figures.
+    static func codecCapabilities() -> [[String: Any]] {
+        let preferred = UserDefaults.standard.string(forKey: "BeamItPreferredCodec")
+        let sdr = ["primaries": "bt709", "transfer": "srgb", "matrix": "bt709"]
+        let hdr = [["primaries": "bt2020", "transfer": "pq", "matrix": "bt2020"],
+                   ["primaries": "bt2020", "transfer": "hlg", "matrix": "bt2020"]]
+        // HDR needs an EDR-capable display; H.264 stays 8-bit SDR (no hardware 10-bit decode).
+        let hdrDisplay = NSScreen.screens.contains { $0.maximumPotentialExtendedDynamicRangeColorComponentValue > 1 }
+        let tenBitColors = hdrDisplay ? hdr + [sdr] : [sdr]
+        var codecs: [(String, Int, Int, Int, Int, [[String: String]])] = []
+        if AV1Config.isHardwareDecodeSupported { codecs.append(("av1", 7680, 4320, 200_000, 10, tenBitColors)) }
+        codecs.append(("h265", 7680, 4320, 200_000, 10, tenBitColors))
+        codecs.append(("h264", 4096, 2304, 100_000, 8, [sdr]))
+        return codecs.map { codec, width, height, bitrate, depth, colors in
+            ["codec": codec, "max_width": width, "max_height": height,
+             "max_frame_rate": 120, "max_bitrate_kbps": bitrate, "max_bit_depth": depth,
+             "color_spaces": colors, "user_preferred": codec == preferred]
+        }
+    }
+
     func startStream(source: BeamItSource) async throws -> BeamItVideoStream {
         let sourceObject: [String: Any]
         switch source {
@@ -90,13 +112,14 @@ final class BeamItConnection {
 
         let response = try await request(
             type: "start_stream",
-            fields: ["source": sourceObject, "input": ["cursor": "client"]],
+            fields: ["source": sourceObject, "input": ["cursor": UserDefaults.standard.bool(forKey: "showHostCursor") ? "video" : "client"], "video": ["codecs": Self.codecCapabilities()]],
             expectedType: "stream_offer"
         )
         let data = try JSONSerialization.data(withJSONObject: response)
         let offer = try JSONDecoder().decode(BeamItStreamOffer.self, from: data)
         guard offer.tokenExpiresInMS > 0, offer.video.width > 0, offer.video.height > 0,
-              ["h264", "h265"].contains(offer.video.codec)
+              ["h264", "h265", "av1"].contains(offer.video.codec),
+              offer.video.codec != "av1" || AV1Config.isHardwareDecodeSupported
         else {
             throw ConnectionError.invalidMessage
         }

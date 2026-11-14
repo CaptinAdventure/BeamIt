@@ -52,9 +52,9 @@ The host serves the authenticated **WSS protocol** in [`PROTOCOL.md`](PROTOCOL.m
 
 ### Current near-term goal
 
-The immediate goal is to mirror **Microsoft Teams** to a custom macOS client, with its main and external/secondary windows presented as native local windows. A Windows client follows. Taskbar attention on Windows and Dock attention on macOS are in scope; native notification forwarding is not required for this milestone.
+The immediate goal is to mirror **Microsoft Teams** to a custom macOS client, with its main and external/secondary windows presented as native local windows, and validate the implemented two-way audio path with the BeamIt Microphone device. The Windows client is also implemented; its Teams, driver and cross-machine behavior still need interactive validation. Taskbar attention on Windows and Dock attention on macOS are in scope; native notification forwarding is not required.
 
-Both capture backends expose frames to a generic encoder interface. Single-window and desktop streams can be viewed with the `HTML/` test client. Next, define the macOS client and window/control protocol, then implement WGC application-window tracking beyond a single HWND. Broader GPU/driver coverage still needs testing. Audio and gamepad support remain out of scope for this milestone.
+Both capture backends expose frames to a generic encoder interface. Single-window and desktop streams can be viewed with the `HTML/` test client. Next, continue the macOS client and window/control integration, then validate WGC application-window behavior with Teams. Broader GPU/driver coverage and audio-device runtime behavior still need testing. Gamepad support remains out of scope.
 
 ## Project goal
 
@@ -228,19 +228,20 @@ advertised JSON duration are derived from sample rate and packet duration.
 Clients must parse the offer rather than assume those defaults.
 
 Outgoing tracks automatically capture Windows playback using event-driven
-WASAPI process loopback. Incoming audio is decoded to PCM only: playback,
-virtual-microphone redirection into Teams and audio playback on the macOS
-client are independent. The macOS client can decode host tracks for local
-playback and sends its microphone through the host decoder; the host still
-does not route that PCM into Teams. The production host has no synthetic
-audio source.
+WASAPI process loopback. Incoming microphone audio is decoded to PCM and sent
+to the BeamIt Microphone recording device for applications such as Teams; it
+is never rendered to a speaker or redirected to a physical microphone. The
+macOS client plays host tracks locally and sends its microphone through this
+host route. The production host has no synthetic audio source.
 
 The source-built **BeamIt Microphone** driver subproject is documented in
 [`drivers/BeamItMicrophone`](drivers/BeamItMicrophone/README.md). It now includes
 a capture-only PortCls/WaveRT endpoint, exclusive producer leases, bounded PCM
 buffering, an INF/catalog package and a local injection/deployment/test utility.
-There is no external virtual-cable dependency. The package remains unsigned;
-loaded-driver/Teams validation and host integration are still pending.
+There is no external virtual-cable dependency. The host bridge is implemented,
+but the driver package remains unsigned and loaded-driver/Teams validation is
+still pending. A recording application must have an active stream on
+**BeamIt Microphone** to receive injected audio.
 
 Clients first use `start_audio` and open the offered socket. Then
 `start_audio_track` explicitly selects `source.kind = application` with a PID
@@ -273,8 +274,17 @@ accepts exactly one packet of normalized, interleaved float PCM for a host
 capture track, returning
 `Accepted`, `NotConnected` or `QueueFull`; `receive_pcm` returns decoded
 `AudioPcmPacket`s from the single microphone route, with sequence/sample
-timestamp/discontinuity metadata. Submitting host PCM to that incoming
-microphone ID throws instead of mixing directions.
+timestamp/discontinuity metadata. The host sends that route to
+`\\.\BeamItMicCtl` on a dedicated output worker: the installed BeamIt
+Microphone driver must be available and its exclusive producer lease idle.
+Packets must be 48 kHz stereo, 10 ms PCM; float samples are clipped and
+converted to signed PCM16, preserving sequence, sample timestamp and
+discontinuity. The three-packet user-mode queue drops stale packets and marks
+the next retained packet discontinuous. A missing or busy device reports
+`audio_failed` and ends only audio; video is unaffected. No physical
+microphone or speaker fallback is used. The lease is explicitly released when
+the audio socket ends, with handle cleanup as a final safeguard. Submitting
+host PCM to that incoming microphone ID throws instead of mixing directions.
 Format errors throw explicitly. The WASAPI capture worker feeds this endpoint;
 do not also inject synthetic PCM into a live capture track. Real-time device
 callbacks should not call these locking/allocating APIs directly.
@@ -411,6 +421,8 @@ xcrun swiftc -default-isolation MainActor -parse-as-library clients/osx/BeamIt/B
 
 **macOS color and HDR.** The client tags every decoded frame with the host's `color` description (PROTOCOL.md §5.5; SDR BT.709/sRGB when absent). For HDR streams (`pq`/`hlg` transfer, bit depth above 8) it asks VideoToolbox for native 10-bit YCbCr matching `chroma_format` and enables extended dynamic range on the display layer; this is re-evaluated on each `stream_config`. In `start_stream` the client advertises each codec's `max_bit_depth` and `color_spaces` (PROTOCOL.md §5.3): BT.2020 PQ and HLG then SDR for H.265/AV1 when a connected screen supports extended dynamic range, SDR only otherwise and for H.264. The host does not parse or send HDR yet, so the HDR path is untested, and screenshots are still exported as 8-bit sRGB.
 
+**macOS host cursor.** The checkable **Connection > Show Host Cursor in Video** item (default off) chooses `input.cursor` (PROTOCOL.md §5.9.11) for streams started afterwards: on requests `"video"` (host pointer drawn into the video), off requests `"client"` (the client draws its own pointer). It is read at `start_stream`, so open streams are unaffected. The menu bar shows the **Connection** menu (this item and Clipboard Sync) while the source-selection window is focused and the **Stream** menu while a stream window is focused; the two are never shown together.
+
 **macOS AV1.** The client can decode `codec: "av1"` through VideoToolbox, which is hardware-only (Apple silicon with an AV1 decoder, M3/A17 Pro or later); offers are rejected otherwise. It decodes the OBU framing defined in PROTOCOL.md §7 and builds the `av1C` record from the host's `codec_string` (`av01.P.LLT.DD`) and `chroma_format`. Every `start_stream` sends the ordered `video.codecs` list (§5.3: AV1 only when hardware decoding is available, then H.265, then H.264; set the `BeamItPreferredCodec` default to `av1`, `h265` or `h264` to mark the user's choice). The host does not parse `video.codecs` or send AV1 yet, so this is untested end to end.
 
 **macOS screenshots.** Focus a stream and choose **Stream > Save PNG Screenshot…**, then choose a file location. This saves the latest presented decoded frame at its original video resolution, regardless of window scaling or fullscreen, without borders, letterboxing or separately streamed popup windows. The frame is frozen when the command is selected. No screen-recording permission or host protocol change is needed; the client retains one presented GPU frame and converts it only on export. Export checks:
@@ -439,7 +451,7 @@ brew install opus
 xcodebuild -project clients/osx/BeamIt/BeamIt.xcodeproj -scheme BeamIt -destination 'platform=macOS' build
 ```
 
-In the connected source picker, enable **Enable audio and microphone**, then explicitly add **Desktop Audio** or an application. If the picker was hidden after opening a video stream, reopen it with **Stream > Add New Stream**. Desktop audio is exclusive with application tracks; video streams do not start or stop audio tracks. Choose distinct application process trees (not a parent and its child) to avoid double capture. The first enable requests macOS microphone permission and starts the host's incoming microphone route. The host currently decodes that stream but does not feed it to Teams. Outgoing host audio tracks play locally. Audio is independent of video and remains active until stopped or the authenticated session ends.
+In the connected source picker, enable **Enable audio and microphone**, then explicitly add **Desktop Audio** or an application. If the picker was hidden after opening a video stream, reopen it with **Stream > Add New Stream**. Desktop audio is exclusive with application tracks; video streams do not start or stop audio tracks. Choose distinct application process trees (not a parent and its child) to avoid double capture. The first enable requests macOS microphone permission and starts the host's incoming microphone route. The host forwards decoded microphone PCM to the BeamIt Microphone recording driver for applications such as Teams. Outgoing host audio tracks play locally. Audio is independent of video and remains active until stopped or the authenticated session ends.
 
 Microphone sends are paced at the offered Opus packet duration, even when a
 macOS capture callback supplies multiple packets or the sender resumes after

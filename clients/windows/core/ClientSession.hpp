@@ -37,6 +37,10 @@ struct StreamCallbacks {
     std::function<void(const SessionError&)> failed;
 };
 
+struct AudioCallbacks {
+    // Audio packets run on the network thread; implementations must enqueue quickly.
+    std::function<void(const net::protocol::AudioPacket&, const media::AudioConfiguration&)> packet;
+    std::function<void(const SessionError&)> failed;
 // Bulk callbacks run on the network thread. A binary message is valid only during the callback.
 struct BulkCallbacks {
     std::function<void(std::span<const std::byte>)> message;
@@ -78,6 +82,11 @@ public:
     // Drops pictures until the next key frame and asks the host for one, e.g. after a decoder error.
     void restart_stream_decoding(const std::string& stream_id);
 
+    void open_audio(const AudioOffer& offer, AudioCallbacks callbacks, Completion<void> opened);
+    void configure_audio_track(AudioTrackConfiguration track);
+    void remove_audio_track(std::uint32_t track_id);
+    void send_audio_packet(std::vector<std::byte> packet);
+    void close_audio();
     // Opens one session-bound bulk socket at a same-authority path such as /bulk/{id}?token=...
     void open_bulk(std::string target, std::chrono::milliseconds token_lifetime, BulkCallbacks callbacks,
                    Completion<void> opened);

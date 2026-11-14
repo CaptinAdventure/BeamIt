@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AppUtil.hpp"
+#include "AudioClient.hpp"
 #include "ClientSession.hpp"
 #include "ClipboardManager.hpp"
 #include "HostWindows.hpp"
@@ -42,6 +43,9 @@ private:
     void on_connected();
     void end_session(std::optional<std::string> error);
     void handle_message(const json::object& message);
+    void start_audio();
+    void stop_audio(bool notify_host);
+    void audio_failed(std::string message);
     void clipboard_context();
     void clipboard_status(ClipboardManager::Status status);
     winrt::fire_and_forget confirm_clipboard(std::uint32_t roots, std::uint64_t bytes, std::function<void(bool)> done);
@@ -60,6 +64,8 @@ private:
 
     Settings settings_;
     std::unique_ptr<Session> session_;
+    std::shared_ptr<AudioClient> audio_client_;
+    std::string audio_id_;
     std::unique_ptr<ClipboardManager> clipboard_;
     bool connecting_{};
     HostWindowList host_windows_;
@@ -91,6 +97,10 @@ private:
     winrt::Microsoft::UI::Xaml::Controls::TextBlock applications_count_{nullptr};
     winrt::Microsoft::UI::Xaml::Controls::TextBox search_box_{nullptr};
     winrt::Microsoft::UI::Xaml::Controls::ComboBox mode_box_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::ComboBox audio_source_box_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::Button audio_button_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::Button stop_audio_button_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::TextBlock audio_status_{nullptr};
     winrt::Microsoft::UI::Xaml::Controls::TextBlock clipboard_text_{nullptr};
     winrt::Microsoft::UI::Xaml::Controls::Button clipboard_cancel_{nullptr};
     winrt::Microsoft::UI::Xaml::Controls::ContentDialog clipboard_dialog_{nullptr};

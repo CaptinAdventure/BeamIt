@@ -7,6 +7,8 @@ import {
   base64UrlEncode,
   computeAuthProofs,
   parseVideoFrame,
+  parseAudioPacket,
+  createAudioPacket,
   BeamItClient,
   bindBrowserInput,
 } from "./beamit.js";
@@ -72,6 +74,28 @@ test("video frame parser rejects malformed headers and ignores unknown message t
   assert.equal(parseVideoFrame(Uint8Array.of(1, 2)), null);
 });
 
+test("version 2 Opus envelopes use network byte order and reject malformed packets", () => {
+  const packet = createAudioPacket({
+    trackId: 7,
+    frameSize: 480,
+    sequence: 3n,
+    samples: Uint8Array.of(0x12, 0x34),
+    discontinuity: true,
+  });
+  const parsed = parseAudioPacket(packet);
+  assert.equal(parsed.trackId, 7);
+  assert.equal(parsed.frameSize, 480);
+  assert.equal(parsed.sequence, 3n);
+  assert.equal(parsed.sampleTimestamp, 1440n);
+  assert.equal(parsed.discontinuity, true);
+  assert.deepEqual(parsed.payload, Uint8Array.of(0x12, 0x34));
+
+  const invalid = packet.slice();
+  invalid[0] = 1;
+  assert.throws(() => parseAudioPacket(invalid), /version 2/);
+  assert.throws(() => parseAudioPacket(packet.subarray(0, 32)), /size/);
+});
+
 class FakeTarget extends EventTarget {
   fire(type, properties = {}) {
     const event = new Event(type, { cancelable: true });
@@ -90,13 +114,105 @@ class FakeSocket extends FakeTarget {
     this.url = url;
     FakeSocket.instances.push(this);
   }
-  send(text) { this.sent.push(JSON.parse(text)); }
+  send(text) { this.sent.push(typeof text === "string" ? JSON.parse(text) : text); }
   open() { this.readyState = 1; this.fire("open"); }
   receive(message) { this.fire("message", { data: JSON.stringify(message) }); }
+  receiveBinary(data) { this.fire("message", { data }); }
   close(code = 1000, reason = "") { this.readyState = 3; this.fire("close", { code, reason }); }
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+const opusConfiguration = {
+  sampleRate: 48000, channels: 2, frameSize: 480, packetDuration: "PT0.01S",
+  useFec: false, application: "VOIP",
+};
+
+class FakeAudioContext {
+  constructor({ sampleRate }) {
+    this.sampleRate = sampleRate;
+    this.currentTime = 0;
+    this.state = "running";
+    this.destination = {};
+    this.audioWorklet = { addModule: async () => {} };
+  }
+  resume() { return Promise.resolve(); }
+  close() { this.state = "closed"; return Promise.resolve(); }
+  createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+  createBuffer(channels, frames, sampleRate) {
+    const data = Array.from({ length: channels }, () => new Float32Array(frames));
+    return { sampleRate, getChannelData: (channel) => data[channel] };
+  }
+  createBufferSource() { return { connect() {}, start() {}, stop() {} }; }
+}
+
+class FakeAudioData {
+  constructor(init) {
+    Object.assign(this, init);
+    this.closed = false;
+  }
+  close() { this.closed = true; }
+}
+
+class FakeAudioDecoder {
+  static async isConfigSupported() { return { supported: true }; }
+  constructor(callbacks) { this.callbacks = callbacks; this.decodeQueueSize = 0; this.state = "unconfigured"; }
+  configure(config) { this.config = config; this.state = "configured"; }
+  reset() { this.state = "unconfigured"; }
+  decode(chunk) {
+    this.callbacks.output({
+      sampleRate: this.config.sampleRate,
+      numberOfChannels: this.config.numberOfChannels,
+      numberOfFrames: 480,
+      copyTo(destination) { destination.fill(0); },
+      close() {},
+    });
+  }
+  close() { this.state = "closed"; }
+}
+
+class FakeAudioEncoder {
+  static async isConfigSupported() { return { supported: true }; }
+  constructor(callbacks) { this.callbacks = callbacks; this.encodeQueueSize = 0; this.state = "unconfigured"; }
+  configure(config) { this.config = config; this.state = "configured"; }
+  encode(frame) {
+    const chunk = {
+      timestamp: frame.timestamp,
+      duration: 10000,
+      byteLength: 2,
+      copyTo(destination) { destination.set([0x22, 0x33]); },
+    };
+    this.callbacks.output(chunk);
+  }
+  close() { this.state = "closed"; }
+}
+
+class FakeAudioWorkletNode {
+  static instances = [];
+  constructor(context, name, options) {
+    this.options = options;
+    this.port = { onmessage: null, postMessage() {} };
+    FakeAudioWorkletNode.instances.push(this);
+  }
+  connect() {}
+  disconnect() {}
+}
+
+function fakeAudioOptions() {
+  return {
+    AudioContext: FakeAudioContext,
+    AudioDecoder: FakeAudioDecoder,
+    EncodedAudioChunk: class { constructor(init) { Object.assign(this, init); } },
+    AudioEncoder: FakeAudioEncoder,
+    AudioData: FakeAudioData,
+    AudioWorkletNode: FakeAudioWorkletNode,
+    mediaDevices: {
+      async getUserMedia() {
+        return { getTracks: () => [{ stop() {} }] };
+      },
+    },
+  };
+}
 
 async function inputSession(t, beforeOpen) {
   const client = new BeamItClient({ url: "https://test:8443", WebSocket: FakeSocket, crypto: webcrypto });
@@ -133,6 +249,97 @@ async function inputSession(t, beforeOpen) {
   videoSocket.open();
   return { client, socket, stream: await starting };
 }
+
+test("audio offers, capture tracks, playback decode, and microphone uplink use negotiated metadata", async (t) => {
+  const { client, socket } = await inputSession(t);
+  FakeAudioWorkletNode.instances = [];
+  const starting = client.startAudio(fakeAudioOptions());
+  const startRequest = socket.sent.at(-1);
+  assert.deepEqual(startRequest, { type: "start_audio", id: startRequest.id });
+  socket.receive({
+    type: "audio_offer",
+    id: startRequest.id,
+    audio_id: "test-audio",
+    url: `wss://test:8443/audio/test-audio?token=${base64UrlEncode(new Uint8Array(32))}`,
+    token_expires_in_ms: 10000,
+    audio_version: 2,
+    hostToClient: { tracks: [] },
+    clientToHost: {
+      track_id: 1, source: { kind: "microphone" }, codec: "opus",
+      opusAudioConfiguration: opusConfiguration,
+    },
+  });
+  await tick();
+  const audioSocket = FakeSocket.instances.at(-1);
+  audioSocket.open();
+  const audio = await starting;
+  await audio.startMicrophone();
+
+  const adding = audio.startTrack({ kind: "application", pid: 4242 });
+  const addRequest = socket.sent.at(-1);
+  assert.deepEqual(addRequest.source, { kind: "application", pid: 4242 });
+  socket.receive({
+    type: "audio_track_started", id: addRequest.id, audio_id: audio.audioId,
+    track: {
+      track_id: 2, source: { kind: "application", pid: 4242, include_process_tree: true },
+      codec: "opus", opusAudioConfiguration: opusConfiguration,
+    },
+  });
+  const track = await adding;
+  assert.equal(track.track_id, 2);
+
+  audioSocket.receiveBinary(createAudioPacket({
+    trackId: 2, frameSize: 480, sequence: 0n, samples: Uint8Array.of(0x55), discontinuity: true,
+  }));
+  await tick();
+  assert.equal(FakeAudioWorkletNode.instances.length, 1);
+  const worklet = FakeAudioWorkletNode.instances[0];
+  worklet.port.onmessage({
+    data: { sequence: 0, samples: new Float32Array(opusConfiguration.frameSize * opusConfiguration.channels) },
+  });
+  const uplink = parseAudioPacket(audioSocket.sent.at(-1));
+  assert.equal(uplink.trackId, 1);
+  assert.equal(uplink.sequence, 0n);
+  assert.equal(uplink.discontinuity, true);
+  assert.deepEqual(uplink.payload, Uint8Array.of(0x22, 0x33));
+
+  const stoppingTrack = audio.stopTrack(track.track_id);
+  const stopTrackRequest = socket.sent.at(-1);
+  socket.receive({
+    type: "audio_track_stopped", id: stopTrackRequest.id,
+    audio_id: audio.audioId, track_id: track.track_id, reason: "requested",
+  });
+  await stoppingTrack;
+  assert.equal(audio.tracks.length, 0);
+
+  const addingDesktop = audio.startTrack({ kind: "desktop" });
+  const desktopRequest = socket.sent.at(-1);
+  assert.deepEqual(desktopRequest.source, { kind: "desktop" });
+  socket.receive({
+    type: "audio_track_started", id: desktopRequest.id, audio_id: audio.audioId,
+    track: {
+      track_id: 3, source: { kind: "desktop", exclude_host_process_tree: true },
+      codec: "opus", opusAudioConfiguration: opusConfiguration,
+    },
+  });
+  const desktopTrack = await addingDesktop;
+  const countBeforeRejectedSource = socket.sent.length;
+  await assert.rejects(audio.startTrack({ kind: "application", pid: 4242 }), TypeError);
+  assert.equal(socket.sent.length, countBeforeRejectedSource);
+  const stoppingDesktop = audio.stopTrack(desktopTrack.track_id);
+  const stopDesktopRequest = socket.sent.at(-1);
+  socket.receive({
+    type: "audio_track_stopped", id: stopDesktopRequest.id,
+    audio_id: audio.audioId, track_id: desktopTrack.track_id, reason: "requested",
+  });
+  await stoppingDesktop;
+
+  const stoppingAudio = audio.stop();
+  const stopAudioRequest = socket.sent.at(-1);
+  socket.receive({ type: "audio_stopped", id: stopAudioRequest.id, audio_id: audio.audioId, reason: "requested" });
+  await stoppingAudio;
+  assert.equal(audio.ready, false);
+});
 
 test("input commands use the authenticated control socket without waiting for success replies", async (t) => {
   const unauthenticated = new BeamItClient({ WebSocket: FakeSocket });

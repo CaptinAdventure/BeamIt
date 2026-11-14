@@ -153,6 +153,7 @@ final class BeamItStreamWindowController: NSWindowController, NSWindowDelegate {
         let pointSize = NSSize(width: videoPixelSize.width / scale, height: videoPixelSize.height / scale)
         frameView = BeamItFrameView(frame: NSRect(origin: .zero, size: pointSize))
         frameView.diagnostics = stream.diagnostics
+        frameView.isHDR = stream.offer.video.isHDR
         inputHandler = BeamItInputHandler(stream: stream)
         frameView.inputHandler = inputHandler
         let window: NSWindow
@@ -207,6 +208,7 @@ final class BeamItStreamWindowController: NSWindowController, NSWindowDelegate {
         stream.onVideoConfig = { [weak self] video in
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.frameView.isHDR = video.isHDR
                 self.videoPixelSize = NSSize(width: video.width, height: video.height)
                 self.applyPixelSize()
                 self.stream.popupCoordinator?.reposition()
@@ -427,6 +429,7 @@ final class BeamItStreamWindowController: NSWindowController, NSWindowDelegate {
 
     func windowDidBecomeKey(_ notification: Notification) {
         Self.activeController = self
+        BeamItScalingMenu.shared.streamWindowIsKey = true
         BeamItAntiIdle.shared.streamDidBecomeKey(self)
         cancelDockAttention()
     }
@@ -445,6 +448,7 @@ final class BeamItStreamWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowDidResignKey(_ notification: Notification) {
+        BeamItScalingMenu.shared.streamWindowIsKey = false
         inputHandler.releaseMouseCapture()
         inputHandler.releaseAll()
     }
@@ -467,6 +471,7 @@ final class BeamItStreamWindowController: NSWindowController, NSWindowDelegate {
         stopTypingText()
         if Self.activeController === self {
             Self.activeController = nil
+            BeamItScalingMenu.shared.streamWindowIsKey = false
         }
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)

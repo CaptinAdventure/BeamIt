@@ -160,6 +160,57 @@ TEST_CASE("Stream offers must stay on the control origin", "[client-protocol]") 
     CHECK_FALSE(parse_stream_offer(invalid, control));
 }
 
+TEST_CASE("Audio offers validate the full-duplex route and negotiated Opus format", "[client-protocol][audio]") {
+    const auto control = *parse_server_url("wss://host.lan:8443");
+    const auto token = net::base64url_encode(net::random_bytes(32));
+    auto offer = json::object{
+        {"type", "audio_offer"},
+        {"audio_id", "AudioTest000001"},
+        {"url", "wss://HOST.lan:8443/audio/AudioTest000001?token=" + token},
+        {"token_expires_in_ms", 10000},
+        {"audio_version", net::protocol::audio_frame_version},
+        {"hostToClient", json::object{{"tracks", json::array{}}}},
+        {"clientToHost", json::object{
+            {"track_id", 7},
+            {"codec", "opus"},
+            {"source", json::object{{"kind", "microphone"}}},
+            {"opusAudioConfiguration", json::object{
+                {"sampleRate", 48000}, {"channels", 2}, {"frameSize", 480},
+                {"packetDuration", "PT0.01S"}, {"useFec", false}, {"application", "VOIP"},
+            }},
+        }},
+    };
+    auto parsed = parse_audio_offer(offer, control);
+    REQUIRE(parsed);
+    CHECK(parsed->audio_id == "AudioTest000001");
+    CHECK(parsed->target == "/audio/AudioTest000001?token=" + token);
+    CHECK(parsed->microphone.track_id == 7);
+    CHECK(parsed->microphone.configuration.sample_rate == 48000);
+    CHECK(parsed->microphone.configuration.channels == 2);
+    CHECK(parsed->microphone.configuration.frame_size() == 480);
+
+    for (const auto* url : {
+             "ws://host.lan:8443/audio/AudioTest000001?token=abc",
+             "wss://evil.lan:8443/audio/AudioTest000001?token=abc",
+             "wss://host.lan:9443/audio/AudioTest000001?token=abc",
+             "wss://host.lan:8443/audio/other0000000000?token=abc",
+             "wss://host.lan:8443/audio/AudioTest000001?token=abc&extra=1",
+         }) {
+        auto invalid = offer;
+        invalid["url"] = url;
+        CHECK_FALSE(parse_audio_offer(invalid, control));
+    }
+    auto invalid = offer;
+    invalid["audio_version"] = 1;
+    CHECK_FALSE(parse_audio_offer(invalid, control));
+    invalid = offer;
+    invalid["clientToHost"].as_object()["opusAudioConfiguration"].as_object()["frameSize"] = 960;
+    CHECK_FALSE(parse_audio_offer(invalid, control));
+    invalid = offer;
+    invalid["clientToHost"].as_object()["opusAudioConfiguration"].as_object()["useFec"] = true;
+    CHECK_FALSE(parse_audio_offer(invalid, control));
+}
+
 TEST_CASE("Clock estimates prefer the lowest round trip within 30 seconds", "[client-protocol]") {
     using namespace std::chrono_literals;
     ClockEstimate clock;

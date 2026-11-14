@@ -1,6 +1,9 @@
 #include "host/WindowTracker.hpp"
+#include "ApplicationWindows.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <algorithm>
 
 using namespace beamit::host;
 
@@ -73,4 +76,17 @@ TEST_CASE("A reused window handle is a new window", "[windows]") {
 TEST_CASE("The image name of the current process is resolved", "[windows]") {
     CHECK(process_image_name(GetCurrentProcessId()) == "BeamItTests.exe");
     CHECK(process_image_name(0).empty());
+}
+
+TEST_CASE("Visible top-level windows do not need a title to be listed", "[windows]") {
+    const HWND untitled = CreateWindowExW(0, L"STATIC", L"", WS_POPUP | WS_VISIBLE, 0, 0, 100, 100,
+                                          nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    REQUIRE(untitled != nullptr);
+
+    const auto windows = application_windows();
+    const auto found = std::ranges::find(windows, untitled, &ApplicationWindow::hwnd);
+    REQUIRE(found != windows.end());
+    CHECK(found->title.empty());
+
+    DestroyWindow(untitled);
 }

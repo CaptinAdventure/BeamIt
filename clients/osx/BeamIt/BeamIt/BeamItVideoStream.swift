@@ -169,6 +169,9 @@ final class BeamItVideoStream {
                         width: video.width,
                         height: video.height,
                         generation: frame.generation,
+                        hdrChroma: video.isHDR ? (video.chroma_format ?? "4:2:0") : nil,
+                        codecString: video.codec_string,
+                        chroma: video.chroma_format,
                         diagnostics: diagnostics,
                         onError: { [weak self] error in self?.onError?(error) }
                     )

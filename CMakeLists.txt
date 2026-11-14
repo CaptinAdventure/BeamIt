@@ -62,6 +62,7 @@ include(cmake/BeamItDependencies.cmake)
 beamit_add_network_dependencies()
 
 set(BEAMIT_HOST_SOURCES
+    src/host/BeamItMicrophoneOutput.cpp
     src/host/AudioCapture.cpp
     src/host/WasapiAudioCapture.cpp
     src/media/OpusAudio.cpp
@@ -105,7 +106,7 @@ add_executable(BeamIt
     src/media/CodecHeaders.cpp
     ${BEAMIT_HOST_SOURCES}
 )
-target_include_directories(BeamIt PRIVATE include src "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_include_directories(BeamIt PRIVATE include src drivers/BeamItMicrophone/shared "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(BeamIt PRIVATE opus spdlog CLI11::CLI11 Boost::beast Boost::json beamit_wintls
     d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs shell32 avrt winmm advapi32 mmdevapi
     normaliz bcrypt)
@@ -168,7 +169,7 @@ if(BUILD_TESTING)
         src/media/AutoVideoEncoder.cpp
         src/media/CodecHeaders.cpp
     )
-    target_include_directories(BeamItTests PRIVATE include src "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    target_include_directories(BeamItTests PRIVATE include src drivers/BeamItMicrophone/shared "${CMAKE_CURRENT_BINARY_DIR}/generated")
     add_dependencies(BeamItTests BeamItInputHelper)
     add_dependencies(BeamItTests BeamItAudioTestSource)
     target_compile_definitions(BeamItTests PRIVATE BEAMIT_USE_CATCH2=1 NOMINMAX _WIN32_WINNT=0x0A00)
