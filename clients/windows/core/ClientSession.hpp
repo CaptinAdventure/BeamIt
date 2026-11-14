@@ -41,6 +41,8 @@ struct AudioCallbacks {
     // Audio packets run on the network thread; implementations must enqueue quickly.
     std::function<void(const net::protocol::AudioPacket&, const media::AudioConfiguration&)> packet;
     std::function<void(const SessionError&)> failed;
+};
+
 // Bulk callbacks run on the network thread. A binary message is valid only during the callback.
 struct BulkCallbacks {
     std::function<void(std::span<const std::byte>)> message;

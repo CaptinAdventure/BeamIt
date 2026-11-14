@@ -58,22 +58,10 @@ if(WIN32)
         "${beamit_root}/src/host/ClipboardBulkStorage.cpp"
     )
     target_compile_definitions(BeamItWindowsCore PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
-    target_link_libraries(BeamItWindowsCore PUBLIC 
-    		Boost::json 
-    		beamit_wintls 
-    		opus 
-    		ws2_32 
-    		d3d11 
-    		dxgi 
-    		mf 
-    		mfplat 
-    		mfuuid
-    		ole32 
-    		mmdevapi 
-    		avrt 
-    		winmm
- 			windowscodecs
- 			spdlog user32 shell32 advapi32 gdi32)
+    target_link_libraries(BeamItWindowsCore PUBLIC
+        Boost::json beamit_wintls opus ws2_32 d3d11 dxgi mf mfplat mfuuid
+        ole32 mmdevapi avrt winmm windowscodecs normaliz
+        spdlog user32 shell32 advapi32 gdi32)
     add_executable(BeamItDecoderProbe DecoderProbeMain.cpp)
     target_link_libraries(BeamItDecoderProbe PRIVATE BeamItWindowsCore)
 
@@ -86,7 +74,7 @@ if(WIN32)
       <PreprocessorDefinitions>$<JOIN:$<TARGET_PROPERTY:BeamItWindowsCore,INTERFACE_COMPILE_DEFINITIONS>,;>;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$<TARGET_LINKER_FILE:BeamItWindowsCore>;$<TARGET_LINKER_FILE:Boost::json>;$<TARGET_LINKER_FILE:Boost::container>;$<TARGET_LINKER_FILE:opus>;$<TARGET_LINKER_FILE:spdlog>;ws2_32.lib;crypt32.lib;secur32.lib;bcrypt.lib;mmdevapi.lib;avrt.lib;winmm.lib;windowscodecs.lib;windowscodecs.lib;normaliz.lib;advapi32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$<TARGET_LINKER_FILE:BeamItWindowsCore>;$<TARGET_LINKER_FILE:Boost::json>;$<TARGET_LINKER_FILE:Boost::container>;$<TARGET_LINKER_FILE:opus>;$<TARGET_LINKER_FILE:spdlog>;ws2_32.lib;crypt32.lib;secur32.lib;bcrypt.lib;mmdevapi.lib;avrt.lib;winmm.lib;windowscodecs.lib;normaliz.lib;advapi32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 </Project>

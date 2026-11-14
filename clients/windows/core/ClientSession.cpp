@@ -248,6 +248,9 @@ struct Session::State {
         std::map<std::uint32_t, std::uint64_t> previous_sequences;
         std::deque<std::vector<std::byte>> writes;
         std::shared_ptr<std::vector<std::byte>> active_write;
+        bool closing{};
+    };
+
     struct Bulk {
         struct Write {
             std::vector<std::byte> bytes;
@@ -624,6 +627,8 @@ struct Session::State {
         audio->resolver.cancel();
         audio->writes.clear();
         close_transport(audio->socket);
+    }
+
     awaitable<void> run_bulk(std::shared_ptr<Bulk> current, Completion<void> opened) {
         Endpoint target_endpoint;
         PinPolicy pin;

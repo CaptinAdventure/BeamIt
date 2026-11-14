@@ -5,8 +5,8 @@ client connects to a host, pins its certificate, authenticates, lists host
 applications and streams windows, applications and desktops into native
 windows with keyboard and mouse input. Bidirectional clipboard text/HTML/PNG
 and file/folder integration is implemented; native clipboard/UI and LAN
-validation remain pending. Text sending, anti-idle, the remote popup
-coordinator and audio are not implemented yet
+validation remain pending. Text sending, anti-idle and the remote popup
+coordinator are not implemented yet
 (see [the implementation plan](IMPLEMENTATION-PLAN.md)).
 Teams and cross-machine LAN behavior have not been validated.
 
@@ -22,11 +22,10 @@ and taskbar attention.
   (network thread, WSS transport, pinning, requests, stream sockets),
   `FrameProtocol` (binary frames, generation/key-frame gate), `HostWindows`
   (window model, application grouping, search, window following),
-  `KeyCodes` (scan code to `KeyboardEvent.code`) and `VideoPipeline`
-  (Media Foundation decoding and D3D11 presentation), `AudioClient` (Opus,
-  event-driven WASAPI microphone capture and mixed host-track playback).
   `ClipboardManager` (negotiation, background spool/staging, confirmation,
-  receiver acknowledgement and paste guards), `KeyCodes` (scan code to
+  receiver acknowledgement and paste guards), `AudioClient` (Opus,
+  event-driven WASAPI microphone capture and mixed host-track playback),
+  `KeyCodes` (scan code to
   `KeyboardEvent.code`) and `VideoPipeline`
   (Media Foundation decoding and D3D11 presentation).
 - **`app/` (WinUI MSBuild project):** `ClientApp` (connection and source
