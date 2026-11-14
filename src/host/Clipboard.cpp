@@ -7,6 +7,7 @@
 #include <spdlog/spdlog.h>
 #include <wincodec.h>
 #include <wrl/client.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <charconv>
@@ -247,11 +248,46 @@ std::optional<std::pair<std::uint32_t, std::uint32_t>> png_dimensions(std::span<
     return std::pair{read_u32_be(png, 16), read_u32_be(png, 20)};
 }
 
+std::expected<std::vector<std::byte>, std::string>
+encode_file_drop(std::span<const std::filesystem::path> paths) {
+    if (paths.empty() || paths.size() > 64) return std::unexpected("the file selection has an invalid root count");
+    std::vector<wchar_t> text;
+    for (const auto& path : paths) {
+        if (!path.is_absolute()) return std::unexpected("file references must be absolute staged paths");
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            return std::unexpected("a staged file reference is missing or is a reparse point");
+        }
+        const auto native = path.native();
+        if (native.empty() || native.size() > 32767 ||
+            std::ranges::any_of(native, [](wchar_t ch) { return ch == L'\0'; })) {
+            return std::unexpected("a staged file reference is invalid");
+        }
+        text.insert(text.end(), native.begin(), native.end());
+        text.push_back(L'\0');
+    }
+    text.push_back(L'\0');
+
+    struct DropHeader {
+        DWORD file_list_offset;
+        POINT point;
+        BOOL non_client;
+        BOOL wide_paths;
+    };
+    static_assert(sizeof(DropHeader) == 20);
+    const DropHeader header{.file_list_offset = sizeof(DropHeader), .wide_paths = TRUE};
+    std::vector<std::byte> result(sizeof(header) + text.size() * sizeof(wchar_t));
+    std::memcpy(result.data(), &header, sizeof(header));
+    std::memcpy(result.data() + sizeof(header), text.data(), text.size() * sizeof(wchar_t));
+    return result;
+}
+
 struct ClipboardMonitor::Impl {
     struct Request {
         unsigned formats{};
         std::size_t max_bytes{};
         ReadCallback done;
+        bool binary_image{};
     };
 
     struct WriteRequest {
@@ -284,6 +320,7 @@ struct ClipboardMonitor::Impl {
             IsClipboardFormatAvailable(CF_DIBV5) || IsClipboardFormatAvailable(CF_BITMAP)) {
             formats |= clipboard_image;
         }
+        if (IsClipboardFormatAvailable(CF_HDROP)) formats |= clipboard_files;
         return formats;
     }
 
@@ -327,15 +364,17 @@ struct ClipboardMonitor::Impl {
             return;
         }
         ClipboardContent content{.sequence = GetClipboardSequenceNumber()};
-        const unsigned wanted = request.formats & clipboard_all;
+        const unsigned wanted = request.formats & (clipboard_all | clipboard_files);
         const std::size_t max = request.max_bytes;
         std::optional<std::wstring> wide_text;
         std::optional<std::vector<std::byte>> html_data;
         std::optional<std::vector<std::byte>> png_data;
         std::optional<std::vector<std::byte>> dib_data;
+        std::vector<std::filesystem::path> file_paths;
         unsigned too_large{};
         if (excluded()) {
-            for (const auto format : {clipboard_text, clipboard_html, clipboard_image}) {
+            content.excluded = true;
+            for (const auto format : {clipboard_text, clipboard_html, clipboard_image, clipboard_files}) {
                 if (wanted & format) content.omitted.push_back({format, "excluded"});
             }
         } else {
@@ -358,11 +397,34 @@ struct ClipboardMonitor::Impl {
                 // Prefer an application-provided PNG (keeps alpha); otherwise use the opaque device-independent bitmap,
                 // which Windows synthesizes from CF_BITMAP/CF_DIBV5 when needed.
                 if (png_format != 0 && IsClipboardFormatAvailable(png_format)) {
-                    png_data = copy_data(png_format, max_dib_bytes, large);
+                    png_data = copy_data(png_format, request.binary_image ? 64 * 1024 * 1024 : max_dib_bytes, large);
                 } else if (IsClipboardFormatAvailable(CF_DIB)) {
                     dib_data = copy_data(CF_DIB, max_dib_bytes, large);
                 }
                 if (large) too_large |= clipboard_image;
+            }
+            if ((wanted & clipboard_files) && IsClipboardFormatAvailable(CF_HDROP)) {
+                const auto drop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
+                const UINT count = drop ? DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0) : 0;
+                if (count > 64) {
+                    too_large |= clipboard_files;
+                } else if (drop) {
+                    file_paths.reserve(count);
+                    for (UINT index = 0; index < count; ++index) {
+                        const UINT length = DragQueryFileW(drop, index, nullptr, 0);
+                        if (length == 0 || length > 32767) {
+                            file_paths.clear();
+                            break;
+                        }
+                        std::wstring path(static_cast<std::size_t>(length) + 1, L'\0');
+                        if (DragQueryFileW(drop, index, path.data(), length + 1) != length) {
+                            file_paths.clear();
+                            break;
+                        }
+                        path.resize(length);
+                        file_paths.emplace_back(std::move(path));
+                    }
+                }
             }
         }
         CloseClipboard();
@@ -397,6 +459,7 @@ struct ClipboardMonitor::Impl {
             }
         }
         if (too_large & clipboard_image) omit(clipboard_image, "too_large");
+        if (too_large & clipboard_files) omit(clipboard_files, "too_large");
         std::optional<ClipboardImage> image;
         if (png_data) {
             if (const auto size = png_dimensions(*png_data)) {
@@ -406,13 +469,20 @@ struct ClipboardMonitor::Impl {
             image = png_from_dib(*dib_data);
         }
         if (image) {
-            if (fits(base64_length(image->png.size()))) {
+            if (request.binary_image ? image->png.size() <= 64 * 1024 * 1024 :
+                                       fits(base64_length(image->png.size()))) {
                 content.image = std::move(image);
             } else {
                 omit(clipboard_image, "too_large");
             }
         } else if (png_data || dib_data) {
             omit(clipboard_image, "unsupported");
+        }
+        if ((wanted & clipboard_files) && !file_paths.empty() && !(too_large & clipboard_files)) {
+            content.files = std::move(file_paths);
+        } else if (!content.excluded && (wanted & clipboard_files) && IsClipboardFormatAvailable(CF_HDROP) &&
+                   !(too_large & clipboard_files)) {
+            omit(clipboard_files, "unsupported");
         }
         request.done({.content = std::move(content), .error = {}});
     }
@@ -451,8 +521,9 @@ struct ClipboardMonitor::Impl {
     }
 
     void serve_write(WriteRequest& request) {
-        const auto fail = [&](const char* code, std::string message) {
-            request.done({.sequence = 0, .error_code = code, .error = std::move(message)});
+        const auto fail = [&](const char* code, std::string message, bool retain_files = false) {
+            request.done({.sequence = 0, .error_code = code, .error = std::move(message),
+                          .retain_files = retain_files});
         };
         auto& content = request.content;
         // Everything is converted before the clipboard is opened, so it is held only while handles are handed over.
@@ -478,37 +549,109 @@ struct ClipboardMonitor::Impl {
             const auto document = html_clipboard_document(*content.html);
             add(html_format, document.c_str(), document.size() + 1);
         }
-        if (content.image) {
-            const auto png = net::base64_decode(*content.image);
+        if (content.image || content.png) {
+            const auto png = content.png ? content.png : net::base64_decode(*content.image);
             if (!png || !png_dimensions(*png)) return fail("invalid_request", "image.data must be a base64 PNG");
             const auto dib = dib_from_png(*png);
             if (!dib) return fail("invalid_request", "image.data could not be decoded (or exceeds 16384 px / 64 Mpx)");
             if (png_format != 0) add(png_format, png->data(), png->size());
             add(CF_DIB, dib->dib.data(), dib->dib.size());
         }
+        if (!content.files.empty()) {
+            const auto drop = encode_file_drop(content.files);
+            if (!drop) return fail("invalid_request", drop.error());
+            add(CF_HDROP, drop->data(), drop->size());
+        }
         if (content.sensitive) {
             const DWORD zero = 0;
             for (const auto* name : {L"ExcludeClipboardContentFromMonitorProcessing", L"CanIncludeInClipboardHistory",
                                      L"CanUploadToCloudClipboard"}) {
-                if (const UINT format = RegisterClipboardFormatW(name)) add(format, &zero, sizeof(zero));
+                const UINT format = RegisterClipboardFormatW(name);
+                if (!format) return fail("clipboard_unavailable", "could not prepare sensitive clipboard markers");
+                add(format, &zero, sizeof(zero));
             }
         }
 
-        if (!open_clipboard()) return fail("clipboard_unavailable", "the clipboard is in use by another application");
-        bool ok = EmptyClipboard() != FALSE;
+        // Allocate every native representation before replacing anything.
+        std::vector<std::pair<UINT, HGLOBAL>> prepared;
+        const auto free_handles = [](auto& handles) {
+            for (auto& [format, handle] : handles) {
+                if (handle) GlobalFree(handle);
+                handle = nullptr;
+            }
+        };
         for (const auto& [format, bytes] : formats) {
+            const auto memory = global_copy(bytes.data(), bytes.size());
+            if (!memory) {
+                free_handles(prepared);
+                return fail("clipboard_unavailable", "could not prepare native clipboard formats");
+            }
+            prepared.emplace_back(format, memory);
+        }
+        if (!open_clipboard()) {
+            free_handles(prepared);
+            return fail("clipboard_unavailable", "the clipboard is in use by another application");
+        }
+        if ((content.expected_sequence && GetClipboardSequenceNumber() != *content.expected_sequence) ||
+            (content.publication_allowed && !content.publication_allowed->load()) ||
+            (content.expected_foreground && GetForegroundWindow() != *content.expected_foreground)) {
+            CloseClipboard();
+            free_handles(prepared);
+            return fail("stale_clipboard", "clipboard revision or transfer changed before publication");
+        }
+        // Snapshot supported HGLOBAL formats while holding the clipboard. Arbitrary delayed-render
+        // third-party formats cannot be restored by this API.
+        std::vector<std::pair<UINT, HGLOBAL>> previous;
+        std::vector<UINT> supported{CF_UNICODETEXT, CF_DIB, CF_DIBV5, CF_HDROP, html_format, png_format};
+        for (const auto* name : {L"ExcludeClipboardContentFromMonitorProcessing", L"CanIncludeInClipboardHistory",
+                                L"CanUploadToCloudClipboard"}) {
+            supported.push_back(RegisterClipboardFormatW(name));
+        }
+        for (const auto format : supported) {
+            if (!format || !IsClipboardFormatAvailable(format)) continue;
+            const auto source = GetClipboardData(format);
+            const auto size = source ? GlobalSize(source) : 0;
+            const auto data = source && size ? GlobalLock(source) : nullptr;
+            const auto copy = data ? global_copy(data, size) : nullptr;
+            if (data) GlobalUnlock(source);
+            if (!copy) {
+                CloseClipboard();
+                free_handles(previous);
+                free_handles(prepared);
+                return fail("clipboard_unavailable", "could not prepare supported-format rollback");
+            }
+            previous.emplace_back(format, copy);
+        }
+        if ((content.expected_sequence && GetClipboardSequenceNumber() != *content.expected_sequence) ||
+            (content.publication_allowed && !content.publication_allowed->load()) ||
+            (content.expected_foreground && GetForegroundWindow() != *content.expected_foreground)) {
+            CloseClipboard();
+            free_handles(previous);
+            free_handles(prepared);
+            return fail("stale_clipboard", "clipboard revision or transfer changed during preparation");
+        }
+        const bool emptied = EmptyClipboard() != FALSE;
+        bool ok = emptied;
+        for (auto& [format, memory] : prepared) {
             if (!ok) break;
-            const HGLOBAL memory = global_copy(bytes.data(), bytes.size());
-            // On success the system owns the memory.
-            if (!memory || !SetClipboardData(format, memory)) {
-                if (memory) GlobalFree(memory);
-                ok = false;
+            if (SetClipboardData(format, memory)) memory = nullptr;
+            else ok = false;
+        }
+        const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+        bool restored = true;
+        if (!ok && emptied) {
+            restored = EmptyClipboard() != FALSE;
+            for (auto& [format, memory] : previous) {
+                if (SetClipboardData(format, memory)) memory = nullptr;
+                else restored = false;
             }
         }
-        if (!ok) EmptyClipboard(); // never leave a partial set of formats behind
-        const DWORD error = GetLastError();
         CloseClipboard();
-        if (!ok) return fail("clipboard_unavailable", fmt::format("writing the clipboard failed (error {})", error));
+        free_handles(prepared);
+        free_handles(previous);
+        if (!ok) return fail("clipboard_unavailable", fmt::format(
+            "writing the clipboard failed (error {}); supported-format rollback {}; third-party formats may be lost",
+            error, restored ? "succeeded" : "failed"), !restored && !content.files.empty());
         request.done({.sequence = GetClipboardSequenceNumber(), .error_code = {}, .error = {}});
     }
 
@@ -579,6 +722,16 @@ void ClipboardMonitor::read(unsigned formats, std::size_t max_bytes, ReadCallbac
             impl->serve(*request);
         } catch (const std::exception& error) {
             spdlog::error("Clipboard read failed: {}", error.what());
+            request->done({.content = std::nullopt, .error = "clipboard read failed"});
+        }
+    });
+}
+
+void ClipboardMonitor::read_bulk(unsigned formats, ReadCallback done) {
+    impl_->post([impl = impl_.get(), request = std::make_shared<Impl::Request>(
+                     formats, 10 * 1024 * 1024, std::move(done), true)] {
+        try { impl->serve(*request); }
+        catch (const std::exception&) {
             request->done({.content = std::nullopt, .error = "clipboard read failed"});
         }
     });

@@ -20,6 +20,7 @@
 #include <winrt/Windows.UI.Core.h>
 
 #include <atomic>
+#include <array>
 #include <cmath>
 #include <format>
 #include <fstream>
@@ -200,6 +201,27 @@ void StreamWindow::initialize() {
     window_.Content(focus_);
     winrt::check_hresult(panel_.as<ISwapChainPanelNative>()->SetSwapChain(pipeline_->swap_chain()));
     build_bar();
+    clipboard_panel_ = xaml::Controls::Border();
+    clipboard_panel_.VerticalAlignment(xaml::VerticalAlignment::Bottom);
+    clipboard_panel_.HorizontalAlignment(xaml::HorizontalAlignment::Left);
+    clipboard_panel_.Background(xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{230, 32, 32, 32}));
+    clipboard_panel_.Padding(xaml::Thickness{10, 6, 10, 6});
+    clipboard_panel_.Visibility(xaml::Visibility::Collapsed);
+    xaml::Controls::StackPanel clipboard_stack;
+    clipboard_stack.Spacing(4);
+    clipboard_text_ = xaml::Controls::TextBlock();
+    clipboard_text_.Foreground(xaml::Media::SolidColorBrush(winrt::Windows::UI::Color{255, 255, 255, 255}));
+    clipboard_text_.TextWrapping(xaml::TextWrapping::Wrap);
+    clipboard_text_.MaxWidth(440);
+    clipboard_cancel_ = xaml::Controls::Button();
+    clipboard_cancel_.Content(winrt::box_value(L"Cancel clipboard transfer"));
+    clipboard_cancel_.Click([weak](auto&&, auto&&) {
+        if (auto self = weak.lock(); self && self->callbacks_.cancel_clipboard) self->callbacks_.cancel_clipboard();
+    });
+    clipboard_stack.Children().Append(clipboard_text_);
+    clipboard_stack.Children().Append(clipboard_cancel_);
+    clipboard_panel_.Child(clipboard_stack);
+    root_.Children().Append(clipboard_panel_);
 
     panel_.SizeChanged([weak](auto&&, auto&&) {
         if (const auto self = weak.lock()) self->resize_surface();
@@ -237,6 +259,8 @@ void StreamWindow::initialize() {
     window_.Activated([weak](auto&&, xaml::WindowActivatedEventArgs const& args) {
         const auto self = weak.lock();
         if (!self || self->closed_) return;
+        if (self->callbacks_.focused) self->callbacks_.focused(
+            args.WindowActivationState() != xaml::WindowActivationState::Deactivated);
         if (args.WindowActivationState() == xaml::WindowActivationState::Deactivated) {
             self->capture_mouse(false);
             self->release_all();
@@ -701,9 +725,23 @@ void StreamWindow::send_input(std::string type, json::object fields) {
 }
 
 void StreamWindow::key(xaml::Input::KeyRoutedEventArgs const& args, bool down) {
+    if (args.OriginalSource().try_as<xaml::Controls::Button>()) return;
     args.Handled(true);
     const auto virtual_key = static_cast<unsigned>(args.Key());
     const auto status = args.KeyStatus();
+    if (!down && suppressed_paste_.erase(virtual_key)) return;
+    const bool paste = (virtual_key == 'V' && held(VK_CONTROL) && !held(VK_MENU)) ||
+        (virtual_key == VK_INSERT && held(VK_SHIFT) && !held(VK_CONTROL));
+    if (down && paste && callbacks_.paste) {
+        if (status.WasKeyDown) return;
+        suppressed_paste_.insert(virtual_key);
+        callbacks_.paste([weak = weak_from_this(), insert = virtual_key == VK_INSERT](bool published) {
+            if (auto self = weak.lock(); self && published && !self->closed_ && GetForegroundWindow() == self->hwnd_) {
+                self->forward_paste(insert);
+            }
+        });
+        return;
+    }
     if (down) {
         // Local shortcuts are consumed before forwarding (Alt+Space menu, Ctrl+Alt+G release, Esc Esc).
         if (virtual_key == VK_SPACE && held(VK_MENU) && !held(VK_CONTROL)) {
@@ -730,6 +768,40 @@ void StreamWindow::key(xaml::Input::KeyRoutedEventArgs const& args, bool down) {
     if (!down && !held_keys_.erase(name)) return;
     if (down) held_keys_.insert(name);
     send_input("key", {{"code", name}, {"down", down}});
+}
+
+void StreamWindow::forward_paste(bool insert) {
+    // The physical modifiers may have been released while copying/confirming.
+    // Release mirrored modifiers, send one complete chord, then restore only
+    // modifiers still physically held. Never synthesize a paste on a stale target.
+    const std::array<std::pair<unsigned, const char*>, 6> modifiers{{
+        {VK_LCONTROL, "ControlLeft"}, {VK_RCONTROL, "ControlRight"},
+        {VK_LSHIFT, "ShiftLeft"}, {VK_RSHIFT, "ShiftRight"},
+        {VK_LMENU, "AltLeft"}, {VK_RMENU, "AltRight"}}};
+    std::vector<std::string> restore;
+    for (const auto& [key, name] : modifiers) {
+        if (!held_keys_.erase(name)) continue;
+        send_input("key", {{"code", name}, {"down", false}});
+        if (GetAsyncKeyState(key) & 0x8000) restore.emplace_back(name);
+    }
+    const auto modifier = insert ? "ShiftLeft" : "ControlLeft";
+    const auto key = insert ? "Insert" : "KeyV";
+    send_input("key", {{"code", modifier}, {"down", true}});
+    send_input("key", {{"code", key}, {"down", true}});
+    send_input("key", {{"code", key}, {"down", false}});
+    send_input("key", {{"code", modifier}, {"down", false}});
+    for (const auto& name : restore) {
+        held_keys_.insert(name);
+        send_input("key", {{"code", name}, {"down", true}});
+    }
+}
+
+void StreamWindow::clipboard_status(const ClipboardManager::Status& status) {
+    if (closed_) return;
+    clipboard_text_.Text(hstring(std::format("Clipboard: {} · {} / {} bytes{}{}", status.phase,
+        status.bytes, status.total, status.error.empty() ? "" : " · ", status.error)));
+    clipboard_cancel_.Visibility(status.busy ? xaml::Visibility::Visible : xaml::Visibility::Collapsed);
+    clipboard_panel_.Visibility(xaml::Visibility::Visible);
 }
 
 std::optional<std::pair<double, double>> StreamWindow::video_position(winrt::Windows::Foundation::Point point) const {
@@ -812,6 +884,7 @@ void StreamWindow::pointer_wheel(xaml::Input::PointerRoutedEventArgs const& args
 }
 
 void StreamWindow::release_all() {
+    suppressed_paste_.clear();
     if (held_keys_.empty() && held_buttons_.empty()) return;
     held_keys_.clear();
     held_buttons_.clear();

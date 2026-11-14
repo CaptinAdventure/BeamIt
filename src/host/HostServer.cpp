@@ -29,6 +29,14 @@ void run_host_server(HostServerOptions options) {
                      "displays", GetLastError());
     }
     Server server(std::move(options));
+    asio::post(server.bulk_worker, [] {
+        try { ClipboardBulkReceiver::recover(clipboard_staging_root()); }
+        catch (const std::exception&) {
+            // Native errors may contain private paths. Admission will fail closed and
+            // report a scoped transfer error if recovery/storage remains unavailable.
+            spdlog::warn("Clipboard staging recovery failed; bulk admission will recheck storage");
+        }
+    });
     const auto detect_process_elevation = [&server] {
         const auto integrity = input::process_integrity(GetCurrentProcessId());
         if (integrity.error) {

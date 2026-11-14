@@ -720,6 +720,7 @@ carries no content; the client calls `get_clipboard` if it wants the data.
   often add formats one by one); clients should debounce or compare
   `sequence` with the latest `clipboard` reply.
 * `formats` lists which of `"text"`, `"html"` and `"image"` are available.
+  Negotiated bulk peers can also receive `"files"` (§5.11.4).
 * `excluded` is `true` (and `formats` empty) when the owner marked the content
   with `ExcludeClipboardContentFromMonitorProcessing`, as password managers
   do. Clients should not fetch or mirror such content.
@@ -811,10 +812,227 @@ Replaces the whole host clipboard, as a local copy would:
   clients do not loop; `sequence` is the new clipboard sequence number.
 * Errors: `invalid_request` (missing/ill-typed fields, invalid base64 or PNG,
   too large) and `clipboard_unavailable` (clipboard held by another
-  application for more than about 100 ms, or the write failed; nothing is
-  changed). Replies may arrive after later replies; match them by `id`.
+  application for more than about 100 ms, or the write failed).
+  Supported-format preparation happens before replacement. If an OS write
+  fails after clearing the clipboard, BeamIt attempts supported-format
+  rollback; arbitrary third-party delayed formats cannot be restored
+  atomically. Failure is never acknowledged as success. Replies may arrive
+  after later replies; match them by `id`.
 
-Files (`CF_HDROP`), RTF and other formats are not exposed or accepted.
+Unnegotiated peers cannot transfer files. RTF and unrelated formats remain
+unsupported.
+
+#### 5.11.4 Optional bulk version 1
+
+The authentication protocol remains **1**. After authentication, a client
+may send `clipboard_bulk_negotiate` with a request `id` and `version: 1`.
+The reply is `clipboard_bulk_capabilities`, with the same `id`, `version: 1`
+and these unsigned integer fields:
+
+| Field | Value |
+|---|---:|
+| `max_file_bytes` | 2,000,000,000 |
+| `max_roots` | 64 |
+| `max_nodes` | 4,096 |
+| `max_manifest_bytes` | 4,194,304 |
+| `max_component_bytes` | 255 |
+| `max_path_bytes` | 4,096 |
+| `max_chunk_bytes` | 262,144 |
+| `max_png_bytes` | 67,108,864 |
+| `max_png_dimension` | 16,384 |
+| `max_png_pixels` | 67,108,864 |
+| `staging_quota_bytes` | 8,000,000,000 |
+| `scratch_bytes` | 134,217,728 |
+
+Only the old host's nonfatal `unknown_type` response permits legacy
+fallback. Malformed or incompatible capabilities are an explicit failure,
+not permission to downgrade. Until negotiation succeeds, §§5.11.1–3,
+including the combined 10 MiB legacy budget, are unchanged.
+
+For negotiated `get_clipboard`, `formats` also accepts `"files"` and
+defaults to all four formats.
+The `clipboard` reply contains `sequence`, `snapshot_id`, small `text` and
+`html` when available, `excluded`, `omitted`, and a preliminary `manifest`.
+PNG is a binary node, not `image.data`. An excluded snapshot exposes no file
+selection and must not be enumerated or fetched. An omitted format must not
+silently become a partial clipboard replacement.
+
+The manifest has unsigned `selected_roots`, unsigned `total_file_bytes`,
+and ordered `nodes`. A preliminary manifest also contains `roots`, an array
+of `{path, identity}`: one top-level selected file or folder per root.
+`identity` is an opaque 32-byte value encoded as canonical unpadded
+base64url. `snapshot_id` is an opaque 16-byte value in the same encoding,
+bound to the source clipboard generation and exact selection.
+
+| Node field | Contract |
+|---|---|
+| `type` | `directory`, `file`, or `png` |
+| `path` | UTF-8 relative path using `/`, including the selected root component |
+| `length` | Unsigned byte length; required for file/PNG, forbidden for directory |
+| `sha256` | Canonical unpadded base64url of 32 digest bytes; final file/PNG nodes only |
+| `width`, `height` | Positive unsigned PNG dimensions; forbidden for other node types |
+
+Preliminary nodes contain **no hashes**, token, or payload. Final manifests
+add hashes without changing paths, types, lengths, dimensions, root count
+or total regular-file bytes. Every ancestor must be a declared directory.
+There is at most one PNG node, separate from the selected-file root count
+and regular-file byte total. Its declared length is positive. Empty regular
+files have the SHA-256 of empty input.
+
+Reject absolute, traversal, empty/dot-component, alternate-stream,
+platform-invalid, control-character, overlong, duplicate, case-colliding,
+or Unicode-normalization-colliding paths. Reject symlinks, reparse points,
+special files and unreadable entries. Ordinary hidden files and nested and
+empty folders are included. No absolute source paths are sent.
+
+#### 5.11.5 Preparing and offering a transfer
+
+For **host to client**, the client confirms the preliminary selection when
+required, then sends `clipboard_bulk_request` with a short request `id`
+and `snapshot_id`. The immediate reply is `clipboard_bulk_progress` with
+that `id`, a new `transfer_id`, `source_snapshot_id`, `phase: "preparing"`,
+and completed/total bytes and nodes. This resolves the existing 10-second
+request; it does not wait for arbitrary spool-copy time.
+
+Later, an unsolicited `clipboard_bulk_offer` contains:
+
+- `direction: "host_to_client"`, `transfer_id`, `source_snapshot_id`,
+  `source_sequence`, `roots`, the final hashed `manifest`, `url`,
+  and `expires_in_ms: 10000`.
+
+The final selection and identities must equal the confirmed preliminary
+selection. If preparation changes the selection, the host discards its
+spool and sends `clipboard_bulk_reconfirm` with the old `transfer_id` and a
+fresh preliminary snapshot (`snapshot_id`, `sequence`, `manifest`, small
+formats and omission/exclusion state), **without a token**. The client must
+make a fresh policy/confirmation decision and request the new snapshot.
+
+For **client to host**, the client enumerates locally, obtains confirmation
+when required, and prepares an immutable hashed spool. It sends
+`clipboard_bulk_begin` with a short request `id`, `source_snapshot_id`,
+final `manifest`, optional small `text`/`html`, and optional `sensitive`
+(boolean, default false). A changed source invalidates the spool and any
+previous confirmation. The reply is `clipboard_bulk_offer` with the same
+`id`, `direction: "client_to_host"`, `transfer_id`, `source_snapshot_id`,
+`destination_sequence`, the exact final `manifest`, `url`, and
+`expires_in_ms: 10000`.
+
+In **both directions the native client opens** the offered
+`wss://` URL at `/bulk/{transfer_id}?token=…`. It must have exactly the
+authenticated control authority, no user information/fragment/extra query,
+and use the same certificate pin. IDs are cryptographically random 128-bit
+values; tokens are random 256-bit values; both use canonical unpadded
+base64url. Tokens are session/authorization-generation, direction, snapshot
+and manifest bound, single-use, and expire after 10 seconds. Wrong, expired,
+used, stale-session or superseded-session claims are rejected. Never log
+tokens, clipboard payloads, or source paths/names.
+
+#### 5.11.6 Binary bulk frames
+
+Each binary WebSocket message contains one 40-byte header followed by one
+chunk. All multi-byte integers are unsigned big-endian.
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 4 | ASCII `BMB1` |
+| 4 | 1 | Version `1` |
+| 5 | 1 | Kind: `1` file, `2` PNG, `3` END |
+| 6 | 2 | Reserved, zero |
+| 8 | 16 | Raw transfer ID |
+| 24 | 4 | Manifest node index |
+| 28 | 8 | Offset within this node |
+| 36 | 4 | Payload length |
+
+Data payloads are 1–262,144 bytes; length must equal the message length
+minus 40. Process nonempty content nodes in manifest order, with exactly
+contiguous offsets starting at zero. Directory and zero-byte file nodes
+send no data frames. Validate every declared length and SHA-256.
+
+The sender's final message is END: kind `3`, node index `0xffffffff`,
+offset equal to **all file plus PNG lengths**, zero payload, exactly 40
+bytes. Even an all-empty transfer sends END. Serial receiver staging must
+drain each preceding write/digest update before accepting END. Reject text,
+wrong IDs/kinds/indices, reserved bytes, gaps, overlaps, duplicates, overruns,
+early/missing/duplicate END, and any message after END. A socket close
+without valid END is interruption, never success.
+
+#### 5.11.7 Publication and terminal events
+
+For client-to-host, the sender rechecks the source and sends
+`clipboard_bulk_commit` with short request `id`, `transfer_id`, and
+`source_snapshot_id`. The reply `clipboard_bulk_committed` only accepts the
+commit barrier; **it is not completion**. The receiver accepts valid END
+and a matching control commit in either arrival order and publishes only
+after both. Identical duplicate commits are idempotent; mismatches fail.
+Host-to-client needs no control commit.
+
+The receiver promotes the complete verified staging selection, rechecks
+destination clipboard revision, exclusion/cancellation and focus guards,
+then prepares and publishes all supported native formats together.
+Windows uses `CF_HDROP`; macOS uses native file-URL pasteboard objects.
+Only after native publication succeeds does the receiver send
+`clipboard_bulk_complete` with `transfer_id` and its new `sequence`.
+The sender must wait for this event, not the last socket write, END,
+socket closure, or a commit reply. Across sockets, bulk closure after END
+may precede the authoritative control outcome.
+
+`clipboard_bulk_progress` events have `transfer_id`, `phase`,
+`completed_bytes`, `total_bytes`, `completed_nodes`, `total_nodes`.
+Preparation uses `preparing`, host sending uses `sending`, and receiver
+reports use `receiving` (including the drained END boundary). Native UI can
+show confirmation and publishing separately. Reports are monotonic,
+bounded by the declared totals, no more than four per second and only on
+changed values; replayed progress does not refresh the timeout.
+
+The client can send `clipboard_bulk_cancel` with `transfer_id`. Receiver
+failure/cancellation outcomes are `clipboard_bulk_failed` or
+`clipboard_bulk_cancelled`, with `transfer_id` and a diagnostic `code`;
+failure can include `message`. Examples of codes include `source_changed`,
+`stale_clipboard`, `digest_mismatch`, `quota_exceeded`, `storage_failed`,
+`disk_full`, `permission_denied`,
+`clipboard_unavailable`, `cancelled` and `timeout`. Pre-offer failures use
+the normal request `error` envelope. Session stop, supersession, expiry,
+stale revision, filesystem/clipboard failure and cancellation close the
+socket and clean only unpublished work. Never release a pending paste on
+failure, decline, cancellation or stale target/source state.
+
+Native APIs do not offer an atomic transaction over arbitrary delayed
+third-party formats. BeamIt prepares supported formats before clearing and
+attempts supported-format rollback on a later write failure. It reports
+that limitation and never reports success or knowingly publishes a partial
+file list. If OS references may survive rollback failure, retain their
+staging files conservatively.
+
+#### 5.11.8 Policy, storage and resource bounds
+
+Clients own confirmation in both directions. Default automatic policy is
+**regular-file bytes < 500,000,000 AND selected roots <= 5**. A folder is
+one selected root; all descendant regular-file bytes count. Reaching the
+byte threshold, or exceeding the root threshold, requires Transfer/Cancel
+confirmation **before payload**. Hard limits in §5.11.4 still apply after
+confirmation. PNG-only content follows its separate image limit. Existing
+platform preferences configure the two validated thresholds; no new
+settings UI or CLI is defined.
+
+Use private immutable sender spools and no-follow receiver staging, with
+source identity/metadata checks before/after copying and before END/commit.
+Do disk enumeration, hashing and file I/O off clipboard, UI, control,
+capture and encode paths. Limit each session to one transfer/socket, one
+outstanding WSS write, at most 1 MiB queued payload, 256 KiB chunks and an
+8 MiB/s token bucket with 1 MiB burst. Cancel after 30 seconds without
+progress or 30 minutes total. Short control requests retain their 10-second
+deadline.
+
+The shared application staging root has an 8,000,000,000-byte quota plus
+per-operation 128 MiB scratch reservation **within** that quota. A
+cross-process lock/ledger accounts actual bytes plus unmaterialized
+reservations without double counting. Preserve live owners; recover only
+abandoned outgoing/partial work. Delete outgoing spools and failed partials
+on terminal outcomes. Never automatically delete published receiver files:
+clipboard owners and consuming applications may still reference them.
+Manual cleanup requires clearing the clipboard and closing consumers first.
+No resume, move/cut, file promises, metadata/ACL replication, general file
+browser, or cloud transport is defined.
 
 ### 5.12 Windows (host → client)
 
@@ -1434,4 +1652,4 @@ if unsupported, restart the stream with `"codec": "h265"`.
 
 These are not implemented in version 1; the names are reserved:
 
-* Touch and pen input, clipboard file transfer.
+* Touch and pen input.

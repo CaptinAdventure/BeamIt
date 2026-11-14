@@ -114,6 +114,23 @@ awaitable<void> upgrade(Server& server, std::shared_ptr<WebSocket> ws, http::req
         co_await ControlSession::run(std::make_shared<ControlSession>(server, ws, authority, remote));
         co_return;
     }
+    constexpr std::string_view bulk_prefix = "/bulk/";
+    const auto bulk_query = target.find("?token=");
+    if (target.starts_with(bulk_prefix) && bulk_query != std::string::npos) {
+        const auto id = std::string_view(target).substr(bulk_prefix.size(), bulk_query - bulk_prefix.size());
+        const auto token = std::string_view(target).substr(bulk_query + 7);
+        const auto session = server.active.lock();
+        const auto entry = session ? session->claim_bulk(id, token) : nullptr;
+        if (!entry) {
+            co_await write_status(*ws, request, http::status::forbidden);
+            co_return;
+        }
+        configure_websocket(*ws, net::clipboard_bulk::frame_header_size + net::clipboard_bulk::max_chunk_size);
+        ws->binary(true);
+        co_await ws->async_accept(request, use_awaitable);
+        session->attach_bulk(entry, ws);
+        co_return;
+    }
     constexpr std::string_view audio_prefix = "/audio/";
     const auto audio_query = target.find("?token=");
     if (target.starts_with(audio_prefix) && audio_query != std::string::npos) {

@@ -2,6 +2,7 @@
 
 #include "AppUtil.hpp"
 #include "ClientSession.hpp"
+#include "ClipboardManager.hpp"
 #include "HostWindows.hpp"
 #include "StreamWindow.hpp"
 
@@ -41,6 +42,9 @@ private:
     void on_connected();
     void end_session(std::optional<std::string> error);
     void handle_message(const json::object& message);
+    void clipboard_context();
+    void clipboard_status(ClipboardManager::Status status);
+    winrt::fire_and_forget confirm_clipboard(std::uint32_t roots, std::uint64_t bytes, std::function<void(bool)> done);
 
     void start_stream(json::object source, bool activate, bool from_picker, std::optional<std::int64_t> follow);
     void reconcile();
@@ -56,6 +60,7 @@ private:
 
     Settings settings_;
     std::unique_ptr<Session> session_;
+    std::unique_ptr<ClipboardManager> clipboard_;
     bool connecting_{};
     HostWindowList host_windows_;
     std::map<std::string, std::shared_ptr<StreamWindow>> streams_;
@@ -86,6 +91,9 @@ private:
     winrt::Microsoft::UI::Xaml::Controls::TextBlock applications_count_{nullptr};
     winrt::Microsoft::UI::Xaml::Controls::TextBox search_box_{nullptr};
     winrt::Microsoft::UI::Xaml::Controls::ComboBox mode_box_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::TextBlock clipboard_text_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::Button clipboard_cancel_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::ContentDialog clipboard_dialog_{nullptr};
 };
 
 } // namespace beamit::client

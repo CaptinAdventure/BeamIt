@@ -3,7 +3,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <string>
 #include <vector>
@@ -108,6 +111,49 @@ TEST_CASE("DIBs gain a bitmap file header with the pixel offset", "[clipboard]")
     CHECK(reinterpret_cast<const BITMAPFILEHEADER*>(host::bitmap_file_from_dib(paletted)->data())->bfOffBits ==
           sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + 256 * sizeof(RGBQUAD));
     CHECK_FALSE(host::bitmap_file_from_dib(std::span(dib).first(10)));
+}
+
+TEST_CASE("native file-drop payload preserves multiple Unicode file and folder references", "[clipboard]") {
+    const auto suffix = net::base64url_encode(net::random_bytes(8));
+    const auto root = std::filesystem::temp_directory_path() / ("BeamItClipboardDrop-" + suffix);
+    struct RemoveTree {
+        std::filesystem::path path;
+        ~RemoveTree() {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+    } cleanup{root};
+    REQUIRE(std::filesystem::create_directories(root / "資料" / "empty"));
+    const auto file = root / "資料" / "résumé.txt";
+    {
+        std::ofstream output(file, std::ios::binary);
+        REQUIRE(output.good());
+        output << "local staged file";
+    }
+
+    const std::array paths{file, root / "資料" / "empty"};
+    const auto payload = host::encode_file_drop(paths);
+    REQUIRE(payload);
+    REQUIRE(payload->size() >= 20 + 3 * sizeof(wchar_t));
+    std::uint32_t file_list_offset{};
+    BOOL wide_paths{};
+    std::memcpy(&file_list_offset, payload->data(), sizeof(file_list_offset));
+    std::memcpy(&wide_paths, payload->data() + 16, sizeof(wide_paths));
+    CHECK(file_list_offset == 20);
+    CHECK(wide_paths == TRUE);
+
+    std::wstring expected;
+    for (const auto& path : paths) {
+        expected += path.native();
+        expected.push_back(L'\0');
+    }
+    expected.push_back(L'\0');
+    const auto* actual = reinterpret_cast<const wchar_t*>(payload->data() + file_list_offset);
+    CHECK(std::wstring_view(actual, expected.size()) == expected);
+
+    const std::array missing{root / "missing"};
+    CHECK_FALSE(host::encode_file_drop(missing));
+    CHECK_FALSE(host::encode_file_drop(std::span<const std::filesystem::path>{}));
 }
 
 TEST_CASE("DIBs convert to PNG", "[clipboard]") {

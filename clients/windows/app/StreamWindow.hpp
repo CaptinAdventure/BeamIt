@@ -2,6 +2,7 @@
 
 #include "AppUtil.hpp"
 #include "ClientSession.hpp"
+#include "ClipboardManager.hpp"
 #include "VideoPipeline.hpp"
 
 #include <windows.h>
@@ -29,6 +30,9 @@ public:
     struct Callbacks {
         std::function<void(const std::string& stream_id)> closed;  // Window closed locally (stop requested).
         std::function<void(const std::string& message)> error;    // Show in the connection window.
+        std::function<void(bool)> focused;
+        std::function<void(std::function<void(bool)>)> paste;
+        std::function<void()> cancel_clipboard;
     };
 
     static std::shared_ptr<StreamWindow> create(Session& session, StreamOffer offer, Callbacks callbacks);
@@ -48,6 +52,8 @@ public:
     [[nodiscard]] std::wstring title() const;
     [[nodiscard]] HWND hwnd() const { return hwnd_; }
     [[nodiscard]] bool closed() const { return closed_; }
+    [[nodiscard]] winrt::Microsoft::UI::Xaml::XamlRoot clipboard_root() const { return root_.XamlRoot(); }
+    void clipboard_status(const ClipboardManager::Status&);
 
 private:
     StreamWindow(Session& session, StreamOffer offer, Callbacks callbacks);
@@ -80,6 +86,7 @@ private:
     void pointer_wheel(winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
     std::optional<std::pair<double, double>> video_position(winrt::Windows::Foundation::Point point) const;
     void release_all();
+    void forward_paste(bool insert);
     void capture_mouse(bool capture);
     void raw_input(LPARAM lparam);
 
@@ -107,6 +114,10 @@ private:
     std::set<std::string> attention_;
     std::set<std::string> held_buttons_;
     std::set<std::string> held_keys_;
+    std::set<unsigned> suppressed_paste_;
+    winrt::Microsoft::UI::Xaml::Controls::Border clipboard_panel_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::TextBlock clipboard_text_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::Button clipboard_cancel_{nullptr};
     bool closed_{};
     bool fullscreen_{};
     bool allow_scaling_{};

@@ -3,9 +3,11 @@
 **Status: functional streaming client, feature parity in progress.** The
 client connects to a host, pins its certificate, authenticates, lists host
 applications and streams windows, applications and desktops into native
-windows with keyboard and mouse input. Clipboard sync, text sending,
-anti-idle, the remote popup coordinator and audio
-are not implemented yet (see [the implementation plan](IMPLEMENTATION-PLAN.md)).
+windows with keyboard and mouse input. Bidirectional clipboard text/HTML/PNG
+and file/folder integration is implemented; native clipboard/UI and LAN
+validation remain pending. Text sending, anti-idle, the remote popup
+coordinator and audio are not implemented yet
+(see [the implementation plan](IMPLEMENTATION-PLAN.md)).
 Teams and cross-machine LAN behavior have not been validated.
 
 ## Architecture
@@ -20,7 +22,9 @@ and taskbar attention.
   (network thread, WSS transport, pinning, requests, stream sockets),
   `FrameProtocol` (binary frames, generation/key-frame gate), `HostWindows`
   (window model, application grouping, search, window following),
-  `KeyCodes` (scan code to `KeyboardEvent.code`) and `VideoPipeline`
+  `ClipboardManager` (negotiation, background spool/staging, confirmation,
+  receiver acknowledgement and paste guards), `KeyCodes` (scan code to
+  `KeyboardEvent.code`) and `VideoPipeline`
   (Media Foundation decoding and D3D11 presentation).
 - **`app/` (WinUI MSBuild project):** `ClientApp` (connection and source
   window, tray, stream bookkeeping) and `StreamWindow` (one window per
@@ -128,6 +132,77 @@ the WinUI project its include paths, definitions and static libraries.
   **Exit fullscreen** and **Close**. It hides again shortly after the
   pointer leaves it unless pinned.
 
+## Clipboard transfers
+
+After connecting, enable **Synchronize clipboard while BeamIt is active**,
+or use **Send clipboard** / **Get clipboard** manually. Manual transfers work
+with automatic synchronization disabled. Keep the intended BeamIt window
+active; changing focus, disabling sync or disconnecting cancels pending work.
+Ctrl+V/Shift+Insert waits for host clipboard publication before forwarding
+paste to the same foreground stream.
+
+Both directions support text, HTML, transparent PNG and multiple ordinary
+files/folders, including nested, empty and hidden entries. Automatic bulk
+transfer requires regular-file bytes **< 500,000,000 AND roots <= 5**.
+A folder is one root, with all descendant bytes counted. Otherwise a
+Transfer/Cancel prompt appears before payload. Progress/Cancel is visible
+for automatic transfers too. Source changes discard old confirmation.
+Completion means receiver native publication, not queued bytes.
+
+Close the app before editing nonsecret
+`%LOCALAPPDATA%\BeamIt\windows-client.json`. Set integer
+`clipboard_bulk_byte_threshold` (0–2,000,000,000) and
+`clipboard_bulk_entry_threshold` (0–64); restart to load them.
+Invalid values produce diagnostics and fall back to 500,000,000/5. These
+preferences do not increase the hard limits or add a new settings UI.
+
+Limits, unsupported entries, shared quota and manual cleanup are documented
+in [the main Clipboard section](../../README.md#clipboard). Windows host and
+client share `%LOCALAPPDATA%\BeamIt\ClipboardStaging`; do not delete published
+`host/committed` or `client/committed` selections until the clipboard is
+cleared and **all** consumers have closed. Published files are never
+automatically deleted. Rollback preserves supported native formats where
+possible, not arbitrary delayed-render formats; rollback failure is not
+transfer success and may require retaining referenced files.
+
+The optional protocol extension uses pinned, client-opened `/bulk` WSS in
+both directions. Only `unknown_type` from an old host enables legacy
+text/HTML/base64-PNG fallback; files are unavailable there. There is no resume
+or cut/move behavior. See [PROTOCOL.md §5.11](../../PROTOCOL.md#511-clipboard).
+
+### Focused clipboard checks
+
+Build the core/tests with the existing script below, then select:
+
+```powershell
+& .\clients\windows\build\core\Debug\BeamItClientTests.exe `
+  '[clipboard-manager],[clipboard-settings],[client-session]'
+```
+
+For an existing isolated core cache, substitute that cache's executable.
+The WinUI project can link it without changing toolset/SDK:
+
+```powershell
+& '<registered VS installation>\MSBuild\Current\Bin\MSBuild.exe' `
+  .\clients\windows\app\BeamIt.Windows.vcxproj `
+  /p:Configuration=Debug /p:Platform=x64 `
+  /p:BeamItCoreBuildDirectory='<absolute isolated core cache>' /verbosity:minimal
+```
+
+Use a fresh shell or the matching VS2026 developer environment for that
+MSBuild. An inherited VS2022 `VisualStudioVersion=17.0` can incorrectly
+select v17 PRI tasks even when the v18 tools are installed.
+
+Focused authenticated mock-WSS checks and the v145 WinUI build pass on the
+development machine. They do **not** verify the real OS clipboard, UI,
+Explorer/application paste, LAN or concurrent video/input behavior.
+Before release, run both-direction native tests with disposable files:
+verify text/HTML and PNG alpha; nested/empty/hidden folders; five/six roots
+and exact byte threshold; decline/Cancel; source/destination/focus changes;
+disconnect/restart; and pasted-reference retention after clipboard
+replacement. During a representative large transfer, measure control/input
+latency and video behavior. Native/LAN/stress results remain **NOT RUN**.
+
 ## Windows prerequisites
 
 - Windows 11 x64.
@@ -138,14 +213,15 @@ the WinUI project its include paths, definitions and static libraries.
   ```powershell
   & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe" modify `
     --installPath 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools' `
-    --add Microsoft.VisualStudio.Workload.UniversalBuildTools `
-    --add Microsoft.VisualStudio.ComponentGroup.WindowsAppDevelopment.VC.BuildTools `
-    --add Microsoft.VisualStudio.ComponentGroup.UWP.VC.BuildTools `
+    --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+    --add Microsoft.VisualStudio.ComponentGroup.UWP.BuildTools `
     --passive --norestart
   ```
 
   These components provide the `AppxPackage` PRI tasks that the WinUI build
-  needs, even for this unpackaged app.
+  needs, even for this unpackaged app. Substitute the actual registered
+  installation path; keep it quoted. Keep the project's required Windows
+  SDK installed. Do not retarget the project to bypass a missing toolset.
 - The x64 Windows App Runtime is **not** required on clients: the app is built
   self-contained (`WindowsAppSDKSelfContained`), so its output folder carries
   the Windows App SDK 2.6.5 binaries. The project pins `Microsoft.WindowsAppSDK` `2.6.5` and

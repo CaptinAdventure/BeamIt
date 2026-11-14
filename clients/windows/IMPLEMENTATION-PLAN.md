@@ -1,5 +1,14 @@
 # Windows client: implementation plan and handoff
 
+> Clipboard update: the later approved `clipboard-bulk-transfer` task
+> supersedes this plan's historical no-file-transfer clipboard scope.
+> Production bidirectional text/HTML/PNG/files/folders, confirmation,
+> progress/cancel and paste guards are now implemented. Focused manager
+> tests and the v145 WinUI build pass; native clipboard/UI/LAN/stress
+> validation remains open. See [README.md](README.md#clipboard-transfers)
+> and [PROTOCOL.md §5.11](../../PROTOCOL.md#511-clipboard). Paced text,
+> anti-idle and unrelated parity work are not completed by that task.
+
 ## Resume instruction
 
 Give Copilot this instruction in the target machine's BeamIt checkout:
@@ -486,7 +495,7 @@ Recreate session-local tasks if necessary; markdown is the portable source.
 | `win-media` | First version done; host end-to-end test passes | `win-session` |
 | `win-input` | First version done; awaiting interactive testing | `win-shell`, `win-media` |
 | `win-popups` | Pending (popups currently follow only via All windows for main/owned/tool roles) | `win-shell`, `win-media` |
-| `win-utilities` | Pending (clipboard, paced text, anti-idle) | `win-input` |
+| `win-utilities` | Clipboard implemented; native validation open. Paced text/anti-idle pending | `win-input` |
 | `win-options` | Partial (stream info, scaling, screenshot, rate dialog); richer live diagnostics pending | `win-popups`, `win-utilities` |
 | `win-validation` | Pending | `win-options` |
 | `win-audio` | Pending; final phase | `win-validation` |

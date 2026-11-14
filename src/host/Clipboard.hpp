@@ -2,12 +2,15 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <expected>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -19,6 +22,7 @@ enum ClipboardFormat : unsigned {
     clipboard_text = 1U << 0,
     clipboard_html = 1U << 1,
     clipboard_image = 1U << 2,
+    clipboard_files = 1U << 3,
     clipboard_all = clipboard_text | clipboard_html | clipboard_image,
 };
 
@@ -38,7 +42,10 @@ struct ClipboardContent {
     std::optional<std::string> text; // UTF-8
     std::optional<std::string> html; // UTF-8 fragment of the "HTML Format" data
     std::optional<ClipboardImage> image;
+    // Local file references. Never serialize these absolute paths as control metadata.
+    std::vector<std::filesystem::path> files;
     std::vector<ClipboardOmission> omitted;
+    bool excluded{};
 };
 
 struct ClipboardReadResult {
@@ -51,13 +58,22 @@ struct ClipboardWrite {
     std::optional<std::string> text;   // UTF-8
     std::optional<std::string> html;   // UTF-8 fragment
     std::optional<std::string> image;  // PNG, standard base64
+    std::optional<std::vector<std::byte>> png; // Binary PNG from a verified bulk transfer.
+    // Absolute paths to already staged, immutable files or directories.
+    std::vector<std::filesystem::path> files;
     bool sensitive{};                  // hide from clipboard history, cloud clipboard and clipboard monitors
+    std::optional<DWORD> expected_sequence;
+    std::shared_ptr<std::atomic_bool> publication_allowed;
+    std::optional<HWND> expected_foreground;
 };
 
 struct ClipboardWriteResult {
     DWORD sequence{};
     std::string error_code; // empty on success: "invalid_request" or "clipboard_unavailable"
     std::string error;
+    // Conservative retention after an OS replacement/rollback failure. This does
+    // not mean publication succeeded and must never produce a success acknowledgement.
+    bool retain_files{};
 };
 
 // A PNG decoded into a packed bottom-up 32-bit CF_DIB (alpha composited onto white, as most paste targets ignore it).
@@ -85,6 +101,9 @@ struct ClipboardChange {
 [[nodiscard]] std::optional<ClipboardDib> dib_from_png(std::span<const std::byte> png);
 // Width and height from a PNG's IHDR chunk.
 [[nodiscard]] std::optional<std::pair<std::uint32_t, std::uint32_t>> png_dimensions(std::span<const std::byte> png);
+// Builds a native CF_HDROP payload for already-staged local paths. Rejects missing or reparse-point roots.
+[[nodiscard]] std::expected<std::vector<std::byte>, std::string>
+encode_file_drop(std::span<const std::filesystem::path> paths);
 // Base64 (RFC 4648 §4, padded) length of `bytes` input bytes.
 [[nodiscard]] constexpr std::size_t base64_length(std::size_t bytes) { return (bytes + 2) / 3 * 4; }
 
@@ -103,6 +122,8 @@ public:
     // Queues a read of the requested `formats`. Text/HTML bytes plus the base64 PNG size must fit `max_bytes`;
     // formats that do not fit are reported in `omitted` as "too_large".
     void read(unsigned formats, std::size_t max_bytes, ReadCallback done);
+    // Negotiated mode budgets text/HTML separately from the capped binary PNG.
+    void read_bulk(unsigned formats, ReadCallback done);
     // Queues replacing the clipboard with `content`. Changes made this way are not reported to the change callback.
     void write(ClipboardWrite content, std::function<void(ClipboardWriteResult)> done);
 

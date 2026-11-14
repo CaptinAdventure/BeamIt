@@ -105,6 +105,13 @@ void ClientApp::initialize() {
 
     winrt::check_bool(SetWindowSubclass(hwnd_, subclass, 1, reinterpret_cast<DWORD_PTR>(this)));
     taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
+    window_.Activated([weak = weak_from_this()](auto&&, xaml::WindowActivatedEventArgs const& args) {
+        if (auto self = weak.lock(); self && self->clipboard_) {
+            if (args.WindowActivationState() == xaml::WindowActivationState::Deactivated) {
+                self->clipboard_->context({.enabled = self->settings_.clipboard_sync});
+            } else self->clipboard_context();
+        }
+    });
     tray_added_ = add_tray();
     window_.Activate();
     update_connect_state();
@@ -208,6 +215,44 @@ void ClientApp::build_source_view() {
     source_error_ = text(L"", 13);
     source_error_.Foreground(brush(0xC4, 0x2B, 0x1C));
     source_view_.Children().Append(source_error_);
+    controls::CheckBox clipboard_sync;
+    clipboard_sync.Content(winrt::box_value(L"Synchronize clipboard while BeamIt is active"));
+    clipboard_sync.IsChecked(settings_.clipboard_sync);
+    clipboard_sync.Click([weak = weak_from_this(), clipboard_sync](auto&&, auto&&) {
+        if (auto self = weak.lock()) {
+            self->settings_.clipboard_sync = clipboard_sync.IsChecked().Value();
+            self->settings_.save();
+            self->clipboard_context();
+        }
+    });
+    source_view_.Children().Append(clipboard_sync);
+    controls::StackPanel clipboard_actions;
+    clipboard_actions.Orientation(controls::Orientation::Horizontal);
+    clipboard_actions.Spacing(8);
+    controls::Button upload, download;
+    upload.Content(winrt::box_value(L"Send clipboard"));
+    download.Content(winrt::box_value(L"Get clipboard"));
+    upload.Click([weak = weak_from_this()](auto&&, auto&&) {
+        if (auto self = weak.lock(); self && self->clipboard_) { self->clipboard_context(); self->clipboard_->upload(); }
+    });
+    download.Click([weak = weak_from_this()](auto&&, auto&&) {
+        if (auto self = weak.lock(); self && self->clipboard_) { self->clipboard_context(); self->clipboard_->download(); }
+    });
+    clipboard_cancel_ = controls::Button();
+    clipboard_cancel_.Content(winrt::box_value(L"Cancel transfer"));
+    clipboard_cancel_.Visibility(xaml::Visibility::Collapsed);
+    clipboard_cancel_.Click([weak = weak_from_this()](auto&&, auto&&) {
+        if (auto self = weak.lock(); self && self->clipboard_) {
+            self->clipboard_->cancel();
+            if (self->clipboard_dialog_) self->clipboard_dialog_.Hide();
+        }
+    });
+    clipboard_actions.Children().Append(upload);
+    clipboard_actions.Children().Append(download);
+    clipboard_actions.Children().Append(clipboard_cancel_);
+    source_view_.Children().Append(clipboard_actions);
+    clipboard_text_ = text(L"", 12);
+    source_view_.Children().Append(clipboard_text_);
     streams_panel_ = controls::StackPanel();
     streams_panel_.Spacing(4);
     source_view_.Children().Append(streams_panel_);
@@ -350,6 +395,21 @@ void ClientApp::connect() {
 }
 
 void ClientApp::on_connected() {
+    const auto queue = DispatcherQueue::GetForCurrentThread();
+    ClipboardManager::Callbacks clipboard_callbacks;
+    clipboard_callbacks.confirm = [weak = weak_from_this()](auto roots, auto bytes, auto done) {
+        if (auto self = weak.lock()) self->confirm_clipboard(roots, bytes, std::move(done));
+        else done(false);
+    };
+    clipboard_callbacks.status = [weak = weak_from_this()](auto status) {
+        if (auto self = weak.lock()) self->clipboard_status(std::move(status));
+    };
+    clipboard_ = std::make_unique<ClipboardManager>(*session_,
+        [queue](auto function) { queue.TryEnqueue([function = std::move(function)] { function(); }); },
+        std::move(clipboard_callbacks));
+    clipboard_->policy({settings_.clipboard_bulk_byte_threshold, settings_.clipboard_bulk_entry_threshold});
+    clipboard_context();
+    clipboard_->start();
     update_connect_state();
     connect_view_.Visibility(xaml::Visibility::Collapsed);
     source_view_.Visibility(xaml::Visibility::Visible);
@@ -360,8 +420,62 @@ void ClientApp::on_connected() {
     refresh_streams();
 }
 
+void ClientApp::clipboard_context() {
+    if (!clipboard_) return;
+    ClipboardManager::Context context{.enabled = settings_.clipboard_sync};
+    const auto foreground = GetForegroundWindow();
+    if (foreground == hwnd_) {
+        context.active = true; context.foreground = hwnd_;
+    }
+    for (const auto& [id, stream] : streams_) {
+        if (!stream->closed() && stream->hwnd() == foreground) {
+            context.active = true; context.foreground = foreground;
+            context.stream = id; context.target = stream->offer().source.hwnd;
+            break;
+        }
+    }
+    clipboard_->context(std::move(context));
+}
+
+void ClientApp::clipboard_status(ClipboardManager::Status status) {
+    auto label = std::format("Clipboard: {} · {} / {} bytes", status.phase, status.bytes, status.total);
+    if (!status.error.empty()) label += " · " + status.error;
+    clipboard_text_.Text(hstring(label));
+    clipboard_cancel_.Visibility(status.busy ? xaml::Visibility::Visible : xaml::Visibility::Collapsed);
+    if (!status.busy && clipboard_dialog_) clipboard_dialog_.Hide();
+    for (const auto& [id, stream] : streams_) stream->clipboard_status(status);
+}
+
+winrt::fire_and_forget ClientApp::confirm_clipboard(std::uint32_t roots, std::uint64_t bytes,
+                                                  std::function<void(bool)> done) {
+    auto lifetime = shared_from_this();
+    if (clipboard_dialog_) { done(false); co_return; }
+    xaml::XamlRoot root{nullptr};
+    const auto foreground = GetForegroundWindow();
+    if (foreground == hwnd_) root = window_.Content().XamlRoot();
+    for (const auto& [id, stream] : streams_) {
+        if (!stream->closed() && stream->hwnd() == foreground) root = stream->clipboard_root();
+    }
+    if (!root) { done(false); co_return; }
+    clipboard_dialog_ = controls::ContentDialog();
+    clipboard_dialog_.XamlRoot(root);
+    clipboard_dialog_.Title(winrt::box_value(L"Transfer clipboard selection?"));
+    clipboard_dialog_.Content(winrt::box_value(hstring(std::format(
+        "{} selected roots · {} bytes in regular files.\nFolders include every descendant. Transfer this selection?",
+        roots, bytes))));
+    clipboard_dialog_.PrimaryButtonText(L"Transfer");
+    clipboard_dialog_.CloseButtonText(L"Cancel");
+    bool approved{};
+    try { approved = (co_await clipboard_dialog_.ShowAsync()) == controls::ContentDialogResult::Primary; }
+    catch (const winrt::hresult_error&) { set_error("Clipboard confirmation could not be displayed."); }
+    clipboard_dialog_ = nullptr;
+    done(approved);
+}
+
 void ClientApp::end_session(std::optional<std::string> error) {
     if (!session_) return;
+    if (clipboard_dialog_) clipboard_dialog_.Hide();
+    clipboard_.reset(); // Joins native/disk work before Session is destroyed.
     for (auto& [id, stream] : std::exchange(streams_, {})) stream->close_after_host_stop();
     followed_.clear();
     handled_.clear();
@@ -380,6 +494,7 @@ void ClientApp::end_session(std::optional<std::string> error) {
 
 void ClientApp::handle_message(const json::object& message) {
     if (!session_) return;
+    if (clipboard_) clipboard_->event(message);
     const auto type = string_field(message, "type").value_or("");
     if (type == "window_opened" || type == "window_changed" || type == "window_closed") {
         const auto* object = message.if_contains("window");
@@ -466,6 +581,22 @@ void ClientApp::start_stream(json::object source, bool activate, bool from_picke
             };
             callbacks.error = [weak](const std::string& message) {
                 if (const auto app = weak.lock()) app->set_error(message);
+            };
+            callbacks.focused = [weak](bool active) {
+                if (auto app = weak.lock(); app && app->clipboard_) {
+                    if (active) app->clipboard_context();
+                    else app->clipboard_->context({.enabled = app->settings_.clipboard_sync});
+                }
+            };
+            callbacks.paste = [weak](auto done) {
+                if (auto app = weak.lock(); app && app->clipboard_) {
+                    app->clipboard_context();
+                    app->clipboard_->paste(std::move(done));
+                }
+                else done(false);
+            };
+            callbacks.cancel_clipboard = [weak] {
+                if (auto app = weak.lock(); app && app->clipboard_) app->clipboard_->cancel();
             };
             auto window = StreamWindow::create(*self->session_, std::move(*offer), std::move(callbacks));
             self->streams_[id] = window;

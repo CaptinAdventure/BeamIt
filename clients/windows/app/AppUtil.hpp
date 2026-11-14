@@ -7,6 +7,8 @@
 #include <winrt/base.h>
 
 #include <filesystem>
+#include <functional>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -29,9 +31,14 @@ struct Settings {
     bool clipboard_sync{};
     bool anti_idle{};
     bool follow_all_windows{true};
+    std::uint64_t clipboard_bulk_byte_threshold{500'000'000};
+    std::uint32_t clipboard_bulk_entry_threshold{5};
 
     [[nodiscard]] static std::filesystem::path path();
     [[nodiscard]] static Settings load();
+    // Parses non-secret settings without accessing the user's configuration file.
+    // An omitted diagnostic callback uses the Windows debug diagnostic channel.
+    [[nodiscard]] static Settings parse(std::string_view, std::function<void(std::string_view)> diagnostic = {});
     void save() const;
 };
 

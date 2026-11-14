@@ -159,6 +159,7 @@ void Server::change_password(HostCommand& command) {
     options.auth_key = command.auth_key;
     options.auth_salt = std::move(command.auth_salt);
     ++auth_generation;
+    if (auto session = active.lock()) session->invalidate_bulk();
     if (command.disconnect_client) {
         if (auto session = active.lock()) {
             session->close(websocket::close_code::policy_error, "connection password changed");
@@ -226,6 +227,7 @@ void ControlSession::send_error(const RequestId& id, std::string_view code, std:
 
 void ControlSession::close(websocket::close_code code, std::string_view reason) {
     if (closing_) return;
+    invalidate_bulk();
     closing_ = true;
     server_.publish_status();
     if (stats_timer_) stats_timer_->cancel();
@@ -306,6 +308,7 @@ awaitable<void> ControlSession::run(std::shared_ptr<ControlSession> self) {
     if (self->stats_timer_) self->stats_timer_->cancel();
     if (self->cursor_timer_) self->cursor_timer_->cancel();
     self->closing_ = true;
+    self->invalidate_bulk();
     self->stop_all_streams(websocket::close_code::going_away);
     if (self->server_.active.lock() == self) self->server_.active.reset();
     self->server_.publish_status();
@@ -343,6 +346,15 @@ void ControlSession::handle(const std::string& text) {
         {"get_window_icon", &ControlSession::get_window_icon},
         {"get_clipboard", &ControlSession::get_clipboard},
         {"set_clipboard", &ControlSession::set_clipboard},
+        {"clipboard_bulk_negotiate", &ControlSession::bulk_negotiate},
+        {"clipboard_bulk_begin", &ControlSession::bulk_begin},
+        {"clipboard_bulk_commit", &ControlSession::bulk_commit},
+        {"clipboard_bulk_cancel", &ControlSession::bulk_cancel},
+        {"clipboard_bulk_request", &ControlSession::bulk_request},
+        {"clipboard_bulk_complete", &ControlSession::bulk_receiver_complete},
+        {"clipboard_bulk_progress", &ControlSession::bulk_receiver_progress},
+        {"clipboard_bulk_failed", &ControlSession::bulk_receiver_failed},
+        {"clipboard_bulk_cancelled", &ControlSession::bulk_receiver_failed},
         {"start_stream", &ControlSession::start_stream},
         {"start_audio", &ControlSession::start_audio},
         {"stop_audio", &ControlSession::stop_audio},

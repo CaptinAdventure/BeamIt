@@ -7,6 +7,7 @@
 #include <wintls/beast.hpp>
 
 #include "net/Protocol.hpp"
+#include "net/ClipboardBulk.hpp"
 
 #include <atomic>
 #include <deque>
@@ -32,6 +33,8 @@ using namespace std::chrono_literals;
 // Clipboard replies may need up to six bytes per content byte after JSON escaping (PROTOCOL.md §5.11).
 constexpr std::size_t control_receive_limit = 64ULL * 1024 * 1024;
 constexpr std::size_t stream_receive_limit = 32ULL * 1024 * 1024;
+constexpr std::size_t bulk_receive_limit = 40 + 256 * 1024;
+constexpr std::size_t bulk_queued_limit = 1024 * 1024;
 constexpr std::size_t max_queued_bytes = 64ULL * 1024 * 1024;
 constexpr std::size_t max_held_frames = 16;
 constexpr std::size_t max_held_bytes = 64ULL * 1024 * 1024;
@@ -112,6 +115,23 @@ bool is_ip_literal(const std::string& host) {
     beast::error_code error;
     (void)asio::ip::make_address(host, error);
     return !error;
+}
+
+bool valid_bulk_target(std::string_view target) {
+    if (!target.starts_with("/bulk/") || target.find("://") != std::string_view::npos ||
+        target.find('#') != std::string_view::npos) return false;
+    const auto query = target.find('?');
+    if (query == std::string_view::npos || target.substr(query, 7) != "?token=" ||
+        target.find('?', query + 1) != std::string_view::npos) return false;
+    const auto id = target.substr(6, query - 6);
+    const auto token = target.substr(query + 7);
+    const auto valid_token = [](std::string_view value, std::size_t length) {
+        return value.size() == length && std::ranges::all_of(value, [](char character) {
+            return (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') ||
+                   (character >= '0' && character <= '9') || character == '-' || character == '_';
+        });
+    };
+    return valid_token(id, 22) && valid_token(token, 43);
 }
 
 net::Sha256 peer_fingerprint(TlsStream& stream) {
@@ -210,6 +230,26 @@ struct Session::State {
         std::deque<std::vector<std::byte>> held;
         std::size_t held_bytes{};
         bool held_overflow{};
+        bool closing{};
+    };
+
+    struct Bulk {
+        struct Write {
+            std::vector<std::byte> bytes;
+            std::function<void(std::expected<void, SessionError>)> done;
+        };
+        Bulk(asio::io_context& io, wintls::context& tls, std::string target,
+             std::chrono::milliseconds lifetime, BulkCallbacks callbacks)
+            : socket(io, tls), resolver(io), target(std::move(target)), lifetime(lifetime),
+              callbacks(std::move(callbacks)) {}
+        WebSocket socket;
+        tcp::resolver resolver;
+        std::string target;
+        std::chrono::milliseconds lifetime;
+        BulkCallbacks callbacks;
+        std::deque<Write> writes;
+        std::size_t queued_bytes{};
+        bool writing{};
         bool closing{};
     };
 
@@ -339,8 +379,13 @@ struct Session::State {
                 auto& request = node.mapped();
                 request.timer->cancel();
                 if (type == "error") {
+                    auto code = std::string(string_field(message, "code").value_or("error"));
+                    if (request.expected == "clipboard_bulk_capabilities" && code == "unknown_type") {
+                        const auto* fatal = message.if_contains("fatal");
+                        if (!fatal || !fatal->is_bool() || fatal->as_bool()) code = "invalid_reply";
+                    }
                     request.done(std::unexpected(SessionError{
-                        std::string(string_field(message, "code").value_or("error")),
+                        std::move(code),
                         std::string(string_field(message, "message").value_or("The host rejected the request."))}));
                 } else if (type != request.expected) {
                     request.done(std::unexpected(SessionError{"unexpected_reply", "The host sent an unexpected reply: " + type}));
@@ -438,10 +483,130 @@ struct Session::State {
             stream->resolver.cancel();
             close_transport(stream->socket);
         }
+        close_bulk_state();
         if (control) close_transport(*control);
         if (notify && events.disconnected) {
             post_ui([this, error = std::move(error)] { events.disconnected(error); });
         }
+    }
+
+    awaitable<void> run_bulk(std::shared_ptr<Bulk> current, Completion<void> opened) {
+        Endpoint target_endpoint;
+        PinPolicy pin;
+        {
+            std::scoped_lock lock(mutex);
+            target_endpoint = *endpoint;
+            pin = pin_policy;
+        }
+        try {
+            {
+                Deadline deadline(io, std::min<Clock::duration>(current->lifetime, 15s), [&] {
+                    current->resolver.cancel();
+                    close_transport(current->socket);
+                });
+                try {
+                    (void)co_await establish(current->socket, current->resolver, target_endpoint, pin,
+                                             current->target, bulk_receive_limit);
+                } catch (...) {
+                    if (deadline.expired()) throw Failure("timeout", "The bulk socket did not open in time.");
+                    throw;
+                }
+            }
+            complete<void>(std::exchange(opened, nullptr), {});
+            beast::flat_buffer buffer;
+            while (!current->closing) {
+                buffer.clear();
+                co_await current->socket.async_read(buffer, use_awaitable);
+                if (current->closing) break;
+                if (!current->socket.got_binary()) {
+                    throw Failure("protocol_error", "The host sent a non-binary bulk message.");
+                }
+                if (current->callbacks.consume) {
+                    std::vector<std::byte> bytes(buffer.size());
+                    asio::buffer_copy(asio::buffer(bytes), buffer.data());
+                    const auto consumed = co_await asio::async_initiate<decltype(use_awaitable),
+                        void(std::expected<void, SessionError>)>(
+                        [this, current, bytes = std::move(bytes)](auto handler) mutable {
+                            auto completion = std::make_shared<decltype(handler)>(std::move(handler));
+                            current->callbacks.consume(std::move(bytes),
+                                [executor = io.get_executor(), completion](auto result) mutable {
+                                    asio::post(executor, [completion, result = std::move(result)]() mutable {
+                                        (*completion)(std::move(result));
+                                    });
+                                });
+                        }, use_awaitable);
+                    if (!consumed) throw Failure(consumed.error().code, consumed.error().message);
+                } else if (current->callbacks.message) {
+                    const auto bytes = std::span(
+                        static_cast<const std::byte*>(buffer.data().data()), buffer.size());
+                    current->callbacks.message(bytes);
+                }
+            }
+        } catch (...) {
+            auto error = describe(std::current_exception(), false);
+            if (current->closing) {
+                if (opened) complete<void>(std::move(opened), std::unexpected(SessionError{
+                    "cancelled", "The bulk socket was closed before it opened."}));
+                co_return;
+            }
+            current->closing = true;
+            close_transport(current->socket);
+            if (bulk == current) bulk.reset();
+            if (opened) complete<void>(std::move(opened), std::unexpected(error));
+            else if (current->callbacks.failed) current->callbacks.failed(error);
+        }
+    }
+
+    void write_bulk_next(const std::shared_ptr<Bulk>& current) {
+        if (current->closing || current->writes.empty()) {
+            current->writing = false;
+            return;
+        }
+        current->writing = true;
+        current->socket.binary(true);
+        current->socket.async_write(asio::buffer(current->writes.front().bytes),
+            [this, current](beast::error_code error, std::size_t) {
+                auto write = std::move(current->writes.front());
+                current->writes.pop_front();
+                current->queued_bytes -= write.bytes.size();
+                if (error || current->closing) {
+                    const bool cancelled = current->closing;
+                    const SessionError failure{cancelled ? "cancelled" : "network_error",
+                                               cancelled ? "The bulk transfer was cancelled."
+                                                         : "The bulk transfer connection failed."};
+                    complete<void>(std::move(write.done), std::unexpected(failure));
+                    current->closing = true;
+                    close_transport(current->socket);
+                    if (bulk == current) bulk.reset();
+                    for (auto& queued : current->writes) {
+                        current->queued_bytes -= queued.bytes.size();
+                        complete<void>(std::move(queued.done), std::unexpected(failure));
+                    }
+                    current->writes.clear();
+                    current->queued_bytes = 0;
+                    current->writing = false;
+                    if (current->callbacks.failed) current->callbacks.failed(failure);
+                    return;
+                }
+                complete<void>(std::move(write.done), {});
+                write_bulk_next(current);
+            });
+    }
+
+    void close_bulk_state() {
+        if (!bulk) return;
+        auto current = std::exchange(bulk, {});
+        current->closing = true;
+        current->resolver.cancel();
+        close_transport(current->socket);
+        const SessionError failure{"cancelled", "The bulk transfer was cancelled."};
+        const auto first_queued = current->writing ? std::next(current->writes.begin()) : current->writes.begin();
+        for (auto iterator = first_queued; iterator != current->writes.end(); ++iterator) {
+            current->queued_bytes -= iterator->bytes.size();
+            complete<void>(std::move(iterator->done), std::unexpected(failure));
+        }
+        current->writes.erase(first_queued, current->writes.end());
+        if (!current->writing) current->queued_bytes = 0;
     }
 
     // Stream sockets (PROTOCOL.md §6-§7). All stream state is owned by the network thread.
@@ -567,6 +732,7 @@ struct Session::State {
     asio::steady_timer clock_timer;
     std::unordered_map<std::int64_t, Pending> pending;
     std::map<std::string, std::shared_ptr<Stream>> streams;
+    std::shared_ptr<Bulk> bulk;
     std::deque<std::string> writes;
     std::size_t queued_bytes{};
     bool writing{};
@@ -671,6 +837,63 @@ void Session::restart_stream_decoding(const std::string& stream_id) {
         found->second->gate.reset();
         state->request_key_frame(stream_id);
     });
+}
+
+void Session::open_bulk(std::string target, std::chrono::milliseconds token_lifetime,
+                        BulkCallbacks callbacks, Completion<void> opened) {
+    auto* state = state_.get();
+    asio::post(state->io, [state, target = std::move(target), token_lifetime,
+                           callbacks = std::move(callbacks), opened = std::move(opened)]() mutable {
+        if (state->phase != State::Phase::Authenticated) {
+            state->complete<void>(std::move(opened),
+                std::unexpected(SessionError{"not_connected", "Not connected to a host."}));
+            return;
+        }
+        if (state->bulk) {
+            state->complete<void>(std::move(opened),
+                std::unexpected(SessionError{"limit_reached", "A bulk transfer is already active."}));
+            return;
+        }
+        if (!valid_bulk_target(target) || token_lifetime <= 0ms || token_lifetime > 10s) {
+            state->complete<void>(std::move(opened),
+                std::unexpected(SessionError{"invalid_offer", "The host sent an invalid bulk socket offer."}));
+            return;
+        }
+        auto bulk = std::make_shared<State::Bulk>(state->io, state->tls, std::move(target),
+                                                   token_lifetime, std::move(callbacks));
+        state->bulk = bulk;
+        asio::co_spawn(state->io, state->run_bulk(bulk, std::move(opened)), asio::detached);
+    });
+}
+
+void Session::write_bulk(std::vector<std::byte> message, Completion<void> written) {
+    auto* state = state_.get();
+    asio::post(state->io, [state, message = std::move(message), written = std::move(written)]() mutable {
+        if (state->phase != State::Phase::Authenticated || !state->bulk || state->bulk->closing) {
+            state->complete<void>(std::move(written),
+                std::unexpected(SessionError{"not_connected", "The bulk transfer socket is not open."}));
+            return;
+        }
+        auto& current = *state->bulk;
+        if (message.size() < net::clipboard_bulk::frame_header_size ||
+            message.size() > bulk_receive_limit ||
+            current.queued_bytes > bulk_queued_limit - message.size()) {
+            state->complete<void>(std::move(written),
+                std::unexpected(SessionError{"overloaded", "The bulk transfer queue limit was reached."}));
+            return;
+        }
+        current.queued_bytes += message.size();
+        current.writes.push_back({std::move(message),
+            [state, written = std::move(written)](std::expected<void, SessionError> result) mutable {
+                state->complete<void>(std::move(written), std::move(result));
+            }});
+        if (!current.writing) state->write_bulk_next(state->bulk);
+    });
+}
+
+void Session::close_bulk() {
+    auto* state = state_.get();
+    asio::post(state->io, [state] { state->close_bulk_state(); });
 }
 
 std::optional<ClockEstimate::Sample> Session::clock() const {

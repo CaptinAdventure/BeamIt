@@ -6,7 +6,7 @@ namespace beamit::host::wss {
 
 struct Server;
 
-// Accepts TLS connections; serves the test page at `/` and upgrades `/control` and `/streams/{id}?token=...` to
+// Accepts TLS connections; serves `/` and upgrades control, streams, audio and session-bound bulk endpoints to
 // WebSockets (PROTOCOL.md §2). Returns when the acceptor is closed.
 awaitable<void> accept_loop(Server& server, tcp::acceptor& acceptor);
 

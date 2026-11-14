@@ -66,6 +66,7 @@ final class BeamItConnection {
             BeamItClipboardMenu.shared.sync = connection.clipboardSync
             task.maximumMessageSize = BeamItControlMessage.receiveLimit
             connection.startControlReceiver()
+            try await connection.clipboardSync.negotiate()
             connection.startClockSampling()
             return connection
         } catch {
@@ -254,7 +255,25 @@ final class BeamItConnection {
     }
 
     func getClipboard() async throws -> [String: Any] {
-        try await request(type: "get_clipboard", fields: ["formats": ["text", "html", "image"]], expectedType: "clipboard")
+        try await request(type: "get_clipboard",
+                          fields: ["formats": clipboardSync.bulkEnabled ? ["text", "html", "image", "files"] :
+                            ["text", "html", "image"]], expectedType: "clipboard")
+    }
+
+    nonisolated struct ClipboardHostFailure: LocalizedError, Sendable {
+        let code: String
+        let errorDescription: String?
+        let fatal: Bool
+    }
+
+    func clipboardRequest(_ type: String, _ fields: [String: Any], reply: String) async throws -> [String: Any] {
+        try await request(type: type, fields: fields, expectedType: reply)
+    }
+
+    func clipboardEvent(_ type: String, _ fields: [String: Any]) async throws {
+        var object = fields
+        object["type"] = type
+        try await sendJSON(object)
     }
 
     func getWindowIcon(_ hwnd: String) async throws -> Data {
@@ -274,7 +293,60 @@ final class BeamItConnection {
     }
 
     func setClipboard(_ fields: [String: Any]) async throws {
-        _ = try await request(type: "set_clipboard", fields: fields, expectedType: "clipboard_set")
+        let reply = try await request(type: "set_clipboard", fields: fields, expectedType: "clipboard_set")
+        guard try BeamItClipboardBulk.unsigned(reply["sequence"]) <= UInt32.max else {
+            throw BeamItClipboardFailure("invalid_completion")
+        }
+    }
+
+    func openBulkSocket(_ offeredURL: URL, transferID: String) async throws -> URLSessionWebSocketTask {
+        let components = URLComponents(url: offeredURL, resolvingAgainstBaseURL: false)
+        let pathComponents = offeredURL.path.split(separator: "/")
+        let queryItems = components?.queryItems ?? []
+        let validBase64URL: (String, Int) -> Bool = { value, count in
+            value.utf8.count == count && value.utf8.allSatisfy {
+                (65...90).contains($0) || (97...122).contains($0) ||
+                    (48...57).contains($0) || $0 == 45 || $0 == 95
+            }
+        }
+        guard offeredURL.scheme?.lowercased() == "wss",
+              offeredURL.host?.lowercased() == controlURL.host?.lowercased(),
+              offeredURL.port == controlURL.port,
+              offeredURL.user == nil, offeredURL.password == nil, offeredURL.fragment == nil,
+              components?.percentEncodedPath == offeredURL.path,
+              pathComponents.count == 2, pathComponents[0] == "bulk",
+              String(pathComponents[1]) == transferID, validBase64URL(transferID, 22),
+              queryItems.count == 1, queryItems[0].name == "token",
+              queryItems[0].value.map({ validBase64URL($0, 43) }) == true else {
+            throw ConnectionError.invalidBulkURL
+        }
+        _ = try BeamItClipboardBulk.decodeID(transferID, bytes: 16)
+        _ = try BeamItClipboardBulk.decodeID(queryItems[0].value!, bytes: 32)
+        let socket = session.webSocketTask(with: offeredURL)
+        socket.maximumMessageSize = 40 + 256 * 1024
+        socket.resume()
+        try await withTaskCancellationHandler {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        socket.sendPing { error in
+                            if let error { continuation.resume(throwing: error) }
+                            else { continuation.resume() }
+                        }
+                    }
+                }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(10))
+                    socket.cancel(with: .goingAway, reason: nil)
+                    throw BeamItClipboardFailure("bulk_open_timeout")
+                }
+                defer { group.cancelAll() }
+                _ = try await group.next()
+            }
+        } onCancel: {
+            socket.cancel(with: .goingAway, reason: nil)
+        }
+        return socket
     }
 
     func setStreamRate(_ streamID: String, bitrate: Int, frameRate: Int, peak: Int? = nil) async throws {
@@ -458,6 +530,10 @@ final class BeamItConnection {
                         clipboardSync.hostClipboardChanged(message)
                         continue
                     }
+                    if message["id"] == nil, let type = message["type"] as? String, type.hasPrefix("clipboard_bulk_") {
+                        clipboardSync.bulkEvent(message)
+                        continue
+                    }
                     if message["type"] as? String == "audio_stopped", message["id"] == nil {
                         if let reason = message["reason"] as? String, reason != "requested" {
                             audio?.onError?(message["message"] as? String ?? "Host audio stopped: \(reason).")
@@ -529,9 +605,16 @@ final class BeamItConnection {
                         continue
                     }
                     if message["type"] as? String == "error" {
-                        pending.continuation.resume(throwing: ConnectionError.hostRejected(
-                            message["message"] as? String ?? message["code"] as? String ?? "The host rejected the request."
-                        ))
+                        if pending.expectedType.hasPrefix("clipboard") {
+                            pending.continuation.resume(throwing: ClipboardHostFailure(
+                                code: message["code"] as? String ?? "unknown",
+                                errorDescription: message["message"] as? String,
+                                fatal: !BeamItClipboardBulk.isNonfatal(message["fatal"])))
+                        } else {
+                            pending.continuation.resume(throwing: ConnectionError.hostRejected(
+                                message["message"] as? String ?? message["code"] as? String ?? "The host rejected the request."
+                            ))
+                        }
                     } else if message["type"] as? String != pending.expectedType {
                         if pending.expectedType == "audio_track_started",
                            message["type"] as? String == "audio_track_stopped" {
@@ -705,6 +788,7 @@ final class BeamItConnection {
         case unexpectedReply(String)
         case invalidMessage
         case invalidStreamURL
+        case invalidBulkURL
         case invalidAudioOffer
         case requestTimedOut
         case disconnected
@@ -731,6 +815,8 @@ final class BeamItConnection {
                 return "The host sent an invalid signaling message."
             case .invalidStreamURL:
                 return "The host returned a stream URL outside the authenticated WSS endpoint."
+            case .invalidBulkURL:
+                return "The host returned a bulk URL outside the authenticated WSS endpoint."
             case .invalidAudioOffer:
                 return "The host returned an invalid or unsupported audio offer."
             case .requestTimedOut:
