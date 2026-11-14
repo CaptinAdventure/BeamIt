@@ -68,6 +68,8 @@ Private staging is
 permissions and a cross-process lock/kernel lease ledger protect staging.
 `~` here is the app's home: the sandboxed build normally places it beneath
 `~/Library/Containers/<bundle-id>/Data`, not the user's unrestricted home.
+Staging traversal starts at that container home because the sandbox may deny
+opening its ancestors; descendants are still opened without following symlinks.
 Native pasteboard URL reads obtain user-selected access; security-scoped
 access is balanced for the lifetime of the captured source.
 Live owners survive recovery; outgoing/failed partial work is cleaned.

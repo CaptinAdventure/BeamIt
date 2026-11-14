@@ -87,17 +87,21 @@ actor BeamItClipboardStorage {
         }
     }
     private let root: URL
+    private let stagingHome: URL?
     private var sources: [String: Source] = [:]
     private var transfers: [String: Transfer] = [:]
     private let quota: UInt64 = 8_000_000_000
     private let scratch: UInt64 = 128 * 1024 * 1024
+    private nonisolated static let stagingPath = "Library/Application Support/BeamIt/ClipboardStaging"
 
     nonisolated static var defaultRoot: URL {
-        URL.homeDirectory.appendingPathComponent("Library/Application Support/BeamIt/ClipboardStaging")
+        URL.homeDirectory.appendingPathComponent(stagingPath)
     }
 
-    init(root: URL? = nil) {
-        self.root = root ?? Self.defaultRoot
+    init(root: URL? = nil, stagingHome: URL? = nil) {
+        let home = stagingHome ?? URL.homeDirectory
+        self.root = root ?? home.appendingPathComponent(Self.stagingPath)
+        self.stagingHome = root == nil ? home : nil
     }
 
     private func stamp(_ fd: FD) throws -> Stamp {
@@ -263,7 +267,14 @@ actor BeamItClipboardStorage {
     }
 
     private func rootFD() throws -> FD {
-        let fd = try openPath(root, create: true)
+        let fd: FD
+        if let stagingHome {
+            // Sandboxed apps cannot open ancestors of their container with openat.
+            let home = try FD(Darwin.open(stagingHome.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC))
+            fd = try child(home, Self.stagingPath, createDirectories: true)
+        } else {
+            fd = try openPath(root, create: true)
+        }
         var info = stat()
         guard fstat(fd.raw, &info) == 0, info.st_uid == geteuid(), fchmod(fd.raw, 0o700) == 0 else {
             throw BeamItClipboardFailure("unsafe_staging")

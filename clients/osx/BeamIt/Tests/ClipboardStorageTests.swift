@@ -21,12 +21,32 @@ enum ClipboardStorageTests {
         precondition(BeamItClipboardStorage.defaultRoot ==
             URL.homeDirectory.appendingPathComponent("Library/Application Support/BeamIt/ClipboardStaging"))
         let fs = FileManager.default
-        let base = fs.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+        guard let temporaryPath = realpath(fs.temporaryDirectory.path, nil) else {
+            throw BeamItClipboardFailure.filesystem("filesystem_unavailable")
+        }
+        defer { free(temporaryPath) }
+        let base = URL(fileURLWithPath: String(cString: temporaryPath)).appendingPathComponent(UUID().uuidString)
         try fs.createDirectory(at: base, withIntermediateDirectories: true)
         defer {
             do { try fs.removeItem(at: base) }
             catch { preconditionFailure("Private fixture cleanup failed.") }
         }
+        let home = base.appendingPathComponent("home")
+        try fs.createDirectory(at: home, withIntermediateDirectories: true)
+        let homeStorage = BeamItClipboardStorage(stagingHome: home)
+        try await homeStorage.recover()
+        precondition(fs.fileExists(atPath: home.appendingPathComponent(
+            "Library/Application Support/BeamIt/ClipboardStaging/client/partial").path))
+
+        let unsafeHome = base.appendingPathComponent("unsafe-home")
+        let outside = base.appendingPathComponent("outside")
+        try fs.createDirectory(at: unsafeHome, withIntermediateDirectories: true)
+        try fs.createDirectory(at: outside, withIntermediateDirectories: true)
+        try fs.createSymbolicLink(at: unsafeHome.appendingPathComponent("Library"), withDestinationURL: outside)
+        try await rejects { try await BeamItClipboardStorage(stagingHome: unsafeHome).recover() }
+        let outsideContents = try fs.contentsOfDirectory(atPath: outside.path)
+        precondition(outsideContents.isEmpty)
+
         let selected = base.appendingPathComponent("selection")
         try fs.createDirectory(at: selected.appendingPathComponent("empty"), withIntermediateDirectories: true)
         let payload = Data((0..<600_000).map { UInt8($0 % 251) })

@@ -125,7 +125,7 @@ nonisolated enum BeamItClipboardBulk {
             "clipboardBulkByteThreshold", default: defaultByteThreshold, maximum: maxFileBytes, defaults: defaults
         )
         let roots = configuredInteger(
-            "clipboardBulkEntryThreshold", default: defaultRootThreshold, maximum: UInt64(maxRoots),
+            "clipboardBulkEntryThreshold", default: UInt64(defaultRootThreshold), maximum: UInt64(maxRoots),
             defaults: defaults
         )
         return TransferPolicy(byteThreshold: bytes, rootThreshold: UInt32(roots))
