@@ -24,8 +24,13 @@ struct TemporaryStaging {
     ~TemporaryStaging() { std::error_code error; std::filesystem::remove_all(path, error); }
 };
 
-awaitable<std::shared_ptr<WebSocket>> connect_socket(Server& server, wintls::context& tls, unsigned short port) {
+awaitable<std::shared_ptr<WebSocket>> connect_socket(Server& server, wintls::context& tls, unsigned short port,
+                                                    int receive_buffer = 0) {
     auto socket = std::make_shared<WebSocket>(server.io, tls);
+    if (receive_buffer) {
+        beast::get_lowest_layer(*socket).open(tcp::v4());
+        beast::get_lowest_layer(*socket).set_option(asio::socket_base::receive_buffer_size(receive_buffer));
+    }
     co_await beast::get_lowest_layer(*socket).async_connect(
         tcp::endpoint(asio::ip::address_v4::loopback(), port), use_awaitable);
     co_await socket->next_layer().async_handshake(wintls::handshake_type::client, use_awaitable);
@@ -60,7 +65,12 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
 
     enum class DownloadScenario { Mixed, Png, Legacy, Stale, ChangedSelection, Mutation, Excluded, Quota,
         Cancel, CancelPreparing, Disconnect, ReceiverFailure, EarlyComplete, Expired, Idle, Absolute, ChangedAfterOffer,
-        ChangedBeforeEnd, ControlDisconnect, DiskFull, PermissionDenied, Responsiveness };
+        ChangedBeforeEnd, ControlDisconnect, DiskFull, PermissionDenied, Responsiveness,
+        PingBeforeReceive, ReceiveAfterUpgrade };
+
+    bool opening_probe(DownloadScenario scenario) {
+        return scenario == DownloadScenario::PingBeforeReceive || scenario == DownloadScenario::ReceiveAfterUpgrade;
+    }
 
     awaitable<void> download(Server& server, unsigned short port, DownloadScenario scenario,
         const std::filesystem::path& source, std::atomic<DWORD>& sequence,
@@ -187,10 +197,34 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
                         co_await reject(server, tls, port, path);
                         CHECK((co_await read(*control)).at("code") == "source_changed");
                     } else {
-                        auto socket = co_await connect_socket(server, tls, port);
+                        const bool ping_gate = scenario == DownloadScenario::PingBeforeReceive;
+                        auto socket = co_await connect_socket(server, tls, port, ping_gate ? 4096 : 0);
                         if (measurement) measurement->started = Clock::now();
                         co_await socket->async_handshake("localhost", path, use_awaitable);
                         co_await reject(server, tls, port, path);
+                        bool pong_received{};
+                        std::uint64_t before_pong{};
+                        if (ping_gate) {
+                            socket->control_callback([&](websocket::frame_type type, beast::string_view) {
+                                if (type == websocket::frame_type::pong) pong_received = true;
+                            });
+                            asio::steady_timer fill(server.io, 250ms);
+                            co_await fill.async_wait(use_awaitable);
+                            co_await socket->async_ping({}, use_awaitable);
+                            // Model a receiver waiting on pong before consuming data.
+                            // Socket acceptance has succeeded, and control still works.
+                            asio::steady_timer pause(server.io, 250ms);
+                            co_await pause.async_wait(use_awaitable);
+                            co_await send(*control, {{"type", "ping"}, {"id", 90}});
+                            CHECK((co_await read(*control)).at("type") == "pong");
+                            CHECK_FALSE(pong_received);
+                            REQUIRE(measurement);
+                            CHECK(measurement->writes == 1); // The actual host write is backpressured.
+                            std::cout << "PING_GATE_REPRO accepted_upgrade=1 received_payload=0 pending_host_write="
+                                << measurement->writes << " pong_before_receive=" << pong_received << '\n';
+                            beast::get_lowest_layer(*socket).set_option(
+                                asio::socket_base::receive_buffer_size(256 * 1024));
+                        }
                         if (scenario == DownloadScenario::Disconnect) {
                             beast::error_code ignored;
                             beast::get_lowest_layer(*socket).close(ignored);
@@ -242,9 +276,17 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
                                     const auto frame = frames.accept(bytes);
                                     REQUIRE(frame);
                                     if (frame->kind != bulk::FrameKind::End) {
+                                        if (ping_gate && !pong_received) before_pong += frame->payload_size;
                                         auto& collected = payloads[frame->node_index];
                                         collected.insert(collected.end(), bytes.begin() + bulk::frame_header_size, bytes.end());
-                                        if (measurement) measurement->received += frame->payload_size;
+                                        if (measurement) {
+                                            if (opening_probe(scenario) && !measurement->received) {
+                                                std::cout << "BULK_OPEN_FIRST_PAYLOAD ping_gate=" << ping_gate
+                                                    << " ms=" << std::chrono::duration<double, std::milli>(
+                                                        Clock::now() - measurement->started).count() << '\n';
+                                            }
+                                            measurement->received += frame->payload_size;
+                                        }
                                     }
                                     if (measurement && !frames.ended() && Clock::now() - last_ping >= 50ms) {
                                         const auto started = Clock::now();
@@ -260,6 +302,12 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
                                 }
                                 if (measurement) measurement->seconds =
                                     std::chrono::duration<double>(Clock::now() - measurement->started).count();
+                                if (ping_gate) {
+                                    CHECK(before_pong >= bulk::max_chunk_size);
+                                    CHECK(pong_received);
+                                    std::cout << "PING_GATE_RECOVERY payload_before_pong=" << before_pong
+                                        << " pong_after_receive=" << pong_received << '\n';
+                                }
                                 for (std::size_t index = 0; index < parsed->nodes.size(); ++index) {
                                     const auto& node = parsed->nodes[index];
                                     if (node.kind == bulk::Node::Kind::Directory) continue;
@@ -360,6 +408,16 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
         run_download(DownloadScenario::Responsiveness);
     }
 
+    TEST_CASE("Bulk receiver can drain payload after upgrade without waiting for pong",
+              "[clipboard-bulk-open]") {
+        auto scenario = DownloadScenario::ReceiveAfterUpgrade;
+        SECTION("receiving immediately after authenticated upgrade completes the download") {}
+        SECTION("waiting for pong before receiving leaves a backpressured write") {
+            scenario = DownloadScenario::PingBeforeReceive;
+        }
+        run_download(scenario);
+    }
+
     void run_download(DownloadScenario scenario) {
         HostServerOptions options;
         try { options.identity = installed_identity(); }
@@ -369,7 +427,8 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
         TemporaryStaging staging, source;
         std::filesystem::create_directories(source.path / L"selection" / L"empty");
         std::ofstream(source.path / L"selection" / L"item.txt", std::ios::binary) <<
-            (scenario == DownloadScenario::Responsiveness ? std::string(32 * 1024 * 1024, 'x') :
+            (opening_probe(scenario) ? std::string(11'076'027, 'x') :
+                scenario == DownloadScenario::Responsiveness ? std::string(32 * 1024 * 1024, 'x') :
                 scenario == DownloadScenario::ChangedBeforeEnd ? std::string(2 * 1024 * 1024, 'x') : "immutable test payload");
         std::ofstream(source.path / L"selection" / L".hidden") << "hidden";
         REQUIRE(SetFileAttributesW((source.path / L"selection" / L".hidden").c_str(), FILE_ATTRIBUTE_HIDDEN));
@@ -379,7 +438,7 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
         server.bulk_staging_root = staging.path;
         std::atomic<DWORD> sequence{42};
         std::atomic_bool preparing{}, release{};
-        if (scenario == DownloadScenario::Responsiveness) {
+        if (scenario == DownloadScenario::Responsiveness || opening_probe(scenario)) {
             server.bulk_send_activity = [&](std::ptrdiff_t bytes, int writes) {
                 measurement.owned += bytes;
                 measurement.writes += writes;
@@ -437,7 +496,9 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
             if (!error) { timed_out = true; release.store(true); server.io.stop(); }
         });
         asio::co_spawn(server.io, download(server, acceptor.local_endpoint().port(), scenario, source.path,
-            sequence, preparing, release, scenario == DownloadScenario::Responsiveness ? &measurement : nullptr),
+            sequence, preparing, release,
+            scenario == DownloadScenario::Responsiveness || opening_probe(scenario) ?
+                &measurement : nullptr),
             [&](std::exception_ptr error) {
                 failure = error;
                 completed = true;
@@ -456,6 +517,13 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
         const auto ledgers = staging.path / L".reservations";
         CHECK((!std::filesystem::exists(outgoing) || std::filesystem::is_empty(outgoing)));
         CHECK((!std::filesystem::exists(ledgers) || std::filesystem::is_empty(ledgers)));
+        if (opening_probe(scenario)) {
+            CHECK(measurement.received == 11'076'027 + 6 + net::base64_decode(png_text)->size());
+            CHECK(measurement.peak_owned <= 1024 * 1024);
+            CHECK(measurement.peak_writes == 1);
+            CHECK(measurement.owned == 0);
+            CHECK(measurement.writes == 0);
+        }
         if (scenario == DownloadScenario::Responsiveness) {
             REQUIRE(measurement.ping_ms.size() >= 20);
             std::ranges::sort(measurement.ping_ms);

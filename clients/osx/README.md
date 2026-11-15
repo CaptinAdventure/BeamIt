@@ -86,11 +86,17 @@ selection. A failed write attempts supported-format rollback, reports the
 limitation and sends no success acknowledgement. If rollback cannot prove
 new file references are gone, it conservatively retains their files.
 
+Bulk socket opening waits for the pinned session's WebSocket upgrade
+callback, not a ping reply. This lets the receiver start reading when
+payload is queued ahead of pong. The ten-second opening deadline and
+session-bound single-use token remain unchanged.
+
 ## Focused checks on a Mac
 
 Use the Xcode/macOS SDK required by the existing project (deployment target
 macOS 27). Its filesystem-synchronized app group automatically includes
-`BeamItClipboardBulk.swift` and `BeamItClipboardStorage.swift`.
+`BeamItClipboardBulk.swift`, `BeamItClipboardStorage.swift` and
+`BeamItConnectionTransport.swift`.
 There is no shared XCTest target/scheme in this project. From repository
 root, build the actual application target:
 
@@ -119,6 +125,18 @@ xcrun swiftc -swift-version 6 -default-isolation MainActor -parse-as-library \
   -framework CryptoKit -framework Security -framework ImageIO \
   -framework UniformTypeIdentifiers -o "$test_dir/ClipboardStorageTests"
 "$test_dir/ClipboardStorageTests"
+
+xcrun swiftc -swift-version 6 -default-isolation MainActor -parse-as-library \
+  -target "$(uname -m)-apple-macos27.0" \
+  clients/osx/BeamIt/BeamIt/CertificatePinDelegate.swift \
+  clients/osx/BeamIt/BeamIt/BeamItClipboardBulk.swift \
+  clients/osx/BeamIt/BeamIt/BeamItClipboardStorage.swift \
+  clients/osx/BeamIt/BeamIt/BeamItConnectionTransport.swift \
+  clients/osx/BeamIt/Tests/WebSocketOpenTests.swift \
+  -framework CryptoKit -framework Security -framework ImageIO \
+  -framework UniformTypeIdentifiers -o "$test_dir/WebSocketOpenTests"
+python3 clients/osx/BeamIt/Tests/WebSocketOpenFixture.py \
+  "$test_dir/WebSocketOpenTests"
 ```
 
 The storage executable uses private temporary fixtures, a sparse logical
@@ -129,6 +147,97 @@ source identity drift, symlink rejection, unpublished cleanup, committed
 retention, live-owner quota protection, abandoned recovery, PNG decode and
 dimension mismatch. The pure checks cover framing, malformed fields/paths,
 threshold/settings boundaries and canonical IDs.
+
+The opening regression calls the **final production `openBulkSocket`**
+in `BeamItConnectionTransport`, inherited without a wrapper by
+`BeamItConnection`. The standalone test compiles that method and uses the
+same inherited binding. It checks authority/path/query/ID/token admission
+before exercising the shared pinned session against a loopback-only TLS
+fixture. It uses Python's standard library and macOS
+`/usr/bin/openssl` to generate and delete a private temporary certificate.
+The peer deliberately never replies to ping. The check requires upgrade
+readiness without pong, reads 32 ordered binary messages (8,388,800 bytes),
+and checks upload's first message, per-task routing, cancellation, deadline,
+HTTP rejection, pin rejection and session invalidation. Synthetic bulk URLs
+use canonical 16-byte repeated-byte IDs and a canonical 32-byte test token;
+the peer maps those IDs to download/upload/failure scenarios. It does not touch
+the clipboard or use host credentials. It is not the deployed Beast host
+and does not verify native paste, bulk authorization or LAN behavior.
+**Mac compilation and execution of this new regression are required;
+they were unavailable in the Windows development environment.**
+
+In-flight delegate and production-entry cancellation wait under a
+two-second deadline for exactly one registration with an installed,
+unfinished continuation. Known-task cases also require a running socket.
+The barrier yields to schedule work; elapsed time alone is not readiness
+proof. It fails visibly if the opener finishes early or never suspends.
+Explicit self-cancellation before entering the delegate remains a separate
+case. A failure callback is injected while its waiter is live; later open
+and close callbacks are deliberately delivered after completion. Session
+invalidation also follows the suspended-waiter barrier. These are ordered
+lifecycle checks, not exhaustive simultaneous-thread callback-race coverage.
+
+#### Native mutation check — NOT RUN
+
+Run the baseline command above and the actual app build first. Make a
+private temporary copy:
+
+```sh
+cp clients/osx/BeamIt/BeamIt/BeamItConnectionTransport.swift \
+  "$test_dir/BeamItConnectionTransport-PingGate.swift"
+```
+
+In that copy, replace only
+`try await certificateDelegate.openWebSocket(socket)` inside the final
+production entry with the former bounded ping gate:
+
+```swift
+socket.resume()
+try await withTaskCancellationHandler {
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        group.addTask {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                socket.sendPing { error in
+                    if let error { continuation.resume(throwing: error) }
+                    else { continuation.resume() }
+                }
+            }
+        }
+        group.addTask {
+            try await Task.sleep(for: .seconds(10))
+            socket.cancel(with: .goingAway, reason: nil)
+            throw BeamItClipboardFailure("bulk_open_timeout")
+        }
+        defer { group.cancelAll() }
+        _ = try await group.next()
+    }
+} onCancel: {
+    socket.cancel(with: .goingAway, reason: nil)
+}
+```
+
+Recompile and run the mutation:
+
+```sh
+xcrun swiftc -swift-version 6 -default-isolation MainActor -parse-as-library \
+  -target "$(uname -m)-apple-macos27.0" \
+  clients/osx/BeamIt/BeamIt/CertificatePinDelegate.swift \
+  clients/osx/BeamIt/BeamIt/BeamItClipboardBulk.swift \
+  clients/osx/BeamIt/BeamIt/BeamItClipboardStorage.swift \
+  "$test_dir/BeamItConnectionTransport-PingGate.swift" \
+  clients/osx/BeamIt/Tests/WebSocketOpenTests.swift \
+  -framework CryptoKit -framework Security -framework ImageIO \
+  -framework UniformTypeIdentifiers -o "$test_dir/WebSocketOpenPingMutation"
+python3 clients/osx/BeamIt/Tests/WebSocketOpenFixture.py \
+  "$test_dir/WebSocketOpenPingMutation"
+```
+
+Compilation must succeed, then the no-pong download must fail
+at runtime with `bulk_open_timeout` (or the fixture's bounded runner
+deadline). A compiler error is not fail-before proof. Keep the repository
+source unchanged and rerun the baseline afterward. Record both commands,
+tested source identities and terminal results on the Mac; Windows source
+inspection does not establish this mutation result.
 
 ### Native/LAN procedure — NOT RUN
 

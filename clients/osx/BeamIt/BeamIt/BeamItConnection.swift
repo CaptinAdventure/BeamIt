@@ -4,16 +4,14 @@ import CryptoKit
 import Foundation
 import Security
 
-final class BeamItConnection {
+final class BeamItConnection: BeamItConnectionTransport {
     private struct PendingRequest {
         let expectedType: String
         let continuation: CheckedContinuation<[String: Any], Error>
         var sentAt: TimeInterval?
     }
 
-    private let session: URLSession
     private let task: URLSessionWebSocketTask
-    private let controlURL: URL
     private var nextRequestID = 1
     private var pendingRequests: [Int: PendingRequest] = [:]
     private var receiveTask: Task<Void, Never>?
@@ -30,10 +28,10 @@ final class BeamItConnection {
     var onStreamStopped: ((String, String?) -> Void)?
     var onDisconnect: ((Error) -> Void)?
 
-    private init(session: URLSession, task: URLSessionWebSocketTask, controlURL: URL) {
-        self.session = session
+    private init(session: URLSession, certificateDelegate: CertificatePinDelegate,
+                 task: URLSessionWebSocketTask, controlURL: URL) {
         self.task = task
-        self.controlURL = controlURL
+        super.init(session: session, certificateDelegate: certificateDelegate, controlURL: controlURL)
     }
 
     static func connect(
@@ -58,7 +56,8 @@ final class BeamItConnection {
 
         let task = session.webSocketTask(with: request)
         task.maximumMessageSize = BeamItControlMessage.handshakeLimit
-        let connection = BeamItConnection(session: session, task: task, controlURL: controlURL)
+        let connection = BeamItConnection(session: session, certificateDelegate: delegate,
+                                          task: task, controlURL: controlURL)
         task.resume()
 
         do {
@@ -320,56 +319,6 @@ final class BeamItConnection {
         guard try BeamItClipboardBulk.unsigned(reply["sequence"]) <= UInt32.max else {
             throw BeamItClipboardFailure("invalid_completion")
         }
-    }
-
-    func openBulkSocket(_ offeredURL: URL, transferID: String) async throws -> URLSessionWebSocketTask {
-        let components = URLComponents(url: offeredURL, resolvingAgainstBaseURL: false)
-        let pathComponents = offeredURL.path.split(separator: "/")
-        let queryItems = components?.queryItems ?? []
-        let validBase64URL: (String, Int) -> Bool = { value, count in
-            value.utf8.count == count && value.utf8.allSatisfy {
-                (65...90).contains($0) || (97...122).contains($0) ||
-                    (48...57).contains($0) || $0 == 45 || $0 == 95
-            }
-        }
-        guard offeredURL.scheme?.lowercased() == "wss",
-              offeredURL.host?.lowercased() == controlURL.host?.lowercased(),
-              offeredURL.port == controlURL.port,
-              offeredURL.user == nil, offeredURL.password == nil, offeredURL.fragment == nil,
-              components?.percentEncodedPath == offeredURL.path,
-              pathComponents.count == 2, pathComponents[0] == "bulk",
-              String(pathComponents[1]) == transferID, validBase64URL(transferID, 22),
-              queryItems.count == 1, queryItems[0].name == "token",
-              queryItems[0].value.map({ validBase64URL($0, 43) }) == true else {
-            throw ConnectionError.invalidBulkURL
-        }
-        _ = try BeamItClipboardBulk.decodeID(transferID, bytes: 16)
-        _ = try BeamItClipboardBulk.decodeID(queryItems[0].value!, bytes: 32)
-        let socket = session.webSocketTask(with: offeredURL)
-        socket.maximumMessageSize = 40 + 256 * 1024
-        socket.resume()
-        try await withTaskCancellationHandler {
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                        socket.sendPing { error in
-                            if let error { continuation.resume(throwing: error) }
-                            else { continuation.resume() }
-                        }
-                    }
-                }
-                group.addTask {
-                    try await Task.sleep(for: .seconds(10))
-                    socket.cancel(with: .goingAway, reason: nil)
-                    throw BeamItClipboardFailure("bulk_open_timeout")
-                }
-                defer { group.cancelAll() }
-                _ = try await group.next()
-            }
-        } onCancel: {
-            socket.cancel(with: .goingAway, reason: nil)
-        }
-        return socket
     }
 
     func setStreamRate(_ streamID: String, bitrate: Int, frameRate: Int, peak: Int? = nil) async throws {
@@ -811,7 +760,6 @@ final class BeamItConnection {
         case unexpectedReply(String)
         case invalidMessage
         case invalidStreamURL
-        case invalidBulkURL
         case invalidAudioOffer
         case requestTimedOut
         case disconnected
@@ -838,8 +786,6 @@ final class BeamItConnection {
                 return "The host sent an invalid signaling message."
             case .invalidStreamURL:
                 return "The host returned a stream URL outside the authenticated WSS endpoint."
-            case .invalidBulkURL:
-                return "The host returned a bulk URL outside the authenticated WSS endpoint."
             case .invalidAudioOffer:
                 return "The host returned an invalid or unsupported audio offer."
             case .requestTimedOut:
