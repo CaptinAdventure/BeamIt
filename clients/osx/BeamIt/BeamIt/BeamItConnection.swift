@@ -558,9 +558,8 @@ final class BeamItConnection: BeamItConnectionTransport, BeamItClipboardPeer {
                         if message["type"] as? String == "error" {
                             // Input has no replies; its failures (e.g. focus_failed) arrive unsolicited.
                             NSLog(
-                                "BeamIt host error %@: %@",
-                                message["code"] as? String ?? "unknown",
-                                message["message"] as? String ?? ""
+                                "BeamIt host error %@",
+                                BeamItClipboardSync.hostErrorCode(message["code"] as? String)
                             )
                             if let streamID = message["stream_id"] as? String {
                                 streams[streamID]?.onInputError?(
@@ -578,7 +577,8 @@ final class BeamItConnection: BeamItConnectionTransport, BeamItClipboardPeer {
                                 fatal: !BeamItClipboardBulk.isNonfatal(message["fatal"])))
                         } else {
                             pending.continuation.resume(throwing: ConnectionError.hostRejected(
-                                message["message"] as? String ?? message["code"] as? String ?? "The host rejected the request."
+                                message["message"] as? String ?? message["code"] as? String ?? "The host rejected the request.",
+                                code: message["code"] as? String
                             ))
                         }
                     } else if message["type"] as? String != pending.expectedType {
@@ -623,7 +623,13 @@ final class BeamItConnection: BeamItConnectionTransport, BeamItClipboardPeer {
                     _ = try await self.request(type: "ping", fields: [:], expectedType: "pong")
                 } catch {
                     guard !Task.isCancelled, !self.isDisconnected else { return }
-                    NSLog("BeamIt clock sampling failed: %@", error.localizedDescription)
+                    let code: String
+                    if case ConnectionError.hostRejected(_, let hostCode) = error {
+                        code = BeamItClipboardSync.hostErrorCode(hostCode)
+                    } else {
+                        code = "unknown"
+                    }
+                    NSLog("BeamIt clock sampling failed: %@", code)
                 }
                 count += 1
                 do {
@@ -750,7 +756,7 @@ final class BeamItConnection: BeamItConnectionTransport, BeamItClipboardPeer {
         case randomGenerationFailed
         case keyDerivationFailed
         case serverProofMismatch
-        case hostRejected(String)
+        case hostRejected(String, code: String? = nil)
         case unexpectedReply(String)
         case invalidMessage
         case invalidStreamURL
@@ -772,7 +778,7 @@ final class BeamItConnection: BeamItConnectionTransport, BeamItClipboardPeer {
                 return "Password key derivation failed."
             case .serverProofMismatch:
                 return "The host's authentication proof did not match."
-            case .hostRejected(let message):
+            case .hostRejected(let message, _):
                 return message
             case .unexpectedReply(let type):
                 return "Unexpected host response: \(type)."

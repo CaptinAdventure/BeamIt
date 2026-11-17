@@ -24,7 +24,7 @@ final class BeamItClipboardMenu {
 @MainActor
 final class BeamItClipboardSync: NSObject {
     typealias Bulk = BeamItClipboardBulk
-    private final class Operation {
+    final class Operation {
         let snapshot: Bulk.RevisionGuard
         var revision: UInt64 { snapshot.revision }
         var sequence: Int { snapshot.sequence }
@@ -67,10 +67,10 @@ final class BeamItClipboardSync: NSObject {
         var reported: TimeInterval = 0
         var replenished = ProcessInfo.processInfo.systemUptime
         var tokens = Double(1024 * 1024)
-        init(revision: UInt64, upload: Bool, manual: Bool, automatic: Bool) {
-            snapshot = .init(revision: revision, sequence: NSPasteboard.general.changeCount)
+        init(revision: UInt64, sequence: Int, upload: Bool, manual: Bool, automatic: Bool, window: NSWindow?) {
+            snapshot = .init(revision: revision, sequence: sequence)
             self.upload = upload; self.manual = manual; self.automatic = automatic
-            window = NSApp.keyWindow ?? NSApp.mainWindow
+            self.window = window
         }
     }
     private weak var connection: (any BeamItClipboardPeer)?
@@ -207,7 +207,7 @@ final class BeamItClipboardSync: NSObject {
               op.upload ? "upload" : "download", stage, op.manifest.selectedRoots, op.manifest.nodes.count,
               op.manifest.totalFileBytes, total(op))
     }
-    private static func diagnosticCode(_ error: Error) -> String {
+    static func diagnosticCode(_ error: Error) -> String {
         if let failure = error as? BeamItClipboardFailure { return failure.code }
         if let failure = error as? BeamItClipboardHostFailure { return "host_\(hostErrorCode(failure.code))" }
         let underlying = error as NSError
@@ -216,7 +216,7 @@ final class BeamItClipboardSync: NSObject {
     static func hostErrorCode(_ code: String?) -> String {
         guard let code else { return "unknown" }
         switch code {
-        case "unknown_type", "invalid_request", "not_authenticated", "not_ready", "not_found", "limit_reached",
+        case "unknown_type", "internal_error", "invalid_request", "not_authenticated", "not_ready", "not_found", "limit_reached",
              "clipboard_unavailable", "source_changed", "source_unavailable", "stale_clipboard", "stale_snapshot",
              "storage_failed", "disk_full", "permission_denied", "quota_exceeded", "insufficient_space",
              "invalid_transfer", "invalid_frame", "invalid_png", "digest_mismatch", "snapshot_mismatch",
@@ -270,7 +270,11 @@ final class BeamItClipboardSync: NSObject {
         }
     }
     func bulkEvent(_ message: [String: Any]) {
-        guard let op = current, let id = message["transfer_id"] as? String else { return }
+        guard let op = current else { return }
+        bulkEvent(message, operation: op)
+    }
+    func bulkEvent(_ message: [String: Any], operation op: Operation) {
+        guard let id = message["transfer_id"] as? String else { return }
         if op.transferID.isEmpty && op.waitingOffer {
             guard op.buffered.count < 8 else { op.failure = "event_overflow"; cancel(); return }
             op.buffered.append(message); return
@@ -323,7 +327,9 @@ final class BeamItClipboardSync: NSObject {
         guard !stopped, lifetime.acceptsTransfers, NSApp.isActive, enabled || manual else { throw CancellationError() }
         let previous = current
         invalidate(cancelAutomatic: false)
-        let op = Operation(revision: revision, upload: upload, manual: manual, automatic: automatic)
+        let op = Operation(revision: revision, sequence: NSPasteboard.general.changeCount,
+                           upload: upload, manual: manual, automatic: automatic,
+                           window: NSApp.keyWindow ?? NSApp.mainWindow)
         if let previous {
             if let task = previous.task {
                 do { try await task.value; previous.succeeded = true }

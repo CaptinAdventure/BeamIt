@@ -254,6 +254,11 @@ threshold/settings boundaries and canonical IDs.
 
 The lifetime executable uses only private temporary roots, fake pasteboard
 counts/URLs, injected process-enumeration results, clock and failure/gate hooks.
+It exercises host-code filtering through the production clipboard diagnostic
+formatter and bulk-event handler, including `internal_error`, missing codes
+and arbitrary peer text. Connection logging uses the same allowlist: unsolicited
+errors omit peer messages, and clock failures never log localized peer text.
+These Connection log call sites are build-checked, not exercised by this suite.
 It invokes the launch delegate callback directly and the termination helper
 with a fake reply. It covers
 startup without connection, own writes versus replacement, supported rollback,

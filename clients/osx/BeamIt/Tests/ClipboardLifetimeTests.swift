@@ -161,14 +161,39 @@ enum ClipboardLifetimeTests {
             precondition(failure.code == code, "Expected \(code), got \(failure.code).")
         }
     }
-    static func hostErrorDiagnostics() {
-        for code in ["source_changed", "permission_denied", "unknown_type"] {
+    static func hostErrorDiagnostics(_ base: URL) {
+        let peer = Peer(), board = Board()
+        let lifetime = coordinator(Storage(root: base.appendingPathComponent("host-errors")), board: board)
+        let sync = BeamItClipboardSync(connection: peer, lifetime: lifetime)
+        defer { sync.stop() }
+        for code in ["source_changed", "permission_denied", "unknown_type", "internal_error"] {
             precondition(BeamItClipboardSync.hostErrorCode(code) == code)
+            let failure = BeamItClipboardHostFailure(code: code, errorDescription: "private-fixture-message", fatal: false)
+            precondition(BeamItClipboardSync.diagnosticCode(failure) == "host_" + code)
         }
         for code in [nil, "", "future_error", "source_changed\nprivate-fixture-path",
                      "wss://fixture.invalid/bulk/id?token=fixture", String(repeating: "x", count: 16_384)] {
             precondition(BeamItClipboardSync.hostErrorCode(code) == "unknown")
+            let failure = BeamItClipboardHostFailure(code: code ?? "unknown", errorDescription: "private-fixture-message",
+                                                    fatal: false)
+            precondition(BeamItClipboardSync.diagnosticCode(failure) == "host_unknown",
+                         "Host diagnostic formatter exposed an unrecognized code.")
         }
+        for type in ["clipboard_bulk_failed", "clipboard_bulk_cancelled"] {
+            for (code, expected) in [(nil, "unknown"), ("internal_error", "internal_error"),
+                                     ("source_changed", "source_changed"), ("private-fixture-path\ncode", "unknown")] {
+                let operation = BeamItClipboardSync.Operation(revision: 0, sequence: 0, upload: false,
+                                                              manual: true, automatic: false, window: nil)
+                operation.transferID = id(134)
+                var message: [String: Any] = ["type": type, "transfer_id": operation.transferID,
+                                             "message": "private-fixture-message"]
+                if let code { message["code"] = code }
+                sync.bulkEvent(message, operation: operation)
+                precondition(operation.remoteEnded && operation.failure == expected,
+                             "Bulk event retained an unexpected host code.")
+            }
+        }
+        precondition(peer.calls == 0 && board.countReads == 1)
     }
     static func startupAndReplacement(_ base: URL) async throws {
         let fs = FileManager.default, root = base.appendingPathComponent("startup")
@@ -1780,7 +1805,6 @@ enum ClipboardLifetimeTests {
             try await child(CommandLine.arguments)
             return
         }
-        hostErrorDiagnostics()
         let fs = FileManager.default
         guard let resolved = realpath(fs.temporaryDirectory.path, nil) else {
             throw BeamItClipboardFailure("fixture_root_failed")
@@ -1793,6 +1817,7 @@ enum ClipboardLifetimeTests {
             do { try fs.removeItem(at: base) }
             catch { preconditionFailure("Private fixture cleanup failed.") }
         }
+        hostErrorDiagnostics(base)
         try await startupAndReplacement(base)
         try await publicationAndRollback(base)
         try await legacySafety(base)
