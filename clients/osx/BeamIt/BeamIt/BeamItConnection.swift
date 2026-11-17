@@ -282,8 +282,6 @@ final class BeamItConnection: BeamItConnectionTransport, BeamItClipboardPeer {
                             ["text", "html", "image"]], expectedType: "clipboard")
     }
 
-    nonisolated typealias ClipboardHostFailure = BeamItClipboardHostFailure
-
     func clipboardRequest(_ type: String, _ fields: [String: Any], reply: String) async throws -> [String: Any] {
         try await request(type: type, fields: fields, expectedType: reply)
     }
@@ -574,7 +572,7 @@ final class BeamItConnection: BeamItConnectionTransport, BeamItClipboardPeer {
                     }
                     if message["type"] as? String == "error" {
                         if pending.expectedType.hasPrefix("clipboard") {
-                            pending.continuation.resume(throwing: ClipboardHostFailure(
+                            pending.continuation.resume(throwing: BeamItClipboardHostFailure(
                                 code: message["code"] as? String ?? "unknown",
                                 errorDescription: message["message"] as? String,
                                 fatal: !BeamItClipboardBulk.isNonfatal(message["fatal"])))

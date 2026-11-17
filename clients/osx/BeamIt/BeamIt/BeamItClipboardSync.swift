@@ -56,6 +56,8 @@ final class BeamItClipboardSync: NSObject {
         var alert: NSAlert?
         var bytes: UInt64 = 0
         var nodes: Int = 0
+        var diagnosticBucket: UInt64 = 0
+        var phase = "starting"
         var lastReportedBytes: UInt64 = .max
         var lastReportedNodes = -1
         var preparation = BeamItClipboardProgress()
@@ -120,6 +122,7 @@ final class BeamItClipboardSync: NSObject {
     func negotiate() async throws {
         guard let connection else { throw CancellationError() }
         do {
+            NSLog("BeamIt clipboard bulk negotiation started.")
             let reply = try await connection.clipboardRequest("clipboard_bulk_negotiate", ["version": 1],
                                                             reply: "clipboard_bulk_capabilities")
             let limits: [String: UInt64] = [
@@ -133,8 +136,13 @@ final class BeamItClipboardSync: NSObject {
             }
             bulkEnabled = true
             try await lifetime.ready()
+            NSLog("BeamIt clipboard bulk negotiation succeeded.")
         } catch let error as BeamItClipboardHostFailure where error.code == "unknown_type" && !error.fatal {
             bulkEnabled = false
+            NSLog("BeamIt clipboard bulk negotiation unavailable; using legacy clipboard transfer.")
+        } catch {
+            NSLog("BeamIt clipboard bulk negotiation failed: %@", Self.diagnosticCode(error))
+            throw error
         }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -182,6 +190,28 @@ final class BeamItClipboardSync: NSObject {
         if let code = op.failure { throw BeamItClipboardFailure(code) }
         let now = ProcessInfo.processInfo.systemUptime
         guard now - op.created < 30 * 60, now - op.progress < 30 else { throw BeamItClipboardFailure("timeout") }
+    }
+    private func phase(_ op: Operation, _ value: String) {
+        op.phase = value
+        NSLog("BeamIt clipboard %@ phase: %@", op.upload ? "upload" : "download", value)
+    }
+    private func logProgress(_ op: Operation) {
+        let bucket = op.bytes / (16 * 1024 * 1024)
+        guard bucket > op.diagnosticBucket else { return }
+        op.diagnosticBucket = bucket
+        NSLog("BeamIt clipboard %@ progress: %llu/%llu bytes, %d/%d nodes.",
+              op.upload ? "upload" : "download", op.bytes, total(op), op.nodes, op.manifest.nodes.count)
+    }
+    private func logManifest(_ op: Operation, _ stage: String) {
+        NSLog("BeamIt clipboard %@ %@: roots=%u nodes=%d file_bytes=%llu payload_bytes=%llu.",
+              op.upload ? "upload" : "download", stage, op.manifest.selectedRoots, op.manifest.nodes.count,
+              op.manifest.totalFileBytes, total(op))
+    }
+    private static func diagnosticCode(_ error: Error) -> String {
+        if let failure = error as? BeamItClipboardFailure { return failure.code }
+        if let failure = error as? BeamItClipboardHostFailure { return "host_\(failure.code)" }
+        let underlying = error as NSError
+        return "\(underlying.domain)_\(underlying.code)"
     }
     private func poll() {
         if let op = current, op.revision == revision {
@@ -295,6 +325,8 @@ final class BeamItClipboardSync: NSObject {
         try Task.checkCancellation()
         guard lifetime.acceptsTransfers, valid(op) else { throw CancellationError() }
         current = op
+        NSLog("BeamIt clipboard %@ started (manual=%@, automatic=%@).",
+              op.upload ? "upload" : "download", String(op.manual), String(op.automatic))
         show(op, "Preparing", bytes: 0, force: true)
         let task = Task {
             try Task.checkCancellation()
@@ -307,6 +339,9 @@ final class BeamItClipboardSync: NSObject {
         do {
             try await task.value
             op.succeeded = true
+            NSLog("BeamIt clipboard %@ completed: %llu bytes, %d/%d nodes, %.2f seconds.",
+                  op.upload ? "upload" : "download", op.bytes, op.nodes, op.manifest.nodes.count,
+                  ProcessInfo.processInfo.systemUptime - op.created)
             show(op, "Complete", bytes: total(op), force: true)
             await cleanup(op, failed: false)
             forwardable = current === op && valid(op, publishing: op.published) && op.failure == nil
@@ -314,6 +349,16 @@ final class BeamItClipboardSync: NSObject {
         } catch {
             if let failure = error as? BeamItClipboardFailure { op.failure = failure.code }
             else if !(error is CancellationError) && op.failure == nil { op.failure = "transport_or_native_failure" }
+            if let code = op.failure {
+                NSLog("BeamIt clipboard %@ failed at %@: %@ (%llu/%llu bytes).",
+                      op.upload ? "upload" : "download", op.phase, code, op.bytes, total(op))
+            } else if error is CancellationError {
+                NSLog("BeamIt clipboard %@ cancelled at %@ (%llu/%llu bytes).",
+                      op.upload ? "upload" : "download", op.phase, op.bytes, total(op))
+            } else {
+                NSLog("BeamIt clipboard %@ failed at %@: %@ (%llu/%llu bytes).",
+                      op.upload ? "upload" : "download", op.phase, Self.diagnosticCode(error), op.bytes, total(op))
+            }
             op.socket?.cancel(with: .goingAway, reason: nil)
             await cleanup(op, failed: true)
             if current === op { current = nil; panel?.orderOut(nil) }
@@ -413,6 +458,7 @@ final class BeamItClipboardSync: NSObject {
         let policy = Bulk.configuredPolicy()
         guard try Bulk.requiresConfirmation(bytes: op.manifest.totalFileBytes, roots: op.manifest.selectedRoots,
                                             byteThreshold: policy.byteThreshold, rootThreshold: policy.rootThreshold) else { return }
+        phase(op, "confirmation.waiting")
         try check(op)
         guard let window = op.window else { throw CancellationError() }
         let alert = NSAlert()
@@ -428,16 +474,22 @@ final class BeamItClipboardSync: NSObject {
         op.alert = nil
         guard decision == .alertFirstButtonReturn else { throw CancellationError() }
         try check(op)
+        phase(op, "confirmation.accepted")
         op.progress = ProcessInfo.processInfo.systemUptime
     }
 
     private func send(_ op: Operation) async throws {
         guard let connection else { throw CancellationError() }
+        phase(op, "source.capture")
         var content = try local(op)
         var image: BeamItClipboardStorage.Image?
-        if let data = content.image { image = try await storage.image(data, isPNG: content.isPNG) }
+        if let data = content.image {
+            phase(op, "image.prepare")
+            image = try await storage.image(data, isPNG: content.isPNG)
+        }
         try check(op)
         if !bulkEnabled || (content.files.isEmpty && image == nil) {
+            phase(op, "legacy.publish")
             guard image == nil || image!.png.count <= 7_864_320 else { throw BeamItClipboardFailure("legacy_too_large") }
             if let image { content.fields["image"] = ["mime_type": "image/png", "data": image.png.base64EncodedString()] }
             let textBytes = ((content.fields["text"] as? String)?.utf8.count ?? 0) +
@@ -448,26 +500,34 @@ final class BeamItClipboardSync: NSObject {
             try await connection.setClipboard(content.fields)
             try check(op)
             uploadedCount = op.sequence
+            phase(op, "complete")
             return
         }
+        phase(op, "source.inspect")
         var selection = try await storage.inspect(urls: content.files, png: image?.png, width: image?.width, height: image?.height)
+        op.manifest = selection.manifest
+        logManifest(op, "selection")
         while true {
             op.localID = selection.id; op.snapshotID = selection.id; op.manifest = selection.manifest
             op.preparation = BeamItClipboardProgress(); op.preparationSeen = 0
-            op.bytes = 0; op.nodes = 0; op.reported = 0
+            op.bytes = 0; op.nodes = 0; op.diagnosticBucket = 0; op.reported = 0
             try check(op)
             try await confirm(op)
+            phase(op, "source.prepare")
             do {
                 op.manifest = try await storage.prepare(selection, progress: op.preparation)
+                logManifest(op, "spool_ready")
                 break
             } catch let error as BeamItClipboardFailure where error.code == "source_changed" {
                 try await storage.finish(selection.id)
                 try check(op)
                 op.reconfirmed = true
+                phase(op, "source.reinspect")
                 selection = try await storage.inspect(urls: content.files, png: image?.png, width: image?.width, height: image?.height)
             }
         }
         try check(op)
+        phase(op, "upload.begin")
         var fields = content.fields
         fields["manifest"] = Bulk.json(op.manifest); fields["source_snapshot_id"] = op.snapshotID
         let offer = try await connection.clipboardRequest("clipboard_bulk_begin", fields, reply: "clipboard_bulk_offer")
@@ -475,8 +535,10 @@ final class BeamItClipboardSync: NSObject {
         guard try await storage.unchanged(op.localID) else { throw BeamItClipboardFailure("source_changed") }
         try check(op)
         guard let url = (offer["url"] as? String).flatMap(URL.init(string:)) else { throw BeamItClipboardFailure("invalid_offer") }
+        phase(op, "upload.socket")
         let socket = try await connection.openBulkSocket(url, transferID: op.transferID); op.socket = socket
         let transfer = try Bulk.decodeID(op.transferID, bytes: 16)
+        phase(op, "upload.frames")
         while true {
             try check(op)
             let frame = try await storage.senderFrame(op.localID, transferID: transfer)
@@ -485,19 +547,30 @@ final class BeamItClipboardSync: NSObject {
             try check(op)
             try await socket.send(.data(frame))
             op.bytes += UInt64(header.payload.count); op.progress = ProcessInfo.processInfo.systemUptime
+            if header.kind == .end {
+                op.nodes = op.manifest.nodes.count
+            } else if Int(header.nodeIndex) < op.manifest.nodes.count {
+                let node = op.manifest.nodes[Int(header.nodeIndex)]
+                let finished = header.offset + UInt64(header.payload.count) == (node.length ?? 0)
+                op.nodes = max(op.nodes, Int(header.nodeIndex) + (finished ? 1 : 0))
+            }
+            logProgress(op)
             show(op, "Sending", bytes: op.bytes)
             if header.kind == .end { op.ended = true; break }
         }
         guard try await storage.unchanged(op.localID) else { throw BeamItClipboardFailure("source_changed") }
         try check(op)
+        phase(op, "upload.commit")
         op.commitSent = true
         let committed = try await connection.clipboardRequest("clipboard_bulk_commit",
             ["transfer_id": op.transferID, "source_snapshot_id": op.snapshotID], reply: "clipboard_bulk_committed")
         guard committed["transfer_id"] as? String == op.transferID else { throw BeamItClipboardFailure("invalid_commit") }
+        phase(op, "upload.acknowledgement")
         while !op.acknowledged { try check(op); try await Task.sleep(for: .milliseconds(20)) }
         guard try await storage.unchanged(op.localID) else { throw BeamItClipboardFailure("source_changed") }
         try check(op)
         uploadedCount = op.sequence
+        phase(op, "complete")
     }
 
     private func snapshot(_ op: Operation, _ reply: [String: Any]) throws {
@@ -544,9 +617,11 @@ final class BeamItClipboardSync: NSObject {
     }
     private func receive(_ op: Operation) async throws {
         guard let connection else { throw CancellationError() }
+        phase(op, "clipboard.read")
         var metadata = try await connection.getClipboard()
         try check(op)
         if !bulkEnabled {
+            phase(op, "legacy.publish")
             var png: Data?
             let textBytes = ((metadata["text"] as? String)?.utf8.count ?? 0) +
                 ((metadata["html"] as? String)?.utf8.count ?? 0)
@@ -560,12 +635,21 @@ final class BeamItClipboardSync: NSObject {
                 png = decoded.png
             }
             try await publish(op, metadata: metadata, files: [], png: png)
+            phase(op, "complete")
             return
         }
         while true {
+            phase(op, "snapshot.validate")
             try snapshot(op, metadata)
-            if op.manifest.nodes.isEmpty { try await publish(op, metadata: metadata, files: [], png: nil); return }
+            logManifest(op, "snapshot")
+            if op.manifest.nodes.isEmpty {
+                phase(op, "clipboard.publish")
+                try await publish(op, metadata: metadata, files: [], png: nil)
+                phase(op, "complete")
+                return
+            }
             try await confirm(op)
+            phase(op, "download.request")
             op.waitingOffer = true
             let preparing = try await connection.clipboardRequest("clipboard_bulk_request",
                 ["snapshot_id": op.snapshotID], reply: "clipboard_bulk_progress")
@@ -578,15 +662,19 @@ final class BeamItClipboardSync: NSObject {
             while op.offer == nil { try check(op); try await Task.sleep(for: .milliseconds(20)) }
             let offer = op.offer!; op.offer = nil
             if offer["type"] as? String == "clipboard_bulk_reconfirm" {
-                metadata = offer; op.transferID = ""; op.bytes = 0; op.progress = ProcessInfo.processInfo.systemUptime
+                metadata = offer; op.transferID = ""; op.bytes = 0; op.diagnosticBucket = 0
+                op.progress = ProcessInfo.processInfo.systemUptime
                 continue // New snapshot and a new confirmation decision, never the old approval.
             }
             try validateOffer(op, offer)
-            op.bytes = 0
+            op.bytes = 0; op.nodes = 0; op.diagnosticBucket = 0
+            phase(op, "download.stage")
             try await storage.beginReceive(op.transferID, manifest: op.manifest)
             try check(op)
             guard let url = (offer["url"] as? String).flatMap(URL.init(string:)) else { throw BeamItClipboardFailure("invalid_offer") }
+            phase(op, "download.socket")
             let socket = try await connection.openBulkSocket(url, transferID: op.transferID); op.socket = socket
+            phase(op, "download.frames")
             while true {
                 try check(op)
                 let message = try await socket.receive()
@@ -599,6 +687,7 @@ final class BeamItClipboardSync: NSObject {
                 op.nodes = ended ? op.manifest.nodes.count : Int(header.nodeIndex) +
                     (header.offset + UInt64(header.payload.count) == op.manifest.nodes[Int(header.nodeIndex)].length ? 1 : 0)
                 op.progress = ProcessInfo.processInfo.systemUptime
+                logProgress(op)
                 if show(op, ended ? "Publishing" : "Receiving", bytes: op.bytes) {
                     try await connection.clipboardEvent("clipboard_bulk_progress", [
                         "transfer_id": op.transferID, "phase": "receiving",
@@ -615,13 +704,19 @@ final class BeamItClipboardSync: NSObject {
                     if !Task.isCancelled && !op.published { op.failure = "interrupted"; op.task?.cancel() }
                 }
             }
+            phase(op, "download.promote")
             try await completeReceivedFiles(transferID: op.transferID,
                 check: { try self.check(op) },
                 publish: { publication in
+                    self.phase(op, "clipboard.publish")
                     try await self.publish(op, metadata: metadata, files: publication.files, png: publication.png,
                                            record: publication.record)
                     return NSPasteboard.general.changeCount
-                }, didPublish: { op.published = true })
+                }, didPublish: {
+                    op.published = true
+                    self.phase(op, "download.acknowledge")
+                })
+            phase(op, "complete")
             return
         }
     }

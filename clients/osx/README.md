@@ -173,6 +173,11 @@ session-bound single-use token remain unchanged.
 
 ## Focused checks on a Mac
 
+On 2026-11-17, the corrected storage and lifetime executables and the unsigned
+Debug app build passed on arm64 macOS 27.3 with Xcode 27.1 / Swift 6.4.
+The tests used private roots and fake clipboard state; this does not validate
+the real pasteboard, AppKit event loop or end-to-end WSS receive path.
+
 Use the Xcode/macOS SDK required by the existing project (deployment target
 macOS 27). Its filesystem-synchronized app group automatically includes
 `BeamItClipboardBulk.swift`, `BeamItClipboardStorage.swift` and
@@ -235,6 +240,11 @@ python3 clients/osx/BeamIt/Tests/WebSocketOpenFixture.py \
 
 The storage executable uses private temporary fixtures, a sparse logical
 quota fixture and injected storage roots. It never opens the real pasteboard.
+Lease publication validates the canonical file with the hard-link-aware
+identity check before requiring its matching two-link pin; payload-tree
+checks still reject hard-linked files. Legacy migration reads the original
+`kind.device.inode.bytes` marker format and creates missing record directories
+only after validating eligibility and the original stage identity.
 It covers multi-chunk folder/empty/hidden/zero-byte content, hashes,
 preliminary/final JSON, early/duplicate END, promotion-before-END rejection,
 source identity drift, symlink rejection, unpublished cleanup, committed
@@ -271,7 +281,7 @@ Malformed old records and injected permission/disk-full publication failures
 exercise quarantined retention, continued authorized recovery and unrelated
 admission. A sparse exact-fit/one-over fixture runs while a typed legacy
 claim and another live reservation are held, before/after partial deletion
-and after completed cleanup. These are authored tests, not executed evidence.
+and after completed cleanup.
 An isolated unlinked-but-still-held lease fixture also checks conservative
 marker-only quota promises and refusal to reclaim the possible live owner.
 The renamed-directory extension exercises real receive and outgoing-spool

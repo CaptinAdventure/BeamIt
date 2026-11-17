@@ -143,7 +143,9 @@ enum ClipboardStorageTests {
         try JSONSerialization.data(withJSONObject: ["kind": "partial", "bytes": 3,
             "directory_device": UInt32(bitPattern: original.st_dev), "directory_inode": original.st_ino])
             .write(to: quotaRoot.appendingPathComponent(".reservations/" + abandoned))
-        try await second.recover()
+        try fs.setAttributes([.posixPermissions: 0o600],
+                             ofItemAtPath: quotaRoot.appendingPathComponent(".reservations/" + abandoned).path)
+        try await second.recover(legacyAllowed: true)
         precondition(!fs.fileExists(atPath: partial.path) && fs.fileExists(atPath: retained.path))
 
         // The PNG decoder validates actual bytes and declared dimensions before promotion.

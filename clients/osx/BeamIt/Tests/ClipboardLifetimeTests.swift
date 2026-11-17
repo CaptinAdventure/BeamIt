@@ -97,7 +97,7 @@ enum ClipboardLifetimeTests {
         }
         nodes.append(.init(kind: .file, path: "b", length: 3, sha256: Data(SHA256.hash(data: bytes)),
                            width: nil, height: nil))
-        return .init(selectedRoots: nodes.count, totalFileBytes: twoFiles ? 4 : 3, nodes: nodes)
+        return .init(selectedRoots: UInt32(nodes.count), totalFileBytes: twoFiles ? 4 : 3, nodes: nodes)
     }
     static func receive(_ storage: Storage, tag: UInt8, twoFiles: Bool = false,
                         promote: Bool = true) async throws -> Storage.Publication? {
@@ -157,7 +157,9 @@ enum ClipboardLifetimeTests {
     }
     static func rejects(_ code: String, _ action: () async throws -> Void) async throws {
         do { try await action(); preconditionFailure("Expected " + code) }
-        catch let failure as BeamItClipboardFailure { precondition(failure.code == code) }
+        catch let failure as BeamItClipboardFailure {
+            precondition(failure.code == code, "Expected \(code), got \(failure.code).")
+        }
     }
     static func startupAndReplacement(_ base: URL) async throws {
         let fs = FileManager.default, root = base.appendingPathComponent("startup")
@@ -452,7 +454,7 @@ enum ClipboardLifetimeTests {
                     root.appendingPathComponent(".reservation-records/" + id(80)).path)
                 var leaseIdentity = stat()
                 precondition(lstat(ledger.path, &leaseIdentity) == 0)
-                precondition(markers == ["lease.pin", v2Marker(id(80), kind: "legacy_cleanup",
+                precondition(markers.sorted() == ["lease.pin", v2Marker(id(80), kind: "legacy_cleanup",
                     bytes: 0, stage: original, lease: leaseIdentity)].sorted())
                 storage = nil // Drop the first owner/claim. The next check must rely on persisted metadata.
                 let successor = Storage(root: root)
@@ -481,8 +483,9 @@ enum ClipboardLifetimeTests {
                 let board = Board(), clock = Clock(), gate = Gate()
                 let lifetime = coordinator(Storage(root: root), board: board, clock: clock)
                 let peer = Peer()
-                let sync = BeamItClipboardSync(connection: peer, lifetime: lifetime,
-                                              admissionCheckpoint: race ? { try await gate.park() } : nil)
+                let checkpoint: (@MainActor () async throws -> Void)?
+                if race { checkpoint = { try await gate.park() } } else { checkpoint = nil }
+                let sync = BeamItClipboardSync(connection: peer, lifetime: lifetime, admissionCheckpoint: checkpoint)
                 // Deliberately never start recovery; successful rejection must not
                 // create a root, read NSApp, open the real board, or contact a host.
                 if !race { clock.advancing = true; await lifetime.shutdown() }
@@ -960,7 +963,9 @@ enum ClipboardLifetimeTests {
         try await rejects("staging_recovery_incomplete") { try await recovery.value }
         precondition(fs.fileExists(atPath: root.appendingPathComponent("client/partial/" + id(101)).path))
         try await peer.finish(id(102))
-        try await rejects("cleanup_identity_changed") { try await live.finish(id(101)) }
+        try await rejects("cleanup_ownership_uncertain") { try await live.finish(id(101)) }
+        precondition(fs.fileExists(atPath: root.appendingPathComponent("client/partial/" + id(101)).path))
+        precondition(fs.fileExists(atPath: root.appendingPathComponent(".reservation-records/" + id(101) + "/lease.pin").path))
     }
     static func renamedMissingLeaseQuota(_ base: URL) async throws {
         let fs = FileManager.default
@@ -1479,7 +1484,9 @@ enum ClipboardLifetimeTests {
             precondition(process.terminationStatus == 0)
             let records = root.appendingPathComponent(".reservation-records/" + id(111))
             let markers = try fs.contentsOfDirectory(atPath: records.path)
-            precondition(markers.count == 1 && markers[0].hasPrefix("deleted_"))
+            let proofs = markers.filter { $0.hasPrefix("deleted_v2.") }
+            precondition(proofs.count == 1)
+            precondition(markers.sorted() == (mode == "--retire-proof" ? proofs + ["lease.pin"] : proofs).sorted())
             let replacement = try legacy(root, tag: 111), peer = Storage(root: root)
             _ = await peer.cleanupStartup(legacyAllowed: true)
             let preserved = try Data(contentsOf: replacement.appendingPathComponent("b"))
@@ -1531,7 +1538,7 @@ enum ClipboardLifetimeTests {
             let owner = Storage(root: root, ledgerCheckpoint: { current in
                 guard current == point, signalOnce(start) else { return }
                 let deadline = ContinuousClock.now + .seconds(6)
-                while !fs.fileExists(atPath: waiting.path) {
+                while !FileManager.default.fileExists(atPath: waiting.path) {
                     guard ContinuousClock.now < deadline else {
                         throw BeamItClipboardFailure("fixture_barrier_timeout")
                     }
@@ -1577,8 +1584,10 @@ enum ClipboardLifetimeTests {
                 return fsync(descriptor)
             })
             try await storage.beginReceive(id(123), manifest: nestedManifest())
-            if crash { preconditionFailure("Tree sync crash checkpoint did not run.") }
-            do { try await storage.finish(id(123)); preconditionFailure("Expected tree sync failure.") }
+            do {
+                try await storage.finish(id(123))
+                preconditionFailure(crash ? "Tree sync crash checkpoint did not run." : "Expected tree sync failure.")
+            }
             catch let failure as BeamItClipboardFailure {
                 precondition(failure.code == "cleanup_failed")
             }

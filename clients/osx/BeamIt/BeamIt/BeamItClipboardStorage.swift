@@ -633,12 +633,15 @@ actor BeamItClipboardStorage {
                 guard values.count == 4 else { return nil }
             }
             let shift = v2 ? 1 : 0
+            let bytesIndex = v2 ? 2 : 3
+            let deviceIndex = v2 ? 3 : 1
+            let inodeIndex = v2 ? 4 : 2
             guard ["partial", "outgoing", "legacy_cleanup"].contains(values[shift]),
-                  let bytes = UInt64(values[shift + 1]), bytes <= quota,
-                  String(bytes) == values[shift + 1],
-                  let device = UInt32(values[shift + 2]), String(device) == values[shift + 2],
-                  let inode = UInt64(values[shift + 3]), inode > 0,
-                  String(inode) == values[shift + 3],
+                  let bytes = UInt64(values[bytesIndex]), bytes <= quota,
+                  String(bytes) == values[bytesIndex],
+                  let device = UInt32(values[deviceIndex]), String(device) == values[deviceIndex],
+                  let inode = UInt64(values[inodeIndex]), inode > 0,
+                  String(inode) == values[inodeIndex],
                   values[shift] != "legacy_cleanup" || bytes == 0 else { return nil }
             let stageIdentity = DirectoryIdentity(device: Int32(bitPattern: device), inode: inode)
             var leaseIdentity: DirectoryIdentity?
@@ -704,13 +707,13 @@ actor BeamItClipboardStorage {
         try ledgerCheckpoint?(.afterRecordDirectoryCreation)
         let leaseStamp = try stamp(lease)
         var leaseInfo = stat()
-        guard leaseStamp.mode & S_IFMT == S_IFREG, leaseStamp.links >= 1,
+        guard leaseStamp.mode & S_IFMT == S_IFREG, leaseStamp.links == 1 || leaseStamp.links == 2,
               fstat(lease.raw, &leaseInfo) == 0, leaseInfo.st_uid == geteuid(),
               leaseInfo.st_mode & 0o077 == 0 else {
             throw BeamItClipboardFailure("invalid_quota_ledger")
         }
         let ledgers = try child(root, ".reservations")
-        try verifyEntry(ledgers, name: id, expected: leaseStamp)
+        try verifyHardlinkEntry(ledgers, name: id, expected: leaseStamp)
         try verifyEntry(root, name: ".quota-lock", expected: stamp(mutex))
         if try !entryExists(directory, name: "lease.pin") {
             guard linkat(ledgers.raw, id, directory.raw, "lease.pin", 0) == 0 else {
@@ -850,8 +853,10 @@ actor BeamItClipboardStorage {
         guard record.version == 2, let expected = record.leaseIdentity else {
             throw BeamItClipboardFailure("cleanup_ownership_uncertain")
         }
-        let pin = try FD(openat(try child(root, ".reservation-records/" + id).raw,
-                                "lease.pin", O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC))
+        let directory = try child(root, ".reservation-records/" + id)
+        let pin = try withExtendedLifetime(directory) {
+            try FD(openat(directory.raw, "lease.pin", O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC))
+        }
         let value = try stamp(pin)
         var info = stat()
         guard value.mode & S_IFMT == S_IFREG, value.device == expected.device,
@@ -933,8 +938,7 @@ actor BeamItClipboardStorage {
             let existing = try FD(openat(ledgers.raw, id, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC))
             let value = try stamp(existing)
             var info = stat()
-            let hasPin = try entryExists(try child(root, ".reservation-records/" + id), name: "lease.pin")
-            let expectedLinks: UInt64 = hasPin ? 2 : 1
+            let expectedLinks: UInt64 = pinAlreadyExists ? 2 : 1
             guard value.mode & S_IFMT == S_IFREG, value.links == expectedLinks,
                   fstat(existing.raw, &info) == 0, info.st_uid == geteuid(),
                   info.st_mode & 0o077 == 0 else {
@@ -953,8 +957,8 @@ actor BeamItClipboardStorage {
             }
             lease = created
         }
-        let transferRecordDirectory = try child(recordDirectory, id)
         if pinAlreadyExists {
+            let transferRecordDirectory = try child(recordDirectory, id)
             let pin = try child(transferRecordDirectory, "lease.pin")
             let pinStamp = try stamp(pin), leaseStamp = try stamp(lease)
             guard pinStamp.mode & S_IFMT == S_IFREG, pinStamp.links == 2,
@@ -1306,7 +1310,7 @@ actor BeamItClipboardStorage {
                     throw BeamItClipboardFailure("cleanup_ownership_uncertain")
                 }
                 lockedLease = owner.lease
-                if current.deleted &&
+                if current.deleted,
                     !(try entryExists(try child(root, ".reservation-records/" + id), name: "lease.pin")) {
                     guard !(try entryExists(ledgers, name: id)) else {
                         throw BeamItClipboardFailure("cleanup_ownership_uncertain")
@@ -1317,7 +1321,7 @@ actor BeamItClipboardStorage {
                 }
             } else if let claim = cleanupClaims[id], let current, current.version == 2 {
                 lockedLease = claim
-                if current.deleted &&
+                if current.deleted,
                     !(try entryExists(try child(root, ".reservation-records/" + id), name: "lease.pin")) {
                     guard !(try entryExists(ledgers, name: id)) else {
                         throw BeamItClipboardFailure("cleanup_ownership_uncertain")
