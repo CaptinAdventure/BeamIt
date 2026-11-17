@@ -4,7 +4,7 @@ import CryptoKit
 import Foundation
 import Security
 
-final class BeamItConnection: BeamItConnectionTransport {
+final class BeamItConnection: BeamItConnectionTransport, BeamItClipboardPeer {
     private struct PendingRequest {
         let expectedType: String
         let continuation: CheckedContinuation<[String: Any], Error>
@@ -282,11 +282,7 @@ final class BeamItConnection: BeamItConnectionTransport {
                             ["text", "html", "image"]], expectedType: "clipboard")
     }
 
-    nonisolated struct ClipboardHostFailure: LocalizedError, Sendable {
-        let code: String
-        let errorDescription: String?
-        let fatal: Bool
-    }
+    nonisolated typealias ClipboardHostFailure = BeamItClipboardHostFailure
 
     func clipboardRequest(_ type: String, _ fields: [String: Any], reply: String) async throws -> [String: Any] {
         try await request(type: type, fields: fields, expectedType: reply)

@@ -73,18 +73,98 @@ opening its ancestors; descendants are still opened without following symlinks.
 Native pasteboard URL reads obtain user-selected access; security-scoped
 access is balanced for the lifetime of the captured source.
 Live owners survive recovery; outgoing/failed partial work is cleaned.
-**Published `client/committed` files are never automatically deleted.**
-Stop transfers, clear the pasteboard and close all consuming applications
-before manually removing unneeded committed selections. Do not remove live
-ledgers, partials or outgoing directories. Retain anything whose consumers
-are uncertain.
+**Received macOS `client/committed` staging uses replacement-and-restart
+cleanup**, not indefinite retention. An app-level coordinator starts recovery
+without a connection and monitors only the pasteboard change count, even while
+sync is disabled, the app is inactive or the host is disconnected. Its own
+publication/rollback counts are protected. Clipboard replacement retires
+received staging; startup also attempts to remove older retained selections.
+Disconnect alone does not delete a published selection.
+
+Normal app termination cancels/drains clipboard work and allows up to two
+seconds for best-effort cleanup of this instance's received staging. If work
+cannot quiesce or deletion stalls, termination proceeds; crashes, forced quit,
+power loss and suspension may leave data for the next startup. Cleanup failures
+are retained as a non-secret diagnostic visible in the connection/stream error
+surface. They do not revoke a previously acknowledged transfer.
+
+**This policy can interrupt consumers and leave stale pasteboard file URLs.**
+BeamIt does not detect paste completion or know when a consuming app is finished.
+It never deletes the original source or an independent pasted destination copy.
+Unlinking staging is not secure erasure: open handles, caches and backups can
+retain data. Windows host/client committed retention is unchanged.
+
+Committed kernel leases protect live instances and promotion before publication.
+Legacy directories without a lease are reclaimed only when process enumeration
+positively excludes another BeamIt instance and transfer ownership is clear.
+An enumeration failure retains them and reports incomplete cleanup. An older
+binary starting after that check cannot be excluded atomically across versions.
+Deletion validates exact directory identities and never follows links or uses
+paths read from the pasteboard; unexpected entries remain untouched.
+
+New reservations keep the original locked lease under `.reservations` and a
+private hard-link pin at `.reservation-records/<transfer-ID>/lease.pin`.
+An immutable `v2` marker binds the transfer ID, operation kind, declared
+payload bytes, stage identity and lease identity. The canonical lease and pin
+must identify the same regular-file inode and have the expected link count.
+The marker name is created atomically; BeamIt does not rewrite an established
+binding. The `.quota-lock` descriptor is checked against its named inode after
+the lock is acquired and before critical mutations.
+
+Recovery opens the pin and attempts to lock that original inode. A live lock
+prevents cleanup. A missing or replaced canonical lease, missing or renamed
+stage, inconsistent pin, or conflicting marker is reported and retained; a
+replacement lease is never adopted. Only the exact validated stage can be
+removed. Recursive removal syncs every directory whose entries it changes.
+BeamIt durably marks the binding deleted only after all of those syncs succeed.
+An error or cancellation before that proof retains the record and lease. That
+proof authorizes metadata retirement in this order:
+canonical lease, pin, then record, with each affected parent synced. A deleted
+proof permits metadata-only recovery; it never authorizes deleting a new
+stage at the same transfer ID. An absent stage without that proof remains
+ambiguous and retains its record and reservation.
+
+Quota accounting counts actual staging bytes once and subtracts only bytes
+measured from the bound original stage. If the original cannot be located or
+measurement is uncertain, BeamIt retains the full possible payload and scratch
+reservation. A replacement does not reduce that promise. Malformed bounds or
+untrusted metadata block admission when the remaining quota cannot be computed
+safely.
+
+Eligible legacy recovery can migrate an intact identity-bound old record only
+after it verifies the stage and durably creates the new binding. An unbound
+ordinary record, malformed metadata, or old `deleted_` marker is not ownership
+proof and remains quarantined. Old unleased committed selections retain the
+previously approved process-enumeration eligibility check. The new lease
+binding does not exclude an older binary that starts after enumeration.
+File/directory sync behavior and the resulting crash guarantees still require
+native macOS verification; do not treat source inspection or authored tests as
+runtime evidence.
+
+If retry fails, stop all BeamIt instances and transfers, clear the pasteboard,
+and close consuming applications before manually removing only unneeded
+selections under the app container's `ClipboardStaging/client/committed`.
+For reported unknown-identity work, inspect only the matching private
+`client/partial` or `client/outgoing` selection; automatic recovery cannot
+safely adopt it. These are staged copies, not original sources.
+With all BeamIt processes stopped, a removed received selection's matching
+abandoned transfer-ID lease under `.reservations` and its matching record
+directory under `.reservation-records` can also be removed after the selected
+staged data is removed. Do not guess ownership or remove
+unrelated entries; never remove a live ledger or another root's data.
+Leave identity-bound partials/outgoing work to recovery. Residual staged
+bytes remain quota-accounted until removal; no additional filesystem permission
+or broader home/container scan is requested.
 
 macOS has no atomic transaction for arbitrary third-party delayed
 pasteboard formats. The client prepares supported formats, captures supported
 old representations, checks the destination again, then writes the complete
 selection. A failed write attempts supported-format rollback, reports the
 limitation and sends no success acknowledgement. If rollback cannot prove
-new file references are gone, it conservatively retains their files.
+new file references are gone, it conservatively retains both possible selections
+for the rest of the process. Supported rollback rebinds the prior selection to
+the resulting change count. Shutdown or a later startup may still remove
+uncertain references under the selected cleanup policy.
 
 Bulk socket opening waits for the pinned session's WebSocket upgrade
 callback, not a ping reply. This lets the receiver start reading when
@@ -96,7 +176,8 @@ session-bound single-use token remain unchanged.
 Use the Xcode/macOS SDK required by the existing project (deployment target
 macOS 27). Its filesystem-synchronized app group automatically includes
 `BeamItClipboardBulk.swift`, `BeamItClipboardStorage.swift` and
-`BeamItConnectionTransport.swift`.
+`BeamItConnectionTransport.swift`, `BeamItClipboardLifetime.swift` and
+`BeamItApplicationLifetime.swift` and `BeamItClipboardPeer.swift`.
 There is no shared XCTest target/scheme in this project. From repository
 root, build the actual application target:
 
@@ -128,6 +209,19 @@ xcrun swiftc -swift-version 6 -default-isolation MainActor -parse-as-library \
 
 xcrun swiftc -swift-version 6 -default-isolation MainActor -parse-as-library \
   -target "$(uname -m)-apple-macos27.0" \
+  clients/osx/BeamIt/BeamIt/BeamItClipboardBulk.swift \
+  clients/osx/BeamIt/BeamIt/BeamItClipboardStorage.swift \
+  clients/osx/BeamIt/BeamIt/BeamItClipboardLifetime.swift \
+  clients/osx/BeamIt/BeamIt/BeamItApplicationLifetime.swift \
+  clients/osx/BeamIt/BeamIt/BeamItClipboardPeer.swift \
+  clients/osx/BeamIt/BeamIt/BeamItClipboardSync.swift \
+  clients/osx/BeamIt/Tests/ClipboardLifetimeTests.swift \
+  -framework AppKit -framework CryptoKit -framework Security -framework ImageIO \
+  -framework UniformTypeIdentifiers -o "$test_dir/ClipboardLifetimeTests"
+"$test_dir/ClipboardLifetimeTests"
+
+xcrun swiftc -swift-version 6 -default-isolation MainActor -parse-as-library \
+  -target "$(uname -m)-apple-macos27.0" \
   clients/osx/BeamIt/BeamIt/CertificatePinDelegate.swift \
   clients/osx/BeamIt/BeamIt/BeamItClipboardBulk.swift \
   clients/osx/BeamIt/BeamIt/BeamItClipboardStorage.swift \
@@ -144,9 +238,110 @@ quota fixture and injected storage roots. It never opens the real pasteboard.
 It covers multi-chunk folder/empty/hidden/zero-byte content, hashes,
 preliminary/final JSON, early/duplicate END, promotion-before-END rejection,
 source identity drift, symlink rejection, unpublished cleanup, committed
-retention, live-owner quota protection, abandoned recovery, PNG decode and
+live committed leases/exact cleanup, live-owner quota protection, abandoned recovery, PNG decode and
 dimension mismatch. The pure checks cover framing, malformed fields/paths,
 threshold/settings boundaries and canonical IDs.
+
+The lifetime executable uses only private temporary roots, fake pasteboard
+counts/URLs, injected process-enumeration results, clock and failure/gate hooks.
+It invokes the launch delegate callback directly and the termination helper
+with a fake reply. It covers
+startup without connection, own writes versus replacement, supported rollback,
+uncertain-reference retention, live promoted/committed leases, legacy uncertainty,
+partial deletion with permission/disk errors, sparse exact quota accounting,
+hostile directory replacement/symlinks and outside source/destination sentinels.
+It also covers persisted legacy identity claims across a second startup with
+legacy cleanup disabled, injected post-claim errors, old unbound ledgers,
+file/directory replacement immediately before unlink, text-only replacement
+and rollback, the automatic observer loop without a connection or window,
+and missing/replaced pins plus conflicting versioned markers.
+The real `BeamItClipboardSync.downloadHostClipboard` entry is compiled and
+called through an injected clipboard peer and private coordinator. An observed
+admission barrier precedes the shutdown/download race; both race and
+already-shutdown cases require zero host calls and no staging-root creation.
+An observed active deletion gate precedes concurrent quota admission and the
+bounded shutdown check. Private child test processes hold real kernel leases
+and exit via `_exit` before/after promotion/publication for recovery checks.
+Additional private child fixtures exit while lease/directory/record creation
+is suspended at an observed checkpoint, including creation of the durable
+identity journal for an eligible old unleased committed selection. Recovery
+retries a complete journal but retains an empty interrupted record directory.
+They preserve replacement sentinels and a concurrent live process's lease.
+Malformed old records and injected permission/disk-full publication failures
+exercise quarantined retention, continued authorized recovery and unrelated
+admission. A sparse exact-fit/one-over fixture runs while a typed legacy
+claim and another live reservation are held, before/after partial deletion
+and after completed cleanup. These are authored tests, not executed evidence.
+An isolated unlinked-but-still-held lease fixture also checks conservative
+marker-only quota promises and refusal to reclaim the possible live owner.
+The renamed-directory extension exercises real receive and outgoing-spool
+operations: a one-byte partial and a complete three-byte spool, both present
+and unlinked held-lease paths, and originals renamed within or outside the
+staging inventory. Exact/one-byte-over admissions include a substituted old-ID
+directory with its own charged sentinel bytes. Receiver writes continue
+through the original descriptor; outgoing tests call production `senderFrame`
+after rename. Cleanup/marker/source sentinel checks keep the original identity
+and reject both ordinary and committed-path substitutions. A synchronous
+checkpoint substitutes the directory between descriptor measurement and final
+entry verification. Rollback fixtures vary pre/post-marker interruption,
+lease unlink/substitution and canonical/renamed original paths; they check
+retained identity, kernel exclusion, quota promises and later committed
+sentinels. Successful partial/outgoing cleanup checks metadata removal.
+Child-process fixtures exit after deletion-proof publication and lease
+retirement, then check replacement preservation and proof-only recovery.
+Injected failures before stage-parent sync, proof sync, canonical-lease sync,
+pin sync, marker retirement and record-directory sync check that pre-proof
+ambiguity retains metadata and post-proof recovery retires metadata without
+deleting a replacement.
+Additional private-root fixtures hold the quota lock in same-process and
+separate-process owners while another storage instance attempts admission.
+They checkpoint after pin linking and around promotion rename plus both parent
+syncs. Nested-tree deletion fixtures inject a failing directory-sync result, exit
+after a nested directory sync, and verify recovery. A cancellable
+`cleanupCommitted` fixture cancels before its first removal and checks that the
+stage, active marker and lease remain. A separate exact-operation fixture
+cancels the current cleanup task before the deletion-proof rename and again
+after the rename but before its directory sync. It checks that the stage stays
+removed, the active marker and original lease/pin remain, and the post-rename
+case rolls the marker back without retiring metadata. A partial-tree fixture
+cancels `cleanupCommitted` after the first child unlink, checks the exact
+remaining tree and active metadata, then retries cleanup successfully. These
+fixtures do not claim that cancellation propagates through the unstructured
+`finish()` path.
+Two observer child processes retain an open descriptor to the original lease
+and test its kernel lock after acquiring the quota lock following retirement
+failures, covering pin-sync and record-retirement errors. Other fixtures
+quarantine an old identity-only `deleted_` marker and exercise exact/one-byte-
+over committed quota with an identity-mismatched committed name and the
+original stage relocated inside the inventory, so the production lookup/open
+measurement checkpoints are reached. The fixtures assert those checkpoints,
+the original stage identity, both replacement sentinels, and exact versus
+one-byte-over arithmetic. These tests are authored and source-checked, not run
+on this Windows host. Root-lock tests use file rendezvous: the MainActor test
+waits asynchronously for holder and contender markers, and checkpoint
+callbacks poll release files on the storage execution context. A bounded
+observation window checks that no acquisition marker appears while the holder
+retains the lock.
+These fixtures test process-death windows, not machine power-loss guarantees.
+An additional private fixture substitutes the quota-lock pathname immediately
+after lock acquisition and expects transfer admission to fail before creating
+its reservation. This is authored coverage, not a native execution result;
+it does not cover replacement after the initial lock validation.
+Each child/barrier has a six-second fixture deadline; failed checks must be
+reported as failures, not native passes. The tests do not use the real board,
+launch the UI or AppKit event loop, invoke
+the real `applicationShouldTerminate` callback, detect consumer completion,
+or establish cross-version exclusion.
+The L8-focused test stages real binary frames/END and calls the actual shared
+`BeamItClipboardSync.completeReceivedFiles` production receive-completion
+method. It uses fake native-board callbacks and an event-recording peer,
+observes one `clipboard_bulk_complete`, then injects cleanup failure and checks
+that no contradictory event follows. It also rejects completion before END.
+It does **not** exercise the full download entry's metadata/control/WSS,
+native board/focus/UI behavior or a deployed transfer. That integration
+coverage remains separate; no native execution is claimed here.
+Native compile/runtime, real lifecycle callbacks and app/UI acceptance are
+**NOT_YET_VERIFIED** on the Windows development machine.
 
 The opening regression calls the **final production `openBulkSocket`**
 in `BeamItConnectionTransport`, inherited without a wrapper by
@@ -260,7 +455,10 @@ Use disposable copied files and an isolated test host:
    Exercise old-host fallback and exclusion/sensitive behavior.
 5. Hold destination pasteboard ownership or inject native API failure. Check
    explicit failure/rollback disclosure and no partial file list. Replace
-   the pasteboard after success and verify consumers retain usable files.
+   a disposable named pasteboard after success, with an injected private staging
+   root, and verify exact staging retirement without rewriting the board.
+   Verify copied source/destination sentinels remain intact. Stale URLs and
+   interrupted consumers are accepted risks, not a consumer-continuity pass.
 6. During a representative large transfer, record control/input latency,
    video behavior and progress/cancel responsiveness. Native UI, rollback,
    app paste, cross-machine LAN and sustained performance require actual

@@ -133,11 +133,15 @@ enum ClipboardStorageTests {
         try await rejects("quota_exceeded") { try await second.beginReceive(otherID, manifest: small) }
         try await first.finish(liveID)
 
-        // An unlocked lease simulates process death; retained committed data survives.
+        // Transfer-only recovery leaves committed data to the app coordinator;
+        // it reclaims an unlocked abandoned partial lease.
         let abandoned = Bulk.base64URL(Data(repeating: 11, count: 16))
         let partial = quotaRoot.appendingPathComponent("client/partial/" + abandoned)
         try fs.createDirectory(at: partial, withIntermediateDirectories: true)
-        try JSONSerialization.data(withJSONObject: ["kind": "partial", "bytes": 3])
+        var original = stat()
+        precondition(lstat(partial.path, &original) == 0)
+        try JSONSerialization.data(withJSONObject: ["kind": "partial", "bytes": 3,
+            "directory_device": UInt32(bitPattern: original.st_dev), "directory_inode": original.st_ino])
             .write(to: quotaRoot.appendingPathComponent(".reservations/" + abandoned))
         try await second.recover()
         precondition(!fs.fileExists(atPath: partial.path) && fs.fileExists(atPath: retained.path))
@@ -169,6 +173,12 @@ enum ClipboardStorageTests {
         try await rejects("invalid_png_dimensions") { _ = try await receiver.promote(pngID) }
         try await receiver.finish(pngID)
         try await sender.finish(imageSelection.id)
-        print("Clipboard storage, ordering, revision, quota and retention checks passed.")
+        let cleaned = try await receiver.cleanupCommitted(publication.record)
+        precondition(cleaned && !fs.fileExists(atPath: publication.files[0].path))
+        let duplicate = try await receiver.cleanupCommitted(publication.record)
+        precondition(duplicate)
+        let pngCleaned = try await receiver.cleanupCommitted(validPublication.record)
+        precondition(pngCleaned)
+        print("Clipboard storage, ordering, revision, quota, live committed lease and exact cleanup checks passed.")
     }
 }

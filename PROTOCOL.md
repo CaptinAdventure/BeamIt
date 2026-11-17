@@ -1001,7 +1001,9 @@ third-party formats. BeamIt prepares supported formats before clearing and
 attempts supported-format rollback on a later write failure. It reports
 that limitation and never reports success or knowingly publishes a partial
 file list. If OS references may survive rollback failure, retain their
-staging files conservatively.
+staging files conservatively. On macOS, uncertain references are protected
+for the rest of the process; the lifecycle policy below may invalidate them
+at shutdown or later startup.
 
 #### 5.11.8 Policy, storage and resource bounds
 
@@ -1028,9 +1030,24 @@ per-operation 128 MiB scratch reservation **within** that quota. A
 cross-process lock/ledger accounts actual bytes plus unmaterialized
 reservations without double counting. Preserve live owners; recover only
 abandoned outgoing/partial work. Delete outgoing spools and failed partials
-on terminal outcomes. Never automatically delete published receiver files:
-clipboard owners and consuming applications may still reference them.
-Manual cleanup requires clearing the clipboard and closing consumers first.
+on terminal outcomes. Windows host/client published receiver paths are retained
+indefinitely; manual cleanup requires clearing the clipboard and closing consumers.
+macOS received `client/committed` paths use the approved replacement-and-restart
+exception: an app-level coordinator observes only pasteboard change count,
+independent of connection/enablement, protects publication/rollback counts,
+and attempts exact no-follow cleanup after replacement, at startup (including
+legacy retained entries) and during a two-second bounded best-effort shutdown.
+Committed kernel leases and quota-locked cleanup claims protect live owners
+and promoted-but-unpublished work. Recursive deletion runs outside the shared
+lock; remaining bytes stay charged after failure. Legacy unleased entries
+require positive no-other-instance and ownership checks; uncertainty retains
+them. A concurrently starting pre-revision binary cannot be excluded atomically.
+Crash/timeout can defer cleanup to a later launch. Failures surface non-secret
+diagnostics and do not retroactively invalidate transfer acknowledgements.
+This policy may interrupt consumers or leave stale pasteboard URLs; it is
+neither paste-completion detection nor secure erasure. It never deletes source
+files or independent pasted destination copies. No wire message or protocol
+version changes for this macOS-only local lifetime policy.
 No resume, move/cut, file promises, metadata/ACL replication, general file
 browser, or cloud transport is defined.
 

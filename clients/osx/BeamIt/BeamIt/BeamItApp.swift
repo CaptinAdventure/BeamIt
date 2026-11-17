@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct BeamItApp: App {
+    @NSApplicationDelegateAdaptor(BeamItApplicationLifetime.self) private var applicationLifetime
     @AppStorage("clipboardSyncEnabled") private var clipboardSyncEnabled = false
     @AppStorage("showHostCursor") private var showHostCursor = false
     var body: some Scene {
@@ -9,6 +10,7 @@ struct BeamItApp: App {
             ContentView()
                 .frame(minWidth: 520, minHeight: 560)
         }
+
         .commands {
             CommandGroup(after: .windowSize) {
                 Button("Fullscreen") {

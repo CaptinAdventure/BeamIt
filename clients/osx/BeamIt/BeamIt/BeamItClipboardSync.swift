@@ -71,15 +71,17 @@ final class BeamItClipboardSync: NSObject {
             window = NSApp.keyWindow ?? NSApp.mainWindow
         }
     }
-    private weak var connection: BeamItConnection?
-    private let storage = BeamItClipboardStorage()
+    private weak var connection: (any BeamItClipboardPeer)?
+    private let lifetime: BeamItClipboardLifetime
+    private let admissionCheckpoint: (@MainActor () async throws -> Void)?
+    private var storage: BeamItClipboardStorage { lifetime.storage }
     private var current: Operation?
     private var pollTask: Task<Void, Never>?
     private var automaticTask: Task<Void, Never>?
     private var observers: [NSObjectProtocol] = []
     private var revision: UInt64 = 0
     private var stopped = false
-    private var seenCount = NSPasteboard.general.changeCount
+    private var seenCount: Int
     private var ownCount = -1
     private var uploadedCount = -1
     private var panel: NSPanel?
@@ -91,9 +93,18 @@ final class BeamItClipboardSync: NSObject {
         didSet { if enabled != oldValue { cancel() } }
     }
 
-    init(connection: BeamItConnection) {
+    convenience init(connection: any BeamItClipboardPeer) {
+        self.init(connection: connection, lifetime: .shared)
+    }
+    init(connection: any BeamItClipboardPeer, lifetime: BeamItClipboardLifetime,
+         admissionCheckpoint: (@MainActor () async throws -> Void)? = nil) {
         self.connection = connection
+        self.lifetime = lifetime
+        self.admissionCheckpoint = admissionCheckpoint
+        seenCount = lifetime.clipboardSequence()
         super.init()
+        lifetime.registerWork(self, cancel: { [weak self] in self?.cancel() },
+                              busy: { [weak self] in self?.current != nil })
         for name in [NSApplication.didResignActiveNotification, NSWindow.didResignKeyNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) {
                 [weak self] _ in
@@ -121,8 +132,8 @@ final class BeamItClipboardSync: NSObject {
                 throw BeamItClipboardFailure("invalid_capabilities")
             }
             bulkEnabled = true
-            try await storage.recover()
-        } catch let error as BeamItConnection.ClipboardHostFailure where error.code == "unknown_type" && !error.fatal {
+            try await lifetime.ready()
+        } catch let error as BeamItClipboardHostFailure where error.code == "unknown_type" && !error.fatal {
             bulkEnabled = false
         }
         pollTask = Task { [weak self] in
@@ -142,6 +153,7 @@ final class BeamItClipboardSync: NSObject {
         if BeamItClipboardMenu.shared.sync === self { BeamItClipboardMenu.shared.sync = nil }
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         observers.removeAll()
+        if current == nil { lifetime.unregisterWork(self) }
     }
     @objc func cancel() {
         invalidate(cancelAutomatic: true)
@@ -249,7 +261,7 @@ final class BeamItClipboardSync: NSObject {
     }
 
     func uploadLocalClipboard(manual: Bool = false, automatic: Bool = false) async throws {
-        guard !stopped, NSApp.isActive, enabled || manual else { throw CancellationError() }
+        guard !stopped, lifetime.acceptsTransfers, NSApp.isActive, enabled || manual else { throw CancellationError() }
         if let op = current, op.upload, valid(op), let task = op.task {
             try await task.value
             guard valid(op), !op.reconfirmed else { throw CancellationError() }
@@ -260,7 +272,11 @@ final class BeamItClipboardSync: NSObject {
     }
     func downloadHostClipboard(manual: Bool = true) async throws { try await run(upload: false, manual: manual) }
     private func run(upload: Bool, manual: Bool, automatic: Bool = false) async throws {
-        guard !stopped, NSApp.isActive, enabled || manual else { throw CancellationError() }
+        defer { if stopped && current == nil { lifetime.unregisterWork(self) } }
+        guard !stopped, lifetime.acceptsTransfers else { throw CancellationError() }
+        if let admissionCheckpoint { try await admissionCheckpoint() }
+        try Task.checkCancellation()
+        guard !stopped, lifetime.acceptsTransfers, NSApp.isActive, enabled || manual else { throw CancellationError() }
         let previous = current
         invalidate(cancelAutomatic: false)
         let op = Operation(revision: revision, upload: upload, manual: manual, automatic: automatic)
@@ -277,10 +293,12 @@ final class BeamItClipboardSync: NSObject {
             await cleanup(previous, failed: !previous.succeeded)
         }
         try Task.checkCancellation()
-        guard valid(op) else { throw CancellationError() }
+        guard lifetime.acceptsTransfers, valid(op) else { throw CancellationError() }
         current = op
         show(op, "Preparing", bytes: 0, force: true)
         let task = Task {
+            try Task.checkCancellation()
+            guard self.lifetime.acceptsTransfers else { throw CancellationError() }
             if upload { try await self.send(op) }
             else { try await self.receive(op) }
         }
@@ -317,7 +335,7 @@ final class BeamItClipboardSync: NSObject {
         }
         for id in Set([op.localID, op.upload ? "" : op.transferID]).filter({ !$0.isEmpty }) {
             do { try await storage.finish(id, published: op.published) }
-            catch { NSLog("BeamIt clipboard staging cleanup failed; retained data remains quota-accounted.") }
+            catch { lifetime.reportFailure() }
         }
         op.socket?.cancel(with: .normalClosure, reason: nil)
     }
@@ -541,12 +559,12 @@ final class BeamItClipboardSync: NSObject {
                 let decoded = try await storage.image(bytes, isPNG: true)
                 png = decoded.png
             }
-            try publish(op, metadata: metadata, files: [], png: png)
+            try await publish(op, metadata: metadata, files: [], png: png)
             return
         }
         while true {
             try snapshot(op, metadata)
-            if op.manifest.nodes.isEmpty { try publish(op, metadata: metadata, files: [], png: nil); return }
+            if op.manifest.nodes.isEmpty { try await publish(op, metadata: metadata, files: [], png: nil); return }
             try await confirm(op)
             op.waitingOffer = true
             let preparing = try await connection.clipboardRequest("clipboard_bulk_request",
@@ -597,20 +615,35 @@ final class BeamItClipboardSync: NSObject {
                     if !Task.isCancelled && !op.published { op.failure = "interrupted"; op.task?.cancel() }
                 }
             }
-            let publication = try await storage.promote(op.transferID)
-            await Task.yield() // Let a queued trailing-frame failure reach the publication guard.
-            try check(op)
-            try publish(op, metadata: metadata, files: publication.files, png: publication.png)
-            // Publication and this retention flag are synchronous on MainActor.
-            // Cancellation cannot delete paths between an OS write and marking ownership.
-            op.published = true
-            try await connection.clipboardEvent("clipboard_bulk_complete",
-                ["transfer_id": op.transferID, "sequence": NSPasteboard.general.changeCount])
+            try await completeReceivedFiles(transferID: op.transferID,
+                check: { try self.check(op) },
+                publish: { publication in
+                    try await self.publish(op, metadata: metadata, files: publication.files, png: publication.png,
+                                           record: publication.record)
+                    return NSPasteboard.general.changeCount
+                }, didPublish: { op.published = true })
             return
         }
     }
 
-    private func publish(_ op: Operation, metadata: [String: Any], files: [URL], png: Data?) throws {
+    // Shared production receive completion path. The test supplies only native
+    // board/check callbacks; promotion/END validation and ACK emission stay here.
+    // This is not a second receiver and never fabricates an acknowledgement.
+    func completeReceivedFiles(transferID: String, check: @MainActor () throws -> Void,
+                               publish: @MainActor (BeamItClipboardStorage.Publication) async throws -> Int,
+                               didPublish: @MainActor () -> Void) async throws {
+        guard let connection else { throw CancellationError() }
+        let publication = try await storage.promote(transferID)
+        await Task.yield() // Let a queued trailing-frame failure reach the publication guard.
+        try check()
+        let sequence = try await publish(publication)
+        didPublish()
+        try await connection.clipboardEvent("clipboard_bulk_complete",
+            ["transfer_id": transferID, "sequence": sequence])
+    }
+
+    private func publish(_ op: Operation, metadata: [String: Any], files: [URL], png: Data?,
+                         record: BeamItClipboardStorage.CommittedRecord? = nil) async throws {
         try check(op)
         guard metadata["excluded"] as? Bool != true,
               (metadata["omitted"] as? [[String: Any]] ?? []).isEmpty else {
@@ -629,32 +662,43 @@ final class BeamItClipboardSync: NSObject {
             items.append(item)
         }
         guard !items.isEmpty else { throw BeamItClipboardFailure("unsupported_clipboard") }
-        let board = NSPasteboard.general
-        // Snapshot currently materialized supported representations before clear.
-        // Arbitrary delayed-render third-party representations cannot be restored atomically.
-        let supported: [NSPasteboard.PasteboardType] = [.string, .html, .png, .tiff, .fileURL,
-            .init("org.nspasteboard.ConcealedType"), .init("org.nspasteboard.TransientType"),
-            .init("org.nspasteboard.AutoGeneratedType")]
-        let old = try (board.pasteboardItems ?? []).compactMap { source -> NSPasteboardItem? in
-            let copy = NSPasteboardItem()
-            for type in source.types where supported.contains(type) {
-                guard let data = source.data(forType: type), copy.setData(data, forType: type) else {
-                    throw BeamItClipboardFailure("clipboard_backup_failed")
+        let outcome = try await lifetime.publish(record) {
+            try check(op)
+            let board = NSPasteboard.general
+            // Snapshot materialized supported formats while both records are protected.
+            // Arbitrary delayed third-party formats cannot be restored atomically.
+            let supported: [NSPasteboard.PasteboardType] = [.string, .html, .png, .tiff, .fileURL,
+                .init("org.nspasteboard.ConcealedType"), .init("org.nspasteboard.TransientType"),
+                .init("org.nspasteboard.AutoGeneratedType")]
+            let old = try (board.pasteboardItems ?? []).compactMap { source -> NSPasteboardItem? in
+                let copy = NSPasteboardItem()
+                for type in source.types where supported.contains(type) {
+                    guard let data = source.data(forType: type), copy.setData(data, forType: type) else {
+                        throw BeamItClipboardFailure("clipboard_backup_failed")
+                    }
                 }
+                return copy.types.isEmpty ? nil : copy
             }
-            return copy.types.isEmpty ? nil : copy
-        }
-        try check(op)
-        board.clearContents()
-        guard board.writeObjects(items) else {
+            try check(op)
             board.clearContents()
-            let restored = old.isEmpty || board.writeObjects(old)
-            if !restored { op.published = true } // Partial OS references may survive; retain conservatively.
-            throw BeamItClipboardFailure(restored ? "clipboard_unavailable_supported_formats_restored_delayed_formats_not_atomic" :
-                "clipboard_unavailable_rollback_failed_files_retained")
+            guard board.writeObjects(items) else {
+                board.clearContents()
+                let restored = old.isEmpty || board.writeObjects(old)
+                if !restored { op.published = true } // Partial OS references may survive.
+                ownCount = board.changeCount; seenCount = ownCount; uploadedCount = ownCount
+                return restored ? .restored(ownCount) : .uncertain(ownCount)
+            }
+            op.published = true
+            ownCount = board.changeCount; seenCount = ownCount; uploadedCount = ownCount
+            return .success(ownCount)
         }
-        op.published = true
-        ownCount = board.changeCount; seenCount = ownCount; uploadedCount = ownCount
+        switch outcome {
+        case .success: return
+        case .restored:
+            throw BeamItClipboardFailure("clipboard_unavailable_supported_formats_restored_delayed_formats_not_atomic")
+        case .uncertain:
+            throw BeamItClipboardFailure("clipboard_unavailable_rollback_failed_files_retained")
+        }
     }
     private func total(_ op: Operation) -> UInt64 { op.manifest.nodes.reduce(0) { $0 + ($1.length ?? 0) } }
     private func pace(_ op: Operation, bytes: Int) async throws {
