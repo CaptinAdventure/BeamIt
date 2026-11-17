@@ -161,6 +161,15 @@ enum ClipboardLifetimeTests {
             precondition(failure.code == code, "Expected \(code), got \(failure.code).")
         }
     }
+    static func hostErrorDiagnostics() {
+        for code in ["source_changed", "permission_denied", "unknown_type"] {
+            precondition(BeamItClipboardSync.hostErrorCode(code) == code)
+        }
+        for code in [nil, "", "future_error", "source_changed\nprivate-fixture-path",
+                     "wss://fixture.invalid/bulk/id?token=fixture", String(repeating: "x", count: 16_384)] {
+            precondition(BeamItClipboardSync.hostErrorCode(code) == "unknown")
+        }
+    }
     static func startupAndReplacement(_ base: URL) async throws {
         let fs = FileManager.default, root = base.appendingPathComponent("startup")
         let storage = Storage(root: root)
@@ -1771,6 +1780,7 @@ enum ClipboardLifetimeTests {
             try await child(CommandLine.arguments)
             return
         }
+        hostErrorDiagnostics()
         let fs = FileManager.default
         guard let resolved = realpath(fs.temporaryDirectory.path, nil) else {
             throw BeamItClipboardFailure("fixture_root_failed")

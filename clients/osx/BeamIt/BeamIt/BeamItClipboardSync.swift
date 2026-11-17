@@ -209,9 +209,23 @@ final class BeamItClipboardSync: NSObject {
     }
     private static func diagnosticCode(_ error: Error) -> String {
         if let failure = error as? BeamItClipboardFailure { return failure.code }
-        if let failure = error as? BeamItClipboardHostFailure { return "host_\(failure.code)" }
+        if let failure = error as? BeamItClipboardHostFailure { return "host_\(hostErrorCode(failure.code))" }
         let underlying = error as NSError
         return "\(underlying.domain)_\(underlying.code)"
+    }
+    static func hostErrorCode(_ code: String?) -> String {
+        guard let code else { return "unknown" }
+        switch code {
+        case "unknown_type", "invalid_request", "not_authenticated", "not_ready", "not_found", "limit_reached",
+             "clipboard_unavailable", "source_changed", "source_unavailable", "stale_clipboard", "stale_snapshot",
+             "storage_failed", "disk_full", "permission_denied", "quota_exceeded", "insufficient_space",
+             "invalid_transfer", "invalid_frame", "invalid_png", "digest_mismatch", "snapshot_mismatch",
+             "invalid_progress", "early_complete", "receiver_failed", "unsupported_entry", "unsupported_selection",
+             "excluded", "cancelled", "timeout", "interrupted", "session_ended":
+            return code
+        default:
+            return "unknown"
+        }
     }
     private func poll() {
         if let op = current, op.revision == revision {
@@ -272,7 +286,7 @@ final class BeamItClipboardSync: NSObject {
             catch { op.failure = "invalid_completion"; cancel() }
         case "clipboard_bulk_failed", "clipboard_bulk_cancelled":
             op.remoteEnded = true
-            op.failure = message["code"] as? String ?? "remote_failure"
+            op.failure = Self.hostErrorCode(message["code"] as? String)
             cancel()
         case "clipboard_bulk_progress":
             do {

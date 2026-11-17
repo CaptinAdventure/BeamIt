@@ -326,8 +326,8 @@ over committed quota with an identity-mismatched committed name and the
 original stage relocated inside the inventory, so the production lookup/open
 measurement checkpoints are reached. The fixtures assert those checkpoints,
 the original stage identity, both replacement sentinels, and exact versus
-one-byte-over arithmetic. These tests are authored and source-checked, not run
-on this Windows host. Root-lock tests use file rendezvous: the MainActor test
+one-byte-over arithmetic. These fixtures passed in the native run described
+above. Root-lock tests use file rendezvous: the MainActor test
 waits asynchronously for holder and contender markers, and checkpoint
 callbacks poll release files on the storage execution context. A bounded
 observation window checks that no acquisition marker appears while the holder
@@ -335,7 +335,7 @@ retains the lock.
 These fixtures test process-death windows, not machine power-loss guarantees.
 An additional private fixture substitutes the quota-lock pathname immediately
 after lock acquisition and expects transfer admission to fail before creating
-its reservation. This is authored coverage, not a native execution result;
+its reservation. This fixture passed in the native run described above;
 it does not cover replacement after the initial lock validation.
 Each child/barrier has a six-second fixture deadline; failed checks must be
 reported as failures, not native passes. The tests do not use the real board,
