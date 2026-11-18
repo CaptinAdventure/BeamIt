@@ -87,7 +87,8 @@ bool valid_relative_path(std::string_view path) {
     return true;
 }
 
-std::optional<std::wstring> collision_key(std::string_view path) {
+std::optional<std::wstring> normalize_path(std::string_view path) {
+    if (path.empty() || path.size() > 4096) return std::nullopt;
     const int input_size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(),
                                                 static_cast<int>(path.size()), nullptr, 0);
     if (input_size <= 0) return std::nullopt;
@@ -100,9 +101,15 @@ std::optional<std::wstring> collision_key(std::string_view path) {
                         static_cast<int>(normalized.size()));
     if (normalized_size <= 0) return std::nullopt;
     normalized.resize(static_cast<std::size_t>(normalized_size));
-    std::wstring folded(normalized.size() * 3 + 1, L'\0');
-    const int folded_size = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, normalized.data(),
-                                          normalized_size, folded.data(), static_cast<int>(folded.size()),
+    return normalized;
+}
+
+std::optional<std::wstring> collision_key(std::string_view path) {
+    const auto normalized = normalize_path(path);
+    if (!normalized) return std::nullopt;
+    std::wstring folded(normalized->size() * 3 + 1, L'\0');
+    const int folded_size = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, normalized->data(),
+                                          static_cast<int>(normalized->size()), folded.data(), static_cast<int>(folded.size()),
                                           nullptr, nullptr, 0);
     if (folded_size <= 0) return std::nullopt;
     folded.resize(static_cast<std::size_t>(folded_size));
@@ -110,6 +117,19 @@ std::optional<std::wstring> collision_key(std::string_view path) {
 }
 
 } // namespace
+
+std::optional<std::string> normalized_path_key(std::string_view path) {
+    const auto normalized = normalize_path(path);
+    if (!normalized) return std::nullopt;
+    const auto size = static_cast<int>(normalized->size());
+    const int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, normalized->data(), size,
+        nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return std::nullopt;
+    std::string result(static_cast<std::size_t>(bytes), '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, normalized->data(), size,
+            result.data(), bytes, nullptr, nullptr) != bytes) return std::nullopt;
+    return result;
+}
 
 std::array<std::byte, frame_header_size> encode_header(const FrameHeader& header) {
     std::array<std::byte, frame_header_size> result{};

@@ -306,10 +306,27 @@ struct ClipboardMonitor::Impl {
     UINT html_format{};
     UINT png_format{};
     UINT exclude_format{};
+    UINT history_format{};
+    UINT cloud_format{};
     std::jthread thread;
 
     [[nodiscard]] bool excluded() const {
         return exclude_format != 0 && IsClipboardFormatAvailable(exclude_format);
+    }
+
+    [[nodiscard]] bool marker_is_zero(UINT format) const {
+        if (!format || !IsClipboardFormatAvailable(format)) return false;
+        const HANDLE handle = GetClipboardData(format);
+        if (!handle || GlobalSize(handle) < sizeof(DWORD)) return false;
+        const auto* data = static_cast<const DWORD*>(GlobalLock(handle));
+        if (!data) return false;
+        const DWORD value = *data;
+        GlobalUnlock(handle);
+        return value == 0;
+    }
+
+    [[nodiscard]] bool sensitive() const {
+        return marker_is_zero(history_format) || marker_is_zero(cloud_format);
     }
 
     [[nodiscard]] unsigned available_formats() const {
@@ -378,6 +395,7 @@ struct ClipboardMonitor::Impl {
                 if (wanted & format) content.omitted.push_back({format, "excluded"});
             }
         } else {
+            content.sensitive = sensitive();
             bool large = false;
             if ((wanted & clipboard_text) && IsClipboardFormatAvailable(CF_UNICODETEXT)) {
                 // Each UTF-16 unit becomes at least one UTF-8 byte, so oversize text is rejected before conversion.
@@ -678,6 +696,8 @@ struct ClipboardMonitor::Impl {
         html_format = RegisterClipboardFormatW(L"HTML Format");
         png_format = RegisterClipboardFormatW(L"PNG");
         exclude_format = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
+        history_format = RegisterClipboardFormatW(L"CanIncludeInClipboardHistory");
+        cloud_format = RegisterClipboardFormatW(L"CanUploadToCloudClipboard");
         window = CreateWindowExW(0, class_name, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, instance, this);
         MSG message{};
         PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE); // create the queue before announcing the thread id

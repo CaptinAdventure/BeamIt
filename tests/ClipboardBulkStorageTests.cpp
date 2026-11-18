@@ -110,6 +110,109 @@ TEST_CASE("Bulk receiver stages verifies and atomically promotes a nested select
     CHECK(std::filesystem::exists(committed / L"folder" / L"hello.txt"));
 }
 
+TEST_CASE("Host snapshot manifest order is independent of selected-root order",
+          "[clipboard-bulk][host-storage]") {
+    TemporaryRoot root;
+    const auto alpha = root.path / L"a-root";
+    const auto zeta = root.path / L"z-root";
+    REQUIRE(std::filesystem::create_directories(alpha));
+    REQUIRE(std::filesystem::create_directories(zeta));
+
+    const auto first = beamit::host::ClipboardBulkSnapshot::inspect(
+        {.files = {zeta, alpha}}, [] { return true; });
+    const auto second = beamit::host::ClipboardBulkSnapshot::inspect(
+        {.files = {alpha, zeta}}, [] { return true; });
+    const auto paths = [](const auto& snapshot) {
+        std::vector<std::string> result;
+        for (const auto& node : snapshot->manifest().nodes) result.push_back(node.path);
+        return result;
+    };
+    const std::vector<std::string> expected{"a-root", "z-root"};
+    CHECK(paths(first) == expected);
+    CHECK(paths(second) == expected);
+    CHECK(boost::json::serialize(first->preliminary().at("roots")) ==
+          boost::json::serialize(second->preliminary().at("roots")));
+}
+
+TEST_CASE("Host snapshot globally sorts a nested child before its later sibling",
+          "[clipboard-bulk][host-storage]") {
+    TemporaryRoot root;
+    const auto selection = root.path / L"selection";
+    REQUIRE(std::filesystem::create_directories(selection / L"a"));
+    REQUIRE(std::filesystem::create_directories(selection / L"a" / L"child"));
+    std::ofstream(selection / L"b.txt", std::ios::binary) << "sibling";
+
+    const auto snapshot = beamit::host::ClipboardBulkSnapshot::inspect(
+        {.files = {selection}}, [] { return true; });
+    REQUIRE(snapshot);
+    std::vector<std::string> paths;
+    for (const auto& node : snapshot->manifest().nodes) paths.push_back(node.path);
+    CHECK(paths == std::vector<std::string>{
+        "selection", "selection/a", "selection/a/child", "selection/b.txt"});
+}
+
+TEST_CASE("Host snapshot sorts NFC keys without changing Unicode names or source mappings",
+          "[clipboard-bulk][host-storage]") {
+    TemporaryRoot source, staging;
+    REQUIRE(std::filesystem::create_directories(source.path));
+    const auto decomposed = source.path / L"e\u0301";
+    const auto latin = source.path / L"f";
+    const auto upper = source.path / L"Z";
+    const auto lower = source.path / L"a";
+    std::ofstream(decomposed, std::ios::binary) << "decomposed source";
+    std::ofstream(latin, std::ios::binary) << "f payload";
+    std::ofstream(upper, std::ios::binary) << "uppercase";
+    std::ofstream(lower, std::ios::binary) << "lowercase payload";
+    std::vector<std::filesystem::path> selected{decomposed, latin, lower, upper};
+    SECTION("decomposed name selected first") {}
+    SECTION("reverse root order has the same normalized result") { std::ranges::reverse(selected); }
+    const auto snapshot = beamit::host::ClipboardBulkSnapshot::inspect(
+        {.sequence = 42, .files = selected}, [] { return true; });
+    REQUIRE(snapshot);
+    const std::vector<std::string> expected_names{"Z", "a", "f", "e\xCC\x81"};
+    const std::vector<std::filesystem::path> expected_sources{upper, lower, latin, decomposed};
+    const auto preliminary = snapshot->preliminary();
+    const auto& nodes = preliminary.at("nodes").as_array();
+    const auto& roots = preliminary.at("roots").as_array();
+    REQUIRE(nodes.size() == expected_names.size());
+    REQUIRE(roots.size() == expected_names.size());
+    for (std::size_t index = 0; index < expected_names.size(); ++index) {
+        CHECK(snapshot->manifest().nodes[index].path == expected_names[index]);
+        CHECK(std::string(nodes[index].as_object().at("path").as_string()) == expected_names[index]);
+        // Compare each permuted identity with its independently inspected root.
+        const auto single = beamit::host::ClipboardBulkSnapshot::inspect(
+            {.files = {expected_sources[index]}}, [] { return true; });
+        CHECK(roots[index] == single->preliminary().at("roots").as_array().front());
+    }
+    CHECK(snapshot->unchanged([] { return true; }));
+    const auto spool_id = beamit::net::base64url_encode(beamit::net::random_bytes(16));
+    beamit::host::ClipboardBulkSpool spool(staging.path, spool_id, snapshot,
+        [] { return true; }, [](auto) {});
+    const auto receiver_id = beamit::net::base64url_encode(beamit::net::random_bytes(16));
+    const auto raw_id = decode_id(receiver_id);
+    beamit::host::ClipboardBulkReceiver receiver(staging.path, receiver_id, spool.manifest());
+    for (std::uint32_t index = 0; index < expected_names.size(); ++index) {
+        const auto& node = spool.manifest().nodes[index];
+        CHECK(node.path == expected_names[index]);
+        const auto bytes = spool.read(index, 0);
+        const auto original = read_fixture(expected_sources[index]);
+        CHECK(std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()) == original);
+        CHECK(node.size == original.size());
+        CHECK(node.sha256 == beamit::net::sha256(bytes));
+        REQUIRE(receiver.accept(data_frame(raw_id, index, 0, bytes)));
+    }
+    REQUIRE(receiver.accept(bulk::encode_header({.kind = bulk::FrameKind::End,
+        .transfer_id = raw_id, .node_index = UINT32_MAX, .offset = bulk::payload_bytes(spool.manifest())})));
+    const auto materialized = receiver.promote();
+    REQUIRE(materialized);
+    REQUIRE(materialized->size() == expected_names.size());
+    for (std::size_t index = 0; index < materialized->size(); ++index) {
+        CHECK(materialized->at(index).filename() == expected_sources[index].filename());
+        CHECK(read_fixture(materialized->at(index)) == read_fixture(expected_sources[index]));
+    }
+    CHECK_FALSE(std::filesystem::exists(materialized->front().parent_path() / L"\u00e9"));
+}
+
 TEST_CASE("Bulk receiver rejects a mismatched digest and removes uncommitted staging",
           "[clipboard-bulk][host-storage]") {
     TemporaryRoot root;

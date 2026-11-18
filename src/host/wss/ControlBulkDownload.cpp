@@ -289,7 +289,12 @@ awaitable<void> ControlSession::send_bulk(std::shared_ptr<ControlSession> self, 
         entry->progress = self->server_.bulk_clock();
         if (entry->receiver_complete) self->complete_download();
     } catch (const boost::system::system_error&) {
-        if (!entry->terminal) self->finish_bulk("interrupted");
+        // If END was in flight, the receiver may have consumed it and closed
+        // WSS before this write completion is dispatched. Let the control
+        // acknowledgement decide success, or let the bounded timeout expire.
+        if (!entry->terminal && !entry->end_in_flight && !entry->ended) {
+            self->finish_bulk("interrupted");
+        }
     }
 }
 
@@ -300,7 +305,12 @@ awaitable<void> ControlSession::watch_download_socket(std::shared_ptr<ControlSes
         co_await entry->socket->async_read(buffer, use_awaitable);
         if (!entry->terminal) self->finish_bulk("invalid_frame");
     } catch (const boost::system::system_error&) {
-        if (!entry->terminal) self->finish_bulk("interrupted");
+        // END drains the ordered data stream. A receiver may close WSS before its
+        // independent control acknowledgement arrives; keep the transfer alive
+        // under the existing bounded control-outcome timeout.
+        if (!entry->terminal && !entry->end_in_flight && !entry->ended) {
+            self->finish_bulk("interrupted");
+        }
     }
 }
 

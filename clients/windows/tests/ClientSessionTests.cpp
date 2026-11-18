@@ -631,7 +631,8 @@ struct ClipboardTemp {
 };
 const std::string manager_png =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6VwsAAAAASUVORK5CYII=";
-enum class ManagerCase { Upload, Download, DeclineUpload, DeclineDownload, Five, Six, ExactBytes,
+enum class ManagerCase { Upload, SensitiveUpload, AutoSensitiveText, AutoSensitiveBulk, AutoSensitivePng,
+    AutoSensitiveLegacy, ManualSensitiveText, ManualSensitiveLegacy, Download, DeclineUpload, DeclineDownload, Five, Six, ExactBytes,
     Cancel, Focus, Source, Destination, Reconfirm, LegacyUpload, LegacyDownload, InvalidCaps, NativeFailure,
     Disconnect, Corrupt, EarlyComplete, SourceReconfirm, UploadQuota, DownloadQuota, Excluded,
     WrongAuthority, Manual, Disabled, PngUpload, PngDownload, NoProgress, AbsoluteTimeout, TextUpload, TextDownload,
@@ -663,6 +664,13 @@ TEST_CASE("Windows clipboard manager uses native facades and authenticated pinne
           "[clipboard-manager]") {
     auto scenario = ManagerCase::Upload;
     SECTION("upload sends immutable folder PNG text HTML and waits for publication before paste") {}
+    SECTION("manual sensitive bulk upload forwards markers to host publication") { scenario = ManagerCase::SensitiveUpload; }
+    SECTION("automatic sensitive text sends no payload or legacy write") { scenario = ManagerCase::AutoSensitiveText; }
+    SECTION("automatic sensitive files are suppressed before source inspection or spooling") { scenario = ManagerCase::AutoSensitiveBulk; }
+    SECTION("automatic sensitive PNG sends no payload or bulk begin") { scenario = ManagerCase::AutoSensitivePng; }
+    SECTION("automatic sensitive legacy content sends no clipboard write") { scenario = ManagerCase::AutoSensitiveLegacy; }
+    SECTION("manual sensitive text forwards the sensitive flag") { scenario = ManagerCase::ManualSensitiveText; }
+    SECTION("manual sensitive legacy PNG forwards the sensitive flag") { scenario = ManagerCase::ManualSensitiveLegacy; }
     SECTION("download publishes all verified formats before receiver acknowledgement") { scenario = ManagerCase::Download; }
     SECTION("declined upload sends no payload or begin") { scenario = ManagerCase::DeclineUpload; }
     SECTION("declined download sends no bulk request") { scenario = ManagerCase::DeclineDownload; }
@@ -710,9 +718,16 @@ TEST_CASE("Windows clipboard manager uses native facades and authenticated pinne
         scenario == ManagerCase::LegacyDownload || scenario == ManagerCase::NativeFailure || scenario == ManagerCase::Corrupt ||
         scenario == ManagerCase::DownloadQuota || scenario == ManagerCase::PngDownload || scenario == ManagerCase::TextDownload ||
         scenario == ManagerCase::DownloadRate;
-    const bool legacy = scenario == ManagerCase::LegacyUpload || scenario == ManagerCase::LegacyDownload;
-    const bool png_only = scenario == ManagerCase::PngUpload || scenario == ManagerCase::PngDownload;
-    const bool text_only = scenario == ManagerCase::TextUpload || scenario == ManagerCase::TextDownload;
+    const bool automatic_sensitive = scenario == ManagerCase::AutoSensitiveText || scenario == ManagerCase::AutoSensitiveBulk ||
+        scenario == ManagerCase::AutoSensitivePng || scenario == ManagerCase::AutoSensitiveLegacy;
+    const bool manual_sensitive = scenario == ManagerCase::SensitiveUpload || scenario == ManagerCase::ManualSensitiveText ||
+        scenario == ManagerCase::ManualSensitiveLegacy;
+    const bool legacy = scenario == ManagerCase::LegacyUpload || scenario == ManagerCase::LegacyDownload ||
+        scenario == ManagerCase::AutoSensitiveLegacy || scenario == ManagerCase::ManualSensitiveLegacy;
+    const bool png_only = scenario == ManagerCase::PngUpload || scenario == ManagerCase::PngDownload ||
+        scenario == ManagerCase::AutoSensitivePng;
+    const bool text_only = scenario == ManagerCase::TextUpload || scenario == ManagerCase::TextDownload ||
+        scenario == ManagerCase::AutoSensitiveText || scenario == ManagerCase::ManualSensitiveText;
     const bool paced = scenario == ManagerCase::UploadRate || scenario == ManagerCase::DownloadRate;
     ClipboardTemp staging, source;
     const auto selected = source.path / L"selection";
@@ -727,7 +742,7 @@ TEST_CASE("Windows clipboard manager uses native facades and authenticated pinne
         HANDLE file{INVALID_HANDLE_VALUE};
         ~SourceLock() { if (file != INVALID_HANDLE_VALUE) CloseHandle(file); }
     } source_lock;
-    if (scenario == ManagerCase::SourceBusy) {
+    if (scenario == ManagerCase::SourceBusy || scenario == ManagerCase::AutoSensitiveBulk) {
         source_lock.file = CreateFileW((selected / L"item.txt").c_str(), GENERIC_READ, 0,
             nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         REQUIRE(source_lock.file != INVALID_HANDLE_VALUE);
@@ -837,6 +852,7 @@ TEST_CASE("Windows clipboard manager uses native facades and authenticated pinne
     std::function<void()> pending_publication;
     std::filesystem::path published_path;
     std::atomic_bool requested_formats_valid{true};
+    std::atomic<unsigned> native_reads{};
     ClipboardManager::Native native;
     native.staging_root = staging.path;
     native.sequence = [&] { return sequence.load(); };
@@ -847,11 +863,13 @@ TEST_CASE("Windows clipboard manager uses native facades and authenticated pinne
             scenario == ManagerCase::AbsoluteTimeout && call && !seconds ? 1799u : seconds));
     };
     native.read = [&](unsigned formats, bool binary, auto done) {
+        ++native_reads;
         host::ClipboardContent content{.sequence = sequence.load(), .text = "local text", .html = "<b>local</b>",
             .image = host::ClipboardImage{.png = png, .width = 1, .height = 1}};
         if (binary) content.files.push_back(selected);
         if (png_only) { content.files.clear(); content.text.reset(); content.html.reset(); }
         if (text_only) { content.files.clear(); content.image.reset(); }
+        if (automatic_sensitive || manual_sensitive) content.sensitive = true;
         if (scenario == ManagerCase::Excluded) content.excluded = true;
         if (scenario == ManagerCase::Five || scenario == ManagerCase::Six) {
             content.files.clear();
@@ -929,10 +947,26 @@ TEST_CASE("Windows clipboard manager uses native facades and authenticated pinne
         CHECK(legacy_writes == 0);
     } else {
         const auto started = std::chrono::steady_clock::now();
-        if (scenario == ManagerCase::Manual) manager->upload();
+        if (scenario == ManagerCase::Manual || manual_sensitive) manager->upload();
+        else if (automatic_sensitive) manager->local_changed({.sequence = sequence.load()});
         else if (incoming) manager->download();
         else manager->paste([&](bool result) { paste_called = true; paste_result = result; });
-        if (scenario == ManagerCase::Disabled) {
+        if (automatic_sensitive) {
+            REQUIRE(inbox.pump_until([&] { return completed; }));
+            CHECK(error == "excluded");
+            CHECK(native_reads == 1);
+            CHECK_FALSE(paste_called);
+            CHECK(confirmations == 0);
+            CHECK(publications == 0);
+            CHECK(begins == 0);
+            CHECK(legacy_writes == 0);
+            CHECK(commits == 0);
+            CHECK(host.upgrades == 1); // Only control; no bulk data connection.
+            CHECK(host.bulk_messages().empty());
+            CHECK_FALSE(std::filesystem::exists(staging.path / L"client" / L"outgoing"));
+            const auto reservations = staging.path / L".reservations";
+            CHECK((!std::filesystem::exists(reservations) || std::filesystem::is_empty(reservations)));
+        } else if (scenario == ManagerCase::Disabled) {
             REQUIRE(inbox.pump_until([&] { return paste_called; }));
             CHECK(paste_result);
             CHECK(begins == 0);
@@ -960,13 +994,14 @@ TEST_CASE("Windows clipboard manager uses native facades and authenticated pinne
                 REQUIRE(inbox.pump_until([&] { return bool(pending_publication); }));
                 auto publish = std::move(pending_publication); publish();
             }
-            REQUIRE(inbox.pump_until([&] { return completed && (incoming || paste_called); }));
-            CHECK((incoming ? publications == 1 : paste_result));
+            REQUIRE(inbox.pump_until([&] { return completed && (incoming || manual_sensitive || paste_called); }));
+            CHECK((incoming ? publications == 1 : manual_sensitive ? error.empty() : paste_result));
             CHECK(begins == 0);
             if (!incoming) {
                 host.run([&] {
                     CHECK(begin_message.at("text") == "local text");
                     CHECK(begin_message.at("html") == "<b>local</b>");
+                    if (manual_sensitive) CHECK(begin_message.at("sensitive") == true);
                     if (legacy) CHECK(std::string(begin_message.at("image").as_object().at("data").as_string()) == manager_png);
                     else CHECK_FALSE(begin_message.contains("image"));
                 });
@@ -1024,6 +1059,7 @@ TEST_CASE("Windows clipboard manager uses native facades and authenticated pinne
                     const auto parsed = bulk::parse_manifest(begin_message.at("manifest"), json::serialize(begin_message.at("manifest")).size());
                     REQUIRE(parsed);
                     CHECK(parsed->selected_roots == (scenario == ManagerCase::Five ? 5u : png_only ? 0u : 1u));
+                    if (scenario == ManagerCase::SensitiveUpload) CHECK(begin_message.at("sensitive") == true);
                 });
                 if (scenario == ManagerCase::Cancel) manager->cancel();
                 if (scenario == ManagerCase::Focus) manager->context({.enabled = true, .active = false});
@@ -1050,12 +1086,13 @@ TEST_CASE("Windows clipboard manager uses native facades and authenticated pinne
                     host.push({{"type", "clipboard_bulk_complete"}, {"transfer_id", transfer}, {"sequence", 100}});
                 }
             }
-            REQUIRE(inbox.pump_until([&] { return completed && (scenario == ManagerCase::Manual || paste_called); }));
+            REQUIRE(inbox.pump_until([&] { return completed && (scenario == ManagerCase::Manual || manual_sensitive || paste_called); }));
             const bool success = scenario == ManagerCase::Upload || scenario == ManagerCase::Five ||
                 scenario == ManagerCase::PngUpload || scenario == ManagerCase::StaleFastPaste || scenario == ManagerCase::UploadRate ||
                 scenario == ManagerCase::ClosedAfterEnd || scenario == ManagerCase::CacheInvalidated ||
-                scenario == ManagerCase::StaleHostPaste;
-            CHECK(paste_result == success);
+                scenario == ManagerCase::StaleHostPaste || scenario == ManagerCase::SensitiveUpload;
+            if (manual_sensitive) { CHECK_FALSE(paste_called); CHECK(error.empty()); CHECK(begins == 1); }
+            else CHECK(paste_result == success);
             CHECK(publications == 0);
             CHECK(confirmations == 0);
             if (scenario == ManagerCase::NoProgress || scenario == ManagerCase::AbsoluteTimeout) CHECK(error == "timeout");

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -97,6 +98,9 @@ enum class ValidationError {
                                                                     std::size_t encoded_size);
 [[nodiscard]] boost::json::object manifest_json(const Manifest& manifest);
 [[nodiscard]] std::expected<void, ValidationError> validate_manifest(const Manifest& manifest);
+// NFC UTF-8 comparison key, without case folding or changing manifest names.
+// Returns nullopt for invalid/empty UTF-8, paths over 4096 bytes, or conversion failure.
+[[nodiscard]] std::optional<std::string> normalized_path_key(std::string_view path);
 [[nodiscard]] bool requires_confirmation(std::uint64_t regular_file_bytes, std::uint32_t selected_roots) noexcept;
 [[nodiscard]] bool requires_confirmation(std::uint64_t regular_file_bytes, std::uint32_t selected_roots,
                                          const TransferPolicy& policy) noexcept;

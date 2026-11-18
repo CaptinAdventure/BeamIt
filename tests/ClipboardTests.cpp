@@ -218,6 +218,17 @@ TEST_CASE("Clipboard monitor reads text and reports changes", "[.clipboard-live]
     std::memcpy(GlobalLock(memory), text.c_str(), (text.size() + 1) * sizeof(wchar_t));
     GlobalUnlock(memory);
     REQUIRE(SetClipboardData(CF_UNICODETEXT, memory));
+    for (const auto* name : {L"CanIncludeInClipboardHistory", L"CanUploadToCloudClipboard"}) {
+        const UINT format = RegisterClipboardFormatW(name);
+        REQUIRE(format);
+        const HGLOBAL marker_memory = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+        REQUIRE(marker_memory);
+        auto* marker = static_cast<DWORD*>(GlobalLock(marker_memory));
+        REQUIRE(marker);
+        *marker = 0;
+        GlobalUnlock(marker_memory);
+        REQUIRE(SetClipboardData(format, marker_memory));
+    }
     CloseClipboard();
     DestroyWindow(owner);
 
@@ -230,6 +241,7 @@ TEST_CASE("Clipboard monitor reads text and reports changes", "[.clipboard-live]
     auto result = read.get_future().get();
     REQUIRE(result.content);
     CHECK(result.content->text == "BeamIt clipboard \xC3\xA9");
+    CHECK(result.content->sensitive);
     CHECK_FALSE(result.content->image);
 
     std::promise<host::ClipboardReadResult> limited_read;
@@ -246,6 +258,26 @@ TEST_CASE("Clipboard monitor reads text and reports changes", "[.clipboard-live]
     const auto write_result = written.get_future().get();
     CHECK(write_result.error_code.empty());
     CHECK(write_result.sequence != 0);
+
+    {
+        const HWND privacy_owner = GetClipboardOwner();
+        REQUIRE(privacy_owner);
+        REQUIRE(OpenClipboard(privacy_owner));
+        struct ClipboardClose { ~ClipboardClose() { CloseClipboard(); } } close_clipboard;
+        for (const auto* name : {L"ExcludeClipboardContentFromMonitorProcessing", L"CanIncludeInClipboardHistory",
+                                 L"CanUploadToCloudClipboard"}) {
+            const UINT format = RegisterClipboardFormatW(name);
+            REQUIRE(format);
+            REQUIRE(IsClipboardFormatAvailable(format));
+            const auto handle = GetClipboardData(format);
+            REQUIRE(handle);
+            REQUIRE(GlobalSize(handle) >= sizeof(DWORD));
+            const auto* marker = static_cast<const DWORD*>(GlobalLock(handle));
+            REQUIRE(marker);
+            CHECK(*marker == 0);
+            GlobalUnlock(handle);
+        }
+    }
 
     std::promise<host::ClipboardReadResult> reread;
     monitor.read(host::clipboard_all, 1024, [&](host::ClipboardReadResult result) { reread.set_value(std::move(result)); });

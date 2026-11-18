@@ -65,7 +65,7 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
 
     enum class DownloadScenario { Mixed, Png, Legacy, Stale, ChangedSelection, Mutation, Excluded, Quota,
         Cancel, CancelPreparing, Disconnect, ReceiverFailure, EarlyComplete, Expired, Idle, Absolute, ChangedAfterOffer,
-        ChangedBeforeEnd, ControlDisconnect, DiskFull, PermissionDenied, Responsiveness,
+        ChangedBeforeEnd, ControlDisconnect, DiskFull, PermissionDenied, Responsiveness, CloseBeforeAck, AckBeforeClose,
         PingBeforeReceive, ReceiveAfterUpgrade };
 
     bool opening_probe(DownloadScenario scenario) {
@@ -342,10 +342,51 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
                                         {"phase", "receiving"}, {"completed_bytes", bulk::payload_bytes(*parsed)},
                                         {"total_bytes", bulk::payload_bytes(*parsed)},
                                         {"completed_nodes", parsed->nodes.size()}, {"total_nodes", parsed->nodes.size()}});
+                                    if (scenario == DownloadScenario::CloseBeforeAck) {
+                                        beast::error_code close_error;
+                                        co_await socket->async_close(websocket::close_code::normal,
+                                            asio::redirect_error(use_awaitable, close_error));
+                                    }
                                     co_await send(*control, {{"type", "clipboard_bulk_complete"}, {"transfer_id", transfer},
                                         {"sequence", 99}});
-                                    co_await send(*control, {{"type", "clipboard_bulk_complete"}, {"transfer_id", transfer},
-                                        {"sequence", 99}});
+                                    if (scenario == DownloadScenario::Mixed) {
+                                        co_await send(*control, {{"type", "clipboard_bulk_complete"}, {"transfer_id", transfer},
+                                            {"sequence", 99}});
+                                    }
+                                    if (scenario == DownloadScenario::CloseBeforeAck ||
+                                        scenario == DownloadScenario::AckBeforeClose) {
+                                        co_await send(*control, {{"type", "ping"}, {"id", 41}});
+                                        const auto outcome = co_await read(*control);
+                                        CHECK(outcome.at("type") == "pong");
+                                        if (outcome.at("type") != "pong") co_return;
+                                    }
+                                    if (scenario == DownloadScenario::AckBeforeClose) {
+                                        // Pong 41 is a control-stream barrier: the host has
+                                        // processed the acknowledgement before this close.
+                                        // Completion may already have closed the peer TCP socket.
+                                        beast::error_code close_error;
+                                        co_await socket->async_close(websocket::close_code::normal,
+                                            asio::redirect_error(use_awaitable, close_error));
+                                        beast::get_lowest_layer(*socket).close(close_error);
+                                        CHECK_FALSE(beast::get_lowest_layer(*socket).is_open());
+
+                                        // Downloads do not echo success. An accepted replay
+                                        // proves the host recorded completion, not just removal;
+                                        // cancellation must find no live transfer. Together these
+                                        // assert one idempotent terminal success after the close.
+                                        co_await send(*control, {{"type", "clipboard_bulk_complete"},
+                                            {"transfer_id", transfer}, {"sequence", 99}});
+                                        co_await send(*control, {{"type", "ping"}, {"id", 42}});
+                                        const auto replay_barrier = co_await read(*control);
+                                        REQUIRE(replay_barrier.at("type") == "pong");
+                                        CHECK(replay_barrier.at("id") == 42);
+                                        co_await send(*control, {{"type", "clipboard_bulk_cancel"},
+                                            {"id", 43}, {"transfer_id", transfer}});
+                                        const auto cancelled = co_await read(*control);
+                                        REQUIRE(cancelled.at("type") == "error");
+                                        CHECK(cancelled.at("id") == 43);
+                                        CHECK(cancelled.at("code") == "not_found");
+                                    }
                                 }
                             }
                         }
@@ -365,6 +406,14 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
             }
             CHECK((!std::filesystem::exists(outgoing) || std::filesystem::is_empty(outgoing)));
             CHECK((!std::filesystem::exists(ledgers) || std::filesystem::is_empty(ledgers)));
+            if (scenario == DownloadScenario::AckBeforeClose) {
+                // Drain control after socket closure and worker cleanup: any late
+                // interrupted/duplicate terminal event must fail, not be skipped.
+                co_await send(*control, {{"type", "ping"}, {"id", 44}});
+                const auto cleanup_barrier = co_await read(*control);
+                REQUIRE(cleanup_barrier.at("type") == "pong");
+                CHECK(cleanup_barrier.at("id") == 44);
+            }
         }
         beast::error_code ignored;
         co_await control->async_close(websocket::close_code::normal, asio::redirect_error(use_awaitable, ignored));
@@ -387,6 +436,12 @@ awaitable<json::object> read(WebSocket& socket, bool include_progress = false) {
         SECTION("cancel reaches the background preparation") { scenario = DownloadScenario::CancelPreparing; }
         SECTION("bulk disconnect deletes sender-only content") { scenario = DownloadScenario::Disconnect; }
         SECTION("receiver publication failure is not completion") { scenario = DownloadScenario::ReceiverFailure; }
+        SECTION("data socket close after END before acknowledgement is tolerated") {
+            scenario = DownloadScenario::CloseBeforeAck;
+        }
+        SECTION("acknowledgement before data socket close completes successfully") {
+            scenario = DownloadScenario::AckBeforeClose;
+        }
         SECTION("premature receiver success is rejected") { scenario = DownloadScenario::EarlyComplete; }
         SECTION("outgoing token expires after ten seconds") { scenario = DownloadScenario::Expired; }
         SECTION("missing receiver acknowledgement hits idle timeout") { scenario = DownloadScenario::Idle; }

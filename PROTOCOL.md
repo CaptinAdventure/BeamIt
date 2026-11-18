@@ -911,8 +911,11 @@ For **client to host**, the client enumerates locally, obtains confirmation
 when required, and prepares an immutable hashed spool. It sends
 `clipboard_bulk_begin` with a short request `id`, `source_snapshot_id`,
 final `manifest`, optional small `text`/`html`, and optional `sensitive`
-(boolean, default false). A changed source invalidates the spool and any
-previous confirmation. The reply is `clipboard_bulk_offer` with the same
+(boolean, default false). On Windows, the client sets `sensitive: true` when
+`CanIncludeInClipboardHistory` or `CanUploadToCloudClipboard` is present with
+a zero value; the exclusion marker still prevents reading or uploading the
+clipboard. A changed source invalidates the spool and any previous
+confirmation. The reply is `clipboard_bulk_offer` with the same
 `id`, `direction: "client_to_host"`, `transfer_id`, `source_snapshot_id`,
 `destination_sequence`, the exact final `manifest`, `url`, and
 `expires_in_ms: 10000`.

@@ -283,11 +283,14 @@ struct ClipboardManager::State : std::enable_shared_from_this<State> {
                     if (content.excluded || std::ranges::any_of(content.omitted, [](const auto& item) {
                         return item.reason == "excluded" || item.format == clipboard_files;
                     })) { state.finish(false, "excluded_or_unsupported"); return; }
+                    if (content.sensitive && !op->manual) { state.finish(false, "excluded"); return; }
                     op->metadata.text = content.text; op->metadata.html = content.html;
+                    op->metadata.sensitive = content.sensitive;
                     if (state.mode == Mode::Legacy || (content.files.empty() && !content.image)) {
                         json::object fields;
                         if (content.text) fields["text"] = *content.text;
                         if (content.html) fields["html"] = *content.html;
+                        if (content.sensitive) fields["sensitive"] = true;
                         if (content.image) fields["image"] = {{"mime_type", "image/png"},
                             {"data", net::base64_encode(content.image->png)}};
                         if (fields.empty()) { state.finish(false, "unsupported_clipboard"); return; }
@@ -340,6 +343,7 @@ struct ClipboardManager::State : std::enable_shared_from_this<State> {
             json::object fields{{"source_snapshot_id", op->source_id}, {"manifest", bulk::manifest_json(op->manifest)}};
             if (op->metadata.text) fields["text"] = *op->metadata.text;
             if (op->metadata.html) fields["html"] = *op->metadata.html;
+            if (op->metadata.sensitive) fields["sensitive"] = true;
             self.request("clipboard_bulk_begin", std::move(fields), "clipboard_bulk_offer",
                 [op](State& state, auto offer) {
                     if (state.current != op) return;

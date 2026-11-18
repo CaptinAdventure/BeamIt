@@ -46,6 +46,7 @@ struct ClipboardContent {
     std::vector<std::filesystem::path> files;
     std::vector<ClipboardOmission> omitted;
     bool excluded{};
+    bool sensitive{}; // preserve history/cloud privacy markers when relaying this snapshot
 };
 
 struct ClipboardReadResult {

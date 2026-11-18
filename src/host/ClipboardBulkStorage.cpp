@@ -12,6 +12,7 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -268,6 +269,8 @@ struct Selection {
     bulk::Manifest manifest;
     std::vector<std::filesystem::path> paths;
     std::vector<SourceStamp> stamps;
+    // Maps each manifest node to its source stamp; PNG nodes use no source.
+    std::vector<std::size_t> source_indices;
 };
 
 Selection scan_selection(const ClipboardContent& content, const ClipboardBulkSnapshot::Guard& current) {
@@ -304,6 +307,7 @@ Selection scan_selection(const ClipboardContent& content, const ClipboardBulkSna
         }
         result.manifest.nodes.push_back({.kind = directory ? bulk::Node::Kind::Directory : bulk::Node::Kind::File,
                                          .path = relative, .size = directory ? 0 : stamp.size});
+        result.source_indices.push_back(result.paths.size());
         result.paths.push_back(source);
         result.stamps.push_back(stamp);
         if (directory) {
@@ -337,13 +341,40 @@ Selection scan_selection(const ClipboardContent& content, const ClipboardBulkSna
             result.manifest.nodes.push_back({.kind = bulk::Node::Kind::Png, .path = path,
                 .size = image.png.size(), .width = image.width, .height = image.height});
             const auto validation = bulk::validate_manifest(result.manifest);
-            if (validation) break;
+            if (validation) {
+                result.source_indices.push_back(std::numeric_limits<std::size_t>::max());
+                break;
+            }
             result.manifest.nodes.pop_back();
             if (validation.error() != bulk::ValidationError::DuplicatePath) {
                 throw ClipboardBulkStorageError("unsupported_selection");
             }
         } while (suffix <= bulk::max_nodes);
     }
+    // Canonicalize the complete node list, not each directory's children. Keep
+    // the source mapping separate so path order cannot detach a stamp from its file.
+    std::vector<std::size_t> order(result.manifest.nodes.size());
+    std::vector<std::string> keys;
+    keys.reserve(order.size());
+    for (std::size_t index = 0; index < order.size(); ++index) {
+        order[index] = index;
+        auto key = bulk::normalized_path_key(result.manifest.nodes[index].path);
+        if (!key) throw ClipboardBulkStorageError("unsupported_selection");
+        keys.push_back(std::move(*key));
+    }
+    std::ranges::sort(order, [&](std::size_t left, std::size_t right) {
+        return keys[left] < keys[right];
+    });
+    std::vector<bulk::Node> sorted_nodes;
+    std::vector<std::size_t> sorted_sources;
+    sorted_nodes.reserve(order.size());
+    sorted_sources.reserve(order.size());
+    for (const auto index : order) {
+        sorted_nodes.push_back(std::move(result.manifest.nodes[index]));
+        sorted_sources.push_back(result.source_indices[index]);
+    }
+    result.manifest.nodes = std::move(sorted_nodes);
+    result.source_indices = std::move(sorted_sources);
     if (!bulk::validate_manifest(result.manifest) ||
         boost::json::serialize(bulk::manifest_json(result.manifest)).size() > bulk::max_manifest_bytes) {
         throw ClipboardBulkStorageError("unsupported_selection");
@@ -591,10 +622,12 @@ boost::json::object ClipboardBulkSnapshot::preliminary() const {
     auto object = bulk::manifest_json(manifest());
     for (auto& node : object.at("nodes").as_array()) node.as_object().erase("sha256");
     boost::json::array identities;
-    for (std::size_t index = 0; index < impl_->selection.paths.size(); ++index) {
+    for (std::size_t index = 0; index < manifest().nodes.size(); ++index) {
+        const auto source_index = impl_->selection.source_indices[index];
+        if (source_index == std::numeric_limits<std::size_t>::max()) continue;
         const auto& node = manifest().nodes[index];
         if (node.path.find('/') != std::string::npos) continue;
-        const auto& stamp = impl_->selection.stamps[index];
+        const auto& stamp = impl_->selection.stamps[source_index];
         // Encode identity fields individually; never hash structure padding or expose absolute paths.
         const std::array<std::uint64_t, 3> identity{stamp.volume, stamp.index_high, stamp.index_low};
         identities.push_back({{"path", node.path},
@@ -669,11 +702,16 @@ ClipboardBulkSpool::ClipboardBulkSpool(std::filesystem::path root, const std::st
             }
         } else {
             const auto& selection = snapshot->impl_->selection;
+            const auto source_index = selection.source_indices[index];
+            if (source_index == std::numeric_limits<std::size_t>::max() ||
+                source_index >= selection.paths.size() || source_index >= selection.stamps.size()) {
+                throw ClipboardBulkStorageError("source_changed");
+            }
             DirectoryPins parents;
-            source_parents(parents, selection.paths[index]);
-            FileHandle source(open_source(selection.paths[index]));
+            source_parents(parents, selection.paths[source_index]);
+            FileHandle source(open_source(selection.paths[source_index]));
             const auto before_copy = source_stamp(source.value);
-            if (before_copy != selection.stamps[index]) {
+            if (before_copy != selection.stamps[source_index]) {
                 throw ClipboardBulkStorageError("source_changed");
             }
             while (offset < node.size) {
@@ -690,11 +728,11 @@ ClipboardBulkSpool::ClipboardBulkSpool(std::filesystem::path root, const std::st
                 offset += read;
                 progress(completed + offset);
             }
-            if (source_stamp(source.value) != selection.stamps[index]) {
+            if (source_stamp(source.value) != selection.stamps[source_index]) {
                 throw ClipboardBulkStorageError("source_changed");
             }
-            FileHandle path_now(open_source(selection.paths[index]));
-            if (source_stamp(path_now.value) != selection.stamps[index]) {
+            FileHandle path_now(open_source(selection.paths[source_index]));
+            if (source_stamp(path_now.value) != selection.stamps[source_index]) {
                 throw ClipboardBulkStorageError("source_changed");
             }
         }
