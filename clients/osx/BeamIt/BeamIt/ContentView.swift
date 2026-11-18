@@ -13,6 +13,7 @@ struct ContentView: View {
     @State private var selectedSource: BeamItSource?
     @State private var isConnecting = false
     @State private var connectionError: String?
+    private var stagingLifetime: BeamItClipboardLifetime { .shared }
     private var streams: BeamItStreamManager { BeamItStreamManager.shared }
     @State private var applicationSearch = ""
 
@@ -141,6 +142,12 @@ struct ContentView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityAddTraits(.updatesFrequently)
             }
+            if let diagnostic = stagingLifetime.diagnostic {
+                Label(diagnostic, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityAddTraits(.updatesFrequently)
+            }
 
             Button(action: connect) {
                 HStack(spacing: 8) {
@@ -204,6 +211,11 @@ struct ContentView: View {
                 Label(connectionError, systemImage: "exclamationmark.triangle.fill")
                     .font(.callout)
                     .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let diagnostic = stagingLifetime.diagnostic {
+                Label(diagnostic, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout).foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
 

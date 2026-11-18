@@ -15,8 +15,8 @@
 namespace beamit::host::wss {
 namespace {
 
-constexpr std::array<std::pair<ClipboardFormat, std::string_view>, 3> clipboard_format_names{{
-    {clipboard_text, "text"}, {clipboard_html, "html"}, {clipboard_image, "image"}}};
+constexpr std::array<std::pair<ClipboardFormat, std::string_view>, 4> clipboard_format_names{{
+    {clipboard_text, "text"}, {clipboard_html, "html"}, {clipboard_image, "image"}, {clipboard_files, "files"}}};
 
 std::string_view clipboard_format_name(ClipboardFormat format) {
     for (const auto& [value, name] : clipboard_format_names) {
@@ -25,17 +25,17 @@ std::string_view clipboard_format_name(ClipboardFormat format) {
     return "unknown";
 }
 
-json::array clipboard_format_list(unsigned formats) {
+json::array clipboard_format_list(unsigned formats, bool bulk_enabled) {
     json::array list;
     for (const auto& [value, name] : clipboard_format_names) {
-        if (formats & value) list.emplace_back(name);
+        if ((formats & value) && (value != clipboard_files || bulk_enabled)) list.emplace_back(name);
     }
     return list;
 }
 
-unsigned parse_clipboard_formats(const json::object& message) {
+unsigned parse_clipboard_formats(const json::object& message, bool bulk_enabled) {
     const auto* field = message.if_contains("formats");
-    if (!field) return clipboard_all;
+    if (!field) return clipboard_all | (bulk_enabled ? clipboard_files : 0U);
     if (!field->is_array() || field->as_array().empty()) {
         throw ProtocolError{"invalid_request", "formats must be a non-empty array"};
     }
@@ -44,7 +44,7 @@ unsigned parse_clipboard_formats(const json::object& message) {
         const auto found = std::ranges::find_if(clipboard_format_names, [&](const auto& entry) {
             return item.is_string() && item.as_string() == entry.second;
         });
-        if (found == clipboard_format_names.end()) {
+        if (found == clipboard_format_names.end() || (!bulk_enabled && found->first == clipboard_files)) {
             throw ProtocolError{"invalid_request", "formats may contain only text, html and image"};
         }
         formats |= found->first;
@@ -116,11 +116,14 @@ void ControlSession::get_window_icon(const json::object& message, const RequestI
 // --- Clipboard -----------------------------------------------------------------------------------------------------
 
 void ControlSession::get_clipboard(const json::object& message, const RequestId& id) {
-    const unsigned formats = parse_clipboard_formats(message);
-    if (!server_.clipboard) throw ProtocolError{"clipboard_unavailable", "clipboard access is unavailable"};
+    const unsigned formats = parse_clipboard_formats(message, bulk_negotiated_);
+    if (bulk_negotiated_) return get_bulk_clipboard(formats, id);
+    if (!server_.clipboard && !server_.clipboard_read) {
+        throw ProtocolError{"clipboard_unavailable", "clipboard access is unavailable"};
+    }
     // Reading and PNG conversion happen on the clipboard thread; the reply is serialized there too so that large
     // payloads do not stall the network thread.
-    server_.clipboard->read(formats, protocol::max_clipboard_bytes,
+    read_clipboard(formats, false,
                             [send_reply = deferred_reply(id)](ClipboardReadResult result) {
         if (!result.content) {
             send_reply({{"type", "error"}, {"code", "clipboard_unavailable"}, {"message", result.error}});
@@ -179,8 +182,13 @@ void ControlSession::set_clipboard(const json::object& message, const RequestId&
 }
 
 void ControlSession::on_clipboard_changed(const ClipboardChange& change) {
+    if (snapshot_abort_) snapshot_abort_();
+    bulk_snapshot_.reset();
+    bulk_snapshot_id_.clear();
+    if (bulk_ && bulk_->download &&
+        (change.excluded || change.sequence != bulk_->source->sequence())) finish_bulk("source_changed");
     send({{"type", "clipboard_changed"}, {"sequence", change.sequence},
-          {"formats", clipboard_format_list(change.formats)}, {"excluded", change.excluded}});
+          {"formats", clipboard_format_list(change.formats, bulk_negotiated_)}, {"excluded", change.excluded}});
 }
 
 // --- Taskbar attention ---------------------------------------------------------------------------------------------

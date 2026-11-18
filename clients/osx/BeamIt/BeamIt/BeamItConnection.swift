@@ -4,16 +4,14 @@ import CryptoKit
 import Foundation
 import Security
 
-final class BeamItConnection {
+final class BeamItConnection: BeamItConnectionTransport, BeamItClipboardPeer {
     private struct PendingRequest {
         let expectedType: String
         let continuation: CheckedContinuation<[String: Any], Error>
         var sentAt: TimeInterval?
     }
 
-    private let session: URLSession
     private let task: URLSessionWebSocketTask
-    private let controlURL: URL
     private var nextRequestID = 1
     private var pendingRequests: [Int: PendingRequest] = [:]
     private var receiveTask: Task<Void, Never>?
@@ -30,10 +28,10 @@ final class BeamItConnection {
     var onStreamStopped: ((String, String?) -> Void)?
     var onDisconnect: ((Error) -> Void)?
 
-    private init(session: URLSession, task: URLSessionWebSocketTask, controlURL: URL) {
-        self.session = session
+    private init(session: URLSession, certificateDelegate: CertificatePinDelegate,
+                 task: URLSessionWebSocketTask, controlURL: URL) {
         self.task = task
-        self.controlURL = controlURL
+        super.init(session: session, certificateDelegate: certificateDelegate, controlURL: controlURL)
     }
 
     static func connect(
@@ -58,7 +56,8 @@ final class BeamItConnection {
 
         let task = session.webSocketTask(with: request)
         task.maximumMessageSize = BeamItControlMessage.handshakeLimit
-        let connection = BeamItConnection(session: session, task: task, controlURL: controlURL)
+        let connection = BeamItConnection(session: session, certificateDelegate: delegate,
+                                          task: task, controlURL: controlURL)
         task.resume()
 
         do {
@@ -67,6 +66,7 @@ final class BeamItConnection {
             BeamItClipboardMenu.shared.sync = connection.clipboardSync
             task.maximumMessageSize = BeamItControlMessage.receiveLimit
             connection.startControlReceiver()
+            try await connection.clipboardSync.negotiate()
             connection.startClockSampling()
             return connection
         } catch {
@@ -277,7 +277,19 @@ final class BeamItConnection {
     }
 
     func getClipboard() async throws -> [String: Any] {
-        try await request(type: "get_clipboard", fields: ["formats": ["text", "html", "image"]], expectedType: "clipboard")
+        try await request(type: "get_clipboard",
+                          fields: ["formats": clipboardSync.bulkEnabled ? ["text", "html", "image", "files"] :
+                            ["text", "html", "image"]], expectedType: "clipboard")
+    }
+
+    func clipboardRequest(_ type: String, _ fields: [String: Any], reply: String) async throws -> [String: Any] {
+        try await request(type: type, fields: fields, expectedType: reply)
+    }
+
+    func clipboardEvent(_ type: String, _ fields: [String: Any]) async throws {
+        var object = fields
+        object["type"] = type
+        try await sendJSON(object)
     }
 
     func getWindowIcon(_ hwnd: String) async throws -> Data {
@@ -297,7 +309,10 @@ final class BeamItConnection {
     }
 
     func setClipboard(_ fields: [String: Any]) async throws {
-        _ = try await request(type: "set_clipboard", fields: fields, expectedType: "clipboard_set")
+        let reply = try await request(type: "set_clipboard", fields: fields, expectedType: "clipboard_set")
+        guard try BeamItClipboardBulk.unsigned(reply["sequence"]) <= UInt32.max else {
+            throw BeamItClipboardFailure("invalid_completion")
+        }
     }
 
     func setStreamRate(_ streamID: String, bitrate: Int, frameRate: Int, peak: Int? = nil) async throws {
@@ -481,6 +496,10 @@ final class BeamItConnection {
                         clipboardSync.hostClipboardChanged(message)
                         continue
                     }
+                    if message["id"] == nil, let type = message["type"] as? String, type.hasPrefix("clipboard_bulk_") {
+                        clipboardSync.bulkEvent(message)
+                        continue
+                    }
                     if message["type"] as? String == "audio_stopped", message["id"] == nil {
                         if let reason = message["reason"] as? String, reason != "requested" {
                             audio?.onError?(message["message"] as? String ?? "Host audio stopped: \(reason).")
@@ -539,9 +558,8 @@ final class BeamItConnection {
                         if message["type"] as? String == "error" {
                             // Input has no replies; its failures (e.g. focus_failed) arrive unsolicited.
                             NSLog(
-                                "BeamIt host error %@: %@",
-                                message["code"] as? String ?? "unknown",
-                                message["message"] as? String ?? ""
+                                "BeamIt host error %@",
+                                BeamItClipboardSync.hostErrorCode(message["code"] as? String)
                             )
                             if let streamID = message["stream_id"] as? String {
                                 streams[streamID]?.onInputError?(
@@ -552,9 +570,17 @@ final class BeamItConnection {
                         continue
                     }
                     if message["type"] as? String == "error" {
-                        pending.continuation.resume(throwing: ConnectionError.hostRejected(
-                            message["message"] as? String ?? message["code"] as? String ?? "The host rejected the request."
-                        ))
+                        if pending.expectedType.hasPrefix("clipboard") {
+                            pending.continuation.resume(throwing: BeamItClipboardHostFailure(
+                                code: message["code"] as? String ?? "unknown",
+                                errorDescription: message["message"] as? String,
+                                fatal: !BeamItClipboardBulk.isNonfatal(message["fatal"])))
+                        } else {
+                            pending.continuation.resume(throwing: ConnectionError.hostRejected(
+                                message["message"] as? String ?? message["code"] as? String ?? "The host rejected the request.",
+                                code: message["code"] as? String
+                            ))
+                        }
                     } else if message["type"] as? String != pending.expectedType {
                         if pending.expectedType == "audio_track_started",
                            message["type"] as? String == "audio_track_stopped" {
@@ -597,7 +623,13 @@ final class BeamItConnection {
                     _ = try await self.request(type: "ping", fields: [:], expectedType: "pong")
                 } catch {
                     guard !Task.isCancelled, !self.isDisconnected else { return }
-                    NSLog("BeamIt clock sampling failed: %@", error.localizedDescription)
+                    let code: String
+                    if case ConnectionError.hostRejected(_, let hostCode) = error {
+                        code = BeamItClipboardSync.hostErrorCode(hostCode)
+                    } else {
+                        code = "unknown"
+                    }
+                    NSLog("BeamIt clock sampling failed: %@", code)
                 }
                 count += 1
                 do {
@@ -724,7 +756,7 @@ final class BeamItConnection {
         case randomGenerationFailed
         case keyDerivationFailed
         case serverProofMismatch
-        case hostRejected(String)
+        case hostRejected(String, code: String? = nil)
         case unexpectedReply(String)
         case invalidMessage
         case invalidStreamURL
@@ -746,7 +778,7 @@ final class BeamItConnection {
                 return "Password key derivation failed."
             case .serverProofMismatch:
                 return "The host's authentication proof did not match."
-            case .hostRejected(let message):
+            case .hostRejected(let message, _):
                 return message
             case .unexpectedReply(let type):
                 return "Unexpected host response: \(type)."

@@ -71,6 +71,7 @@ set(BEAMIT_HOST_SOURCES
     src/host/wss/ControlAudio.cpp
     src/host/AttentionMonitor.cpp
     src/host/Clipboard.cpp
+    src/host/ClipboardBulkStorage.cpp
     src/host/HostServer.cpp
     src/host/InputInjector.cpp
     src/host/InputProtocol.cpp
@@ -80,6 +81,8 @@ set(BEAMIT_HOST_SOURCES
     src/host/WindowIcon.cpp
     src/host/WindowTracker.cpp
     src/host/wss/ControlDesktop.cpp
+    src/host/wss/ControlBulk.cpp
+    src/host/wss/ControlBulkDownload.cpp
     src/host/wss/ControlInput.cpp
     src/host/wss/ControlSession.cpp
     src/host/wss/ControlStats.cpp
@@ -87,6 +90,7 @@ set(BEAMIT_HOST_SOURCES
     src/host/wss/HttpFrontend.cpp
     src/host/wss/StreamSocket.cpp
     src/media/BitstreamInfo.cpp
+    src/net/ClipboardBulk.cpp
     src/net/Crypto.cpp
 )
 
@@ -104,7 +108,8 @@ add_executable(BeamIt
 )
 target_include_directories(BeamIt PRIVATE include src drivers/BeamItMicrophone/shared "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(BeamIt PRIVATE opus spdlog CLI11::CLI11 Boost::beast Boost::json beamit_wintls
-    d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs shell32 avrt winmm advapi32 mmdevapi)
+    d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs shell32 avrt winmm advapi32 mmdevapi
+    normaliz bcrypt)
 target_compile_definitions(BeamIt PUBLIC NOMINMAX _WIN32_WINNT=0x0A00)
 
 # Separate privilege boundary: no network, credentials, capture, clipboard or encoder dependencies.
@@ -149,10 +154,13 @@ if(BUILD_TESTING)
         tests/InputIpcTests.cpp
         tests/AttentionTests.cpp
         tests/ClipboardTests.cpp
+        tests/ClipboardBulkStorageTests.cpp
+        tests/ClipboardBulkTests.cpp
         tests/WindowTrackerTests.cpp
         tests/WindowIconTests.cpp
         tests/WssFieldsTests.cpp
         tests/HostControlTests.cpp
+        tests/ClipboardBulkWssTests.cpp
         src/ApplicationWindows.cpp
         ${BEAMIT_HOST_SOURCES}
         src/capture/DxgiCapturer.cpp
@@ -166,7 +174,8 @@ if(BUILD_TESTING)
     add_dependencies(BeamItTests BeamItAudioTestSource)
     target_compile_definitions(BeamItTests PRIVATE BEAMIT_USE_CATCH2=1 NOMINMAX _WIN32_WINNT=0x0A00)
     target_link_libraries(BeamItTests PRIVATE opus Catch2::Catch2WithMain spdlog Boost::beast Boost::json beamit_wintls
-        d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs shell32 avrt winmm advapi32 mmdevapi)
+        d3d11 d3d12 dxgi windowsapp ws2_32 user32 dwmapi shcore ole32 windowscodecs shell32 avrt winmm advapi32 mmdevapi
+        normaliz bcrypt)
     if(TARGET NVIDIA::NVENCHeaders)
         target_sources(BeamItTests PRIVATE tests/NvencVideoEncoderTests.cpp src/media/NvencVideoEncoder.cpp)
         target_link_libraries(BeamItTests PRIVATE NVIDIA::NVENCHeaders)

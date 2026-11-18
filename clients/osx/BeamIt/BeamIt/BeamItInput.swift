@@ -287,6 +287,7 @@ final class BeamItInputHandler {
     private func pasteClipboard(_ event: NSEvent) {
         guard pasteTask == nil, !event.isARepeat, NSApp.isActive,
               let window = event.window, window.isKeyWindow, window.attachedSheet == nil else { return }
+        let clipboardRevision = NSPasteboard.general.changeCount
         pasteTask = Task { [weak self, weak window] in
             guard let self else { return }
             defer { self.pasteTask = nil }
@@ -294,8 +295,9 @@ final class BeamItInputHandler {
                 try await stream.uploadClipboardForPaste()
                 try Task.checkCancellation()
                 guard NSApp.isActive, let window, window.isKeyWindow,
-                      window.attachedSheet == nil else { return }
-                // Command may have been released while waiting for clipboard_set.
+                      window.attachedSheet == nil, canSendInput,
+                      NSPasteboard.general.changeCount == clipboardRevision else { return }
+                // Command may have been released while waiting for receiver publication.
                 let needsControl = !heldKeys.contains("ControlLeft") && !heldKeys.contains("ControlRight")
                 if needsControl { stream.sendInput("key", ["code": "ControlLeft", "down": true]) }
                 stream.sendInput("key", ["code": "KeyV", "down": true])

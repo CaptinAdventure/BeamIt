@@ -8,7 +8,9 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <vector>
 
 namespace beamit::client {
 
@@ -39,6 +41,14 @@ struct AudioCallbacks {
     // Audio packets run on the network thread; implementations must enqueue quickly.
     std::function<void(const net::protocol::AudioPacket&, const media::AudioConfiguration&)> packet;
     std::function<void(const SessionError&)> failed;
+};
+
+// Bulk callbacks run on the network thread. A binary message is valid only during the callback.
+struct BulkCallbacks {
+    std::function<void(std::span<const std::byte>)> message;
+    std::function<void(const SessionError&)> failed;
+    // When supplied, the next network read waits for this serial consumer.
+    std::function<void(std::vector<std::byte>, std::function<void(std::expected<void, SessionError>)>)> consume;
 };
 
 // One authenticated signaling session plus its stream sockets (PROTOCOL.md §2-§7).
@@ -79,6 +89,12 @@ public:
     void remove_audio_track(std::uint32_t track_id);
     void send_audio_packet(std::vector<std::byte> packet);
     void close_audio();
+    // Opens one session-bound bulk socket at a same-authority path such as /bulk/{id}?token=...
+    void open_bulk(std::string target, std::chrono::milliseconds token_lifetime, BulkCallbacks callbacks,
+                   Completion<void> opened);
+    // Queues one binary message. The session bounds queued payload to the bulk protocol limit.
+    void write_bulk(std::vector<std::byte> message, Completion<void> written);
+    void close_bulk();
 
     [[nodiscard]] std::optional<ClockEstimate::Sample> clock() const;
     [[nodiscard]] std::optional<Endpoint> endpoint() const;

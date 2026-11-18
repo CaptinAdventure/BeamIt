@@ -3,6 +3,7 @@
 #include "AppUtil.hpp"
 #include "AudioClient.hpp"
 #include "ClientSession.hpp"
+#include "ClipboardManager.hpp"
 #include "HostWindows.hpp"
 #include "StreamWindow.hpp"
 
@@ -45,6 +46,9 @@ private:
     void start_audio();
     void stop_audio(bool notify_host);
     void audio_failed(std::string message);
+    void clipboard_context();
+    void clipboard_status(ClipboardManager::Status status);
+    winrt::fire_and_forget confirm_clipboard(std::uint32_t roots, std::uint64_t bytes, std::function<void(bool)> done);
 
     void start_stream(json::object source, bool activate, bool from_picker, std::optional<std::int64_t> follow);
     void reconcile();
@@ -62,6 +66,7 @@ private:
     std::unique_ptr<Session> session_;
     std::shared_ptr<AudioClient> audio_client_;
     std::string audio_id_;
+    std::unique_ptr<ClipboardManager> clipboard_;
     bool connecting_{};
     HostWindowList host_windows_;
     std::map<std::string, std::shared_ptr<StreamWindow>> streams_;
@@ -96,6 +101,9 @@ private:
     winrt::Microsoft::UI::Xaml::Controls::Button audio_button_{nullptr};
     winrt::Microsoft::UI::Xaml::Controls::Button stop_audio_button_{nullptr};
     winrt::Microsoft::UI::Xaml::Controls::TextBlock audio_status_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::TextBlock clipboard_text_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::Button clipboard_cancel_{nullptr};
+    winrt::Microsoft::UI::Xaml::Controls::ContentDialog clipboard_dialog_{nullptr};
 };
 
 } // namespace beamit::client

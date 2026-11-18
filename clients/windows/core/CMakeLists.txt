@@ -26,6 +26,8 @@ if(WIN32)
     include("${beamit_root}/cmake/CPM.cmake")
     include("${beamit_root}/cmake/BeamItDependencies.cmake")
     beamit_add_network_dependencies()
+    CPMAddPackage(NAME spdlog GIT_TAG v1.15.3 GITHUB_REPOSITORY gabime/spdlog
+        OPTIONS "SPDLOG_FMT_EXTERNAL OFF")
 
     CPMAddPackage(
         NAME opus
@@ -44,16 +46,22 @@ if(WIN32)
         AudioClient.cpp
         ClientProtocol.cpp
         ClientSession.cpp
+        ClipboardManager.cpp
         DecoderProbe.cpp
         HostWindows.cpp
         KeyCodes.cpp
         VideoPipeline.cpp
+        "${beamit_root}/src/net/ClipboardBulk.cpp"
         "${beamit_root}/src/net/Crypto.cpp"
         "${beamit_root}/src/media/OpusAudio.cpp"
+        "${beamit_root}/src/host/Clipboard.cpp"
+        "${beamit_root}/src/host/ClipboardBulkStorage.cpp"
     )
     target_compile_definitions(BeamItWindowsCore PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
-    target_link_libraries(BeamItWindowsCore PUBLIC Boost::json beamit_wintls opus ws2_32 d3d11 dxgi mf mfplat mfuuid
-        ole32 mmdevapi avrt winmm windowscodecs)
+    target_link_libraries(BeamItWindowsCore PUBLIC
+        Boost::json beamit_wintls opus ws2_32 d3d11 dxgi mf mfplat mfuuid
+        ole32 mmdevapi avrt winmm windowscodecs normaliz
+        spdlog user32 shell32 advapi32 gdi32)
     add_executable(BeamItDecoderProbe DecoderProbeMain.cpp)
     target_link_libraries(BeamItDecoderProbe PRIVATE BeamItWindowsCore)
 
@@ -66,7 +74,7 @@ if(WIN32)
       <PreprocessorDefinitions>$<JOIN:$<TARGET_PROPERTY:BeamItWindowsCore,INTERFACE_COMPILE_DEFINITIONS>,;>;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$<TARGET_LINKER_FILE:BeamItWindowsCore>;$<TARGET_LINKER_FILE:Boost::json>;$<TARGET_LINKER_FILE:Boost::container>;$<TARGET_LINKER_FILE:opus>;ws2_32.lib;crypt32.lib;secur32.lib;bcrypt.lib;mmdevapi.lib;avrt.lib;winmm.lib;windowscodecs.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$<TARGET_LINKER_FILE:BeamItWindowsCore>;$<TARGET_LINKER_FILE:Boost::json>;$<TARGET_LINKER_FILE:Boost::container>;$<TARGET_LINKER_FILE:opus>;$<TARGET_LINKER_FILE:spdlog>;ws2_32.lib;crypt32.lib;secur32.lib;bcrypt.lib;mmdevapi.lib;avrt.lib;winmm.lib;windowscodecs.lib;normaliz.lib;advapi32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 </Project>
@@ -81,7 +89,10 @@ if(BUILD_TESTING)
     if(WIN32)
         beamit_add_catch2()
         add_executable(BeamItClientTests
+            ../app/AppUtil.cpp
+            ../tests/ClipboardSettingsTests.cpp
             ../tests/ClientProtocolTests.cpp
+            "${beamit_root}/tests/ClipboardBulkTests.cpp"
             ../tests/ClientSessionTests.cpp
             ../tests/HostWindowsTests.cpp
             ../tests/HostEndToEndTests.cpp
