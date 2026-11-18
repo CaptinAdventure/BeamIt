@@ -146,7 +146,7 @@ void BeamItMicrophoneOutput::submit(const AudioPcmPacket& packet) {
         queue_.pop_front();
         if (!queue_.empty()) queue_.front().header.flags |= BeamItMicPcmDiscontinuity;
         else converted.header.flags |= BeamItMicPcmDiscontinuity;
-        spdlog::warn("BeamIt Microphone queue full; dropping oldest packet and preserving discontinuity");
+        spdlog::warn("Microphone output queue full; dropping oldest packet and preserving discontinuity");
     }
     queue_.push_back(std::move(converted));
     wake_.notify_one();
@@ -176,7 +176,7 @@ void BeamItMicrophoneOutput::report_error(std::string message) {
         queue_.clear();
         callback = on_error_;
     }
-    spdlog::error("BeamIt Microphone output failed: {}", message);
+    spdlog::error("Microphone output failed: {}", message);
     if (callback) callback(std::move(message));
 }
 

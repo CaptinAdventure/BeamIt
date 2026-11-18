@@ -65,6 +65,7 @@ set(BEAMIT_HOST_SOURCES
     src/host/BeamItMicrophoneOutput.cpp
     src/host/AudioCapture.cpp
     src/host/WasapiAudioCapture.cpp
+    src/host/WasapiMicrophoneOutput.cpp
     src/media/OpusAudio.cpp
     src/host/AudioEndpoint.cpp
     src/host/wss/AudioSocket.cpp
