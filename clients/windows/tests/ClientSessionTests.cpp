@@ -8,6 +8,7 @@
 #include <wintls/beast.hpp>
 
 #include "net/Protocol.hpp"
+#include "net/AudioProtocol.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -124,6 +125,7 @@ public:
     std::atomic<int> upgrades{};
     std::atomic<int> key_frame_requests{};
     std::atomic<bool> unexpected_headers{};
+    std::atomic<bool> received_audio_binary{};
     std::function<std::vector<json::object>(const json::object&)> clipboard_handler;
 
     MockHost() : acceptor_(io_, {asio::ip::address_v4::loopback(), 0}) {
@@ -236,6 +238,19 @@ private:
             } else if (target == bulk_target) {
                 bulk_ = std::make_shared<Writer>(socket);
                 co_await bulk_session(socket);
+            } else if (target == "/audio/test?token=audio-token") {
+                beast::flat_buffer audio;
+                co_await socket->async_read(audio, use_awaitable);
+                received_audio_binary = socket->got_binary();
+                const auto data = audio.cdata();
+                auto packet = net::protocol::decode_audio_packet(
+                    {static_cast<const std::byte*>(data.data()), data.size()}, {}, {});
+                packet.track_id = 2;
+                const auto bytes = net::protocol::encode_audio_packet(packet, {});
+                socket->binary(true);
+                co_await socket->async_write(asio::buffer(bytes), use_awaitable);
+                audio.clear();
+                co_await socket->async_read(audio, use_awaitable);
             }
         } catch (...) {
         }
@@ -1138,4 +1153,47 @@ TEST_CASE("Windows clipboard manager uses native facades and authenticated pinne
     CHECK((!std::filesystem::exists(partial) || std::filesystem::is_empty(partial)));
     CHECK(requested_formats_valid.load());
     if (publications && !published_path.empty()) CHECK(std::filesystem::exists(published_path / L"item.txt"));
+}
+
+TEST_CASE("Audio sockets send binary microphone packets and receive host audio", "[client-session][client-audio]") {
+    MockHost host;
+    Inbox inbox;
+    Connected state;
+    std::optional<net::protocol::AudioPacket> received;
+    std::atomic<bool> delivered{};
+    std::atomic<bool> failed{};
+    auto session = connect(inbox, state, {host.url(), host.password, host.fingerprint()});
+    REQUIRE(*state.result);
+
+    AudioCallbacks callbacks;
+    callbacks.packet = [&](const auto& packet, const auto&) {
+        received = packet;
+        delivered = true;
+    };
+    callbacks.failed = [&](const auto&) { failed = true; };
+    std::optional<std::expected<void, SessionError>> opened;
+    session->open_audio({"test", "/audio/test?token=audio-token", 10s,
+                         {net::protocol::microphone_track_id, {}}},
+                        std::move(callbacks), [&](auto result) { opened = result; });
+    REQUIRE(inbox.pump_until([&] { return opened.has_value(); }));
+    REQUIRE(*opened);
+    session->configure_audio_track({2, {}});
+
+    media::OpusAudio codec;
+    const media::AudioConfiguration configuration;
+    const std::vector<float> pcm(configuration.sample_count(), 0.1f);
+    net::protocol::AudioPacket microphone{
+        .discontinuity = true, .payload = codec.encode(pcm)};
+    session->send_audio_packet(net::protocol::encode_audio_packet(microphone, configuration));
+    REQUIRE(inbox.pump_until([&] { return delivered || failed; }, 5s));
+    REQUIRE_FALSE(failed);
+    REQUIRE(host.received_audio_binary);
+    REQUIRE(received);
+    CHECK(received->track_id == 2);
+    CHECK(received->sequence == microphone.sequence);
+    CHECK(received->sample_timestamp == microphone.sample_timestamp);
+    CHECK(received->discontinuity);
+    CHECK(received->payload == microphone.payload);
+    session->close_audio();
+    session.reset();
 }

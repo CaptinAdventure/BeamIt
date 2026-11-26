@@ -537,6 +537,7 @@ struct Session::State {
                         throw;
                     }
                 }
+                audio->socket.binary(true);
                 complete<void>(std::exchange(opened, nullptr), {});
                 beast::flat_buffer buffer;
                 while (!audio->closing) {
