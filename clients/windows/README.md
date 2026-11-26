@@ -140,6 +140,9 @@ the WinUI project its include paths, definitions and static libraries.
   host's listed applications, then start the authenticated full-duplex Opus
   socket. The client captures its default microphone with event-driven WASAPI
   and plays host audio tracks through its default render endpoint.
+- Audio packets use binary WebSocket messages in both directions. Sending
+  microphone packets as text causes the host to reject the Opus bytes as
+  invalid UTF-8 and disconnect audio.
 - Each host track uses its negotiated Opus metadata and has an independent
   decoder. The client bounds packet queues, drops stale playback audio under
   overload, and tears audio down on stop, socket failure or session end.
