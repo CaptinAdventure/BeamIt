@@ -209,6 +209,7 @@ function Test-PlaybackDevice([string] $Name) {
 }
 
 $repository = Split-Path -Parent $PSScriptRoot
+if ($MicrophoneOutput -in 'auto', 'beamit', 'vb-cable') { $MicrophoneOutput = $MicrophoneOutput.ToLowerInvariant() }
 $usesDriver = $MicrophoneOutput -in 'auto', 'beamit'
 $microphoneProblem = if ($usesDriver) { Test-BeamItMicrophone } else { Test-PlaybackDevice $MicrophoneOutput }
 $cableTarget = "VB-Audio Virtual Cable (select 'CABLE Output' as the microphone in Teams)"
