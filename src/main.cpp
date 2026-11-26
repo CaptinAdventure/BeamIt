@@ -17,17 +17,26 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace {
 
-std::string read_password(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) throw std::runtime_error("Cannot open --password-file " + path.string());
+std::string read_password(const std::string& utf8_path) {
+    std::ifstream file(CLI::to_path(utf8_path), std::ios::binary);
+    if (!file) throw std::runtime_error("Cannot open --password-file " + utf8_path);
     std::string password{std::istreambuf_iterator<char>(file), {}};
     while (!password.empty() && (password.back() == '\n' || password.back() == '\r')) password.pop_back();
     if (password.empty()) throw std::runtime_error("--password-file is empty");
     if (password.size() < 12) spdlog::warn("The password is shorter than 12 characters; use a long random password");
     return password;
+}
+
+// Messages may embed UTF-8 arguments; invalid sequences become U+FFFD instead of throwing.
+void show_message(std::string_view text, const wchar_t* title, UINT flags) {
+    std::wstring wide(MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), wide.data(),
+        static_cast<int>(wide.size()));
+    MessageBoxW(nullptr, wide.c_str(), title, flags);
 }
 
 } // namespace
@@ -64,9 +73,11 @@ int main(int argc, char** argv) {
     key_option->needs(cert_option);
     try {
         try {
-            app.parse(argc, argv);
+            // Arguments come from the Unicode command line as UTF-8 (paths are converted with CLI::to_path), so
+            // device and file names outside the active code page survive.
+            app.parse(argc, app.ensure_utf8(argv));
         } catch (const CLI::ParseError& error) {
-            if (standalone_console) MessageBoxA(nullptr, error.what(), "BeamIt", MB_OK | MB_ICONINFORMATION);
+            if (standalone_console) show_message(error.what(), L"BeamIt", MB_OK | MB_ICONINFORMATION);
             return app.exit(error);
         }
         beamit::host::HostServerOptions options;
@@ -74,10 +85,12 @@ int main(int argc, char** argv) {
         options.port = port;
         options.elevate_input = elevate_input;
         options.make_microphone_device = beamit::host::microphone_device_factory(microphone_output);
-        if (*cert_option && (!std::filesystem::exists(tls_cert) || !std::filesystem::exists(tls_key))) {
+        const auto tls_cert_path = CLI::to_path(tls_cert);
+        const auto tls_key_path = CLI::to_path(tls_key);
+        if (*cert_option && (!std::filesystem::exists(tls_cert_path) || !std::filesystem::exists(tls_key_path))) {
             throw beamit::host::MissingTlsCertificate("The specified TLS certificate or private key was not found.");
         }
-        options.identity = *cert_option ? beamit::host::load_pem_identity(tls_cert, tls_key)
+        options.identity = *cert_option ? beamit::host::load_pem_identity(tls_cert_path, tls_key_path)
                                         : beamit::host::installed_identity();
         options.auth_salt = beamit::net::random_bytes(16);
         options.auth_iterations = beamit::net::protocol::pbkdf2_iterations;
@@ -120,7 +133,7 @@ int main(int argc, char** argv) {
         return 1;
     } catch (const std::exception& error) {
         spdlog::error("Host failed: {}", error.what());
-        if (standalone_console) MessageBoxA(nullptr, error.what(), "BeamIt - Cannot start host", MB_OK | MB_ICONERROR);
+        if (standalone_console) show_message(error.what(), L"BeamIt - Cannot start host", MB_OK | MB_ICONERROR);
         return 1;
     }
 }
