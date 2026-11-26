@@ -115,12 +115,22 @@ awaitable<void> exercise_audio(Server& server, unsigned short port) {
     co_await unauthenticated->async_close(websocket::close_code::normal, asio::redirect_error(use_awaitable, ignored));
 
     auto control = co_await authenticate_client(server, tls, port);
+    // A missing or busy BeamIt Microphone driver must not block host-to-client playback.
     co_await send_json(*control, {{"type", "start_audio"}, {"id", 1}});
-    const auto microphone_failure = co_await read_json(*control);
-    CHECK(microphone_failure.at("type") == "error");
-    CHECK(microphone_failure.at("code") == "audio_failed");
-    CHECK(microphone_failure.at("id") == 1);
-    CHECK_FALSE(server.options.audio->connected());
+    const auto degraded = co_await read_json(*control);
+    REQUIRE(degraded.at("type") == "audio_offer");
+    CHECK(degraded.at("id") == 1);
+    CHECK(degraded.at("clientToHost").as_object().at("available") == false);
+    CHECK(degraded.at("clientToHost").as_object().at("message") == "Simulated driver lease busy");
+    auto degraded_audio = co_await connect_tls(server, tls, port);
+    co_await degraded_audio->async_handshake("localhost", offer_path(degraded), use_awaitable);
+    while (!server.options.audio->connected()) co_await pause(server.io);
+    co_await send_json(*control, {{"type", "start_audio_track"}, {"id", 21}, {"audio_id", degraded.at("audio_id")},
+        {"source", json::object{{"kind", "desktop"}}}});
+    CHECK((co_await read_json(*control)).at("type") == "audio_track_started");
+    co_await send_json(*control, {{"type", "stop_audio"}, {"id", 22}, {"audio_id", degraded.at("audio_id")}});
+    CHECK((co_await read_json(*control)).at("type") == "audio_stopped");
+    while (server.options.audio->connected()) co_await pause(server.io);
     co_await send_json(*control, {{"type", "ping"}, {"id", 20}});
     CHECK((co_await read_json(*control)).at("type") == "pong");
 
@@ -131,6 +141,8 @@ awaitable<void> exercise_audio(Server& server, unsigned short port) {
     CHECK(offer.at("audio_version") == 2);
     CHECK(offer.at("hostToClient").as_object().at("tracks").as_array().empty());
     CHECK(offer.at("clientToHost").as_object().at("track_id") == protocol::microphone_track_id);
+    CHECK(offer.at("clientToHost").as_object().at("available") == true);
+    CHECK_FALSE(offer.at("clientToHost").as_object().contains("message"));
     const auto& opus = offer.at("clientToHost").as_object().at("opusAudioConfiguration").as_object();
     CHECK(opus.at("frameSize") == 480);
     CHECK(opus.at("packetDuration") == "PT0.01S");

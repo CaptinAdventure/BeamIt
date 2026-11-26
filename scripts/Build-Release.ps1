@@ -108,6 +108,12 @@ BeamIt host (Windows 11 x64)
 3. If Windows Firewall asks, allow access on Private networks only.
 
 More instances: Start-BeamIt.cmd -Instance teams -Port 17390
+Microphone: client microphone audio goes to the BeamIt Microphone driver, else VB-Audio Virtual Cable
+(install it from https://vb-audio.com/Cable/ and select "CABLE Output" as the microphone in Teams; keep real
+speakers as the default playback device). Choose explicitly with -MicrophoneOutput beamit|vb-cable|<playback
+device name>. The console warns if no output is found (client microphone audio is then discarded). Install the
+BeamIt driver on start with Start-BeamIt.cmd -MicrophoneDriver <signed BeamItMicrophone.inf>; add
+-RequireMicrophone to refuse to start without a microphone output.
 Elevated input for administrator windows: Start-BeamIt.cmd --elevate-input (or tray menu > Elevate input...)
 Stop: tray icon > Exit, or Ctrl+C in the console.
 '@
